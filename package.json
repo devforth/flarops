@@ -1,0 +1,15 @@
+{
+  "name": "flarops",
+  "version": "1.0.0",
+  "description": "DevOps flow automation tool",
+  "main": "index.js",
+  "bin": {
+    "flarops": "bin/index.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
