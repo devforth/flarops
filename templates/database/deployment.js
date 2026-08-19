@@ -7,7 +7,10 @@ module.exports = (config) => {
             - name: POSTGRES_USER
               value: {{ .Values.database.user | quote }}
             - name: POSTGRES_PASSWORD
-              value: {{ .Values.database.password | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: DATABASE_PASSWORD
             - name: POSTGRES_DB
               value: {{ .Values.database.name | quote }}`;
     volumeMountPath = '/var/lib/postgresql/data';
@@ -16,12 +19,18 @@ module.exports = (config) => {
             - name: MYSQL_DATABASE
               value: {{ .Values.database.name | quote }}
             - name: MYSQL_ROOT_PASSWORD
-              value: {{ .Values.database.password | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: DATABASE_PASSWORD
 {{- if ne .Values.database.user "root" }}
             - name: MYSQL_USER
               value: {{ .Values.database.user | quote }}
             - name: MYSQL_PASSWORD
-              value: {{ .Values.database.password | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: DATABASE_PASSWORD
 {{- end }}`;
     volumeMountPath = '/var/lib/mysql';
   } else if (config.dbType === 'mongodb') {
@@ -29,7 +38,10 @@ module.exports = (config) => {
             - name: MONGO_INITDB_ROOT_USERNAME
               value: {{ .Values.database.user | quote }}
             - name: MONGO_INITDB_ROOT_PASSWORD
-              value: {{ .Values.database.password | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: DATABASE_PASSWORD
             - name: MONGO_INITDB_DATABASE
               value: {{ .Values.database.name | quote }}`;
     volumeMountPath = '/data/db';

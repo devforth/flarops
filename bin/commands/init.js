@@ -488,6 +488,7 @@ ${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
   fs.writeFileSync(path.join(helmDir, 'values.yaml'), valuesYaml);
 
   const ingressTemplate = require('../../templates/01-ingress.js');
+  const secretTemplate = require('../../templates/secret.js');
   const dbDeploymentTemplate = require('../../templates/database/deployment.js');
   const dbServiceTemplate = require('../../templates/database/service.js');
   const apiDeploymentTemplate = require('../../templates/api/deployment.js');
@@ -496,6 +497,7 @@ ${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
   const frontendServiceTemplate = require('../../templates/frontend/service.js');
 
   fs.writeFileSync(path.join(helmTemplatesDir, '01-ingress.yaml'), ingressTemplate());
+  fs.writeFileSync(path.join(helmTemplatesDir, 'secret.yaml'), secretTemplate());
 
   if (config.dbType) {
     const databaseYaml = dbServiceTemplate() + '\n---\n' + dbDeploymentTemplate(config);

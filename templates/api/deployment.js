@@ -22,11 +22,9 @@ spec:
         - name: api
           image: {{ if .Values.werf }}{{ .Values.werf.image.api }}{{ else }}{{ .Values.images.api | default "api:latest" }}{{ end }}
 {{- if .Values.env }}
-          env:
-{{- range $key, $value := .Values.env }}
-            - name: {{ $key }}
-              value: {{ $value | quote }}
-{{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.projectName }}-secrets
 {{- end }}
           resources:
             requests:

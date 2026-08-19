@@ -22,11 +22,9 @@ spec:
         - name: frontend
           image: {{ if .Values.werf }}{{ .Values.werf.image.frontend }}{{ else }}{{ .Values.images.frontend | default "frontend:latest" }}{{ end }}
 {{- if .Values.env }}
-          env:
-{{- range $key, $value := .Values.env }}
-            - name: {{ $key }}
-              value: {{ $value | quote }}
-{{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.projectName }}-secrets
 {{- end }}
           resources:
             requests:
