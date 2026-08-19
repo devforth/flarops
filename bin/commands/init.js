@@ -385,6 +385,7 @@ variable "ssh_public_key" {
 
   const envFiles = findEnvFiles(currentDir);
   let foundDbPasswords = [];
+  let foundDbUrls = {};
   let rootEnvContent = '';
 
   for (const file of envFiles) {
@@ -400,6 +401,23 @@ variable "ssh_public_key" {
       const val = match[2].replace(/^["']|["']$/g, '').trim();
       if (val) {
         foundDbPasswords.push({ file: path.relative(currentDir, file) || '.env', key, value: val });
+      }
+    }
+
+    const urlRegex = /^(DATABASE_URL|DB_URL|MONGO_URI|MONGO_URL|POSTGRES_URL|MYSQL_URL)\s*=\s*(.*)$/gm;
+    let urlMatch;
+    while ((urlMatch = urlRegex.exec(content)) !== null) {
+      const key = urlMatch[1];
+      const val = urlMatch[2].replace(/^["']|["']$/g, '').trim();
+      if (val && !foundDbUrls[key]) {
+        let query = '';
+        try {
+          // Temporarily encode brackets in bash variables to make them valid URLs for the parser
+          const tempVal = val.replace(/\${([^}]+)}/g, 'BASH_VAR_$1');
+          const urlObj = new URL(tempVal);
+          query = urlObj.search || '';
+        } catch (e) {}
+        foundDbUrls[key] = { key, query };
       }
     }
   }
@@ -425,12 +443,24 @@ CLOUDFLARE_ZONE_ID=
 `;
 
   if (rootEnvContent) {
-    envContent += `\n# Variables from root .env\n` + rootEnvContent + `\n`;
+    let lines = rootEnvContent.split('\n');
+    let finalRootEnv = [];
+    for (let line of lines) {
+      const match = line.match(/^([A-Z_][A-Z0-9_]*)\s*=/);
+      if (match && foundDbUrls[match[1]]) {
+        // Exclude this line so it doesn't get generated in the Kubernetes Secret
+      } else {
+        finalRootEnv.push(line);
+      }
+    }
+    envContent += `\n# Variables from root .env\n` + finalRootEnv.join('\n') + `\n`;
   }
 
   if (finalDbPassword && !envContent.includes(`${finalDbPasswordKey}=`)) {
     envContent += `${finalDbPasswordKey}="${finalDbPassword}"\n`;
   }
+
+
 
   const envFile = path.join(deployDir, '.env');
   if (!fs.existsSync(envFile)) {
@@ -508,7 +538,8 @@ DOMAIN=${domain}
     dbHasLocalDockerfile: dbInfo.hasDb ? dbInfo.hasLocalDockerfile : false,
     dbLocalDockerfile: dbInfo.hasDb ? dbInfo.localDbDockerfile : null,
     dbContext: dbInfo.hasDb ? dbInfo.dbContext : null,
-    dbPasswordKey: finalDbPasswordKey
+    dbPasswordKey: finalDbPasswordKey,
+    dbUrlVars: Object.values(foundDbUrls)
   };
 
   // Write Chart.yaml
@@ -574,7 +605,7 @@ ${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
     fs.writeFileSync(path.join(helmTemplatesDir, 'database.yaml'), databaseYaml);
   }
 
-  const apiYaml = apiServiceTemplate() + '\n---\n' + apiDeploymentTemplate();
+  const apiYaml = apiServiceTemplate() + '\n---\n' + apiDeploymentTemplate(config);
   fs.writeFileSync(path.join(helmTemplatesDir, 'api.yaml'), apiYaml);
 
   const frontendYaml = frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate();

@@ -1,4 +1,20 @@
-module.exports = () => `
+module.exports = (config) => {
+  let dbUrlEnvBlock = '';
+  if (config.dbUrlVars && config.dbUrlVars.length > 0 && config.dbType) {
+    let scheme = 'postgres';
+    if (config.dbType === 'mysql' || config.dbType === 'mariadb') scheme = 'mysql';
+    else if (config.dbType === 'mongodb') scheme = 'mongodb';
+
+    for (const urlVar of config.dbUrlVars) {
+      dbUrlEnvBlock += `
+            - name: ${urlVar.key}
+              value: "${scheme}://{{ .Values.database.user }}:$(${config.dbPasswordKey})@database:{{ .Values.dbPort | default 5432 }}/{{ .Values.database.name }}${urlVar.query}"`;
+    }
+  }
+
+  let hasCustomEnv = config.dbUrlVars && config.dbUrlVars.length > 0;
+  
+  return `
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,12 +42,12 @@ spec:
             - secretRef:
                 name: {{ .Values.projectName }}-secrets
 {{- end }}
-{{- if .Values.api.env }}
+{{- if or .Values.api.env ${hasCustomEnv ? 'true' : 'false'} }}
           env:
 {{- range $key, $value := .Values.api.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
-{{- end }}
+{{- end }}${dbUrlEnvBlock}
 {{- end }}
           resources:
             requests:
@@ -41,3 +57,4 @@ spec:
               memory: "256Mi"
               cpu: "500m"
 `.trim();
+};
