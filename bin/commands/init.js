@@ -361,8 +361,13 @@ variable "ssh_public_key" {
     console.log("deploy/terraform/variables.tf already exists");
   }
 
-  const envFile = path.join(deployDir, '.env');
-  const envContent = `# These secrets must be saved in Github repository secrets with the same name
+  const rootEnvFile = path.join(currentDir, '.env');
+  let rootEnvContent = '';
+  if (fs.existsSync(rootEnvFile)) {
+    rootEnvContent = fs.readFileSync(rootEnvFile, 'utf8');
+  }
+
+  let envContent = `# These secrets must be saved in Github repository secrets with the same name
 AWS_ACCESS_KEY_ID="${awsCredentials.accessKey}"
 AWS_SECRET_ACCESS_KEY="${awsCredentials.secretKey}"
 SSH_PRIVATE_KEY="${privateKey}"
@@ -372,6 +377,12 @@ CLOUDFLARE_API_TOKEN=
 CLOUDFLARE_ZONE_ID=
 DATABASE_PASSWORD=
 `;
+
+  if (rootEnvContent) {
+    envContent += `\n# Variables from root .env\n` + rootEnvContent + `\n`;
+  }
+
+  const envFile = path.join(deployDir, '.env');
   if (!fs.existsSync(envFile)) {
     fs.writeFileSync(envFile, envContent);
     console.log("Created deploy/.env");
@@ -480,11 +491,14 @@ database:
   user: "${finalDbUser}"
   password: null
   name: "${finalDbName}"
-  env: {}
+  env:
+    # KEY: "VALUE"
 api:
-  env: {}
+  env:
+    # KEY: "VALUE"
 frontend:
-  env: {}
+  env:
+    # KEY: "VALUE"
 apiPorts:
 ${config.apiPorts.map(p => `  - ${p}`).join('\n')}
 frontendPorts:
