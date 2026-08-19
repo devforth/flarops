@@ -482,7 +482,6 @@ variable "ssh_public_key" {
 AWS_ACCESS_KEY_ID="${awsCredentials.accessKey}"
 AWS_SECRET_ACCESS_KEY="${awsCredentials.secretKey}"
 SSH_PRIVATE_KEY="${privateKey}"
-REGISTRY_USER="${registryUser}"
 REGISTRY_PASSWORD="${registryPassword}"
 CLOUDFLARE_API_TOKEN=
 CLOUDFLARE_ZONE_ID=
@@ -538,6 +537,7 @@ DOMAIN=${domain}
     projectName,
     domain,
     dockerRegistry,
+    registryUser,
     envKeysToPass,
     backendPath: relativeBackendPath,
     frontendPath: relativeFrontendPath,

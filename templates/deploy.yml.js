@@ -1,7 +1,7 @@
 module.exports = function deployYmlTemplate(config) {
   const repoString = config.dockerRegistry
     ? `\${{ env.DOCKER_REGISTRY }}/\${{ env.PROJECT_NAME }}`
-    : `docker.io/\${{ secrets.REGISTRY_USER }}/\${{ env.PROJECT_NAME }}`;
+    : `docker.io/\${{ env.REGISTRY_USER }}/\${{ env.PROJECT_NAME }}`;
 
   const registryEnv = config.dockerRegistry
     ? 'DOCKER_REGISTRY: ' + config.dockerRegistry
@@ -16,7 +16,7 @@ module.exports = function deployYmlTemplate(config) {
         uses: docker/login-action@v3
         with:
           registry: ${loginRegistryHost}
-          username: \${{ secrets.REGISTRY_USER }}
+          username: \${{ env.REGISTRY_USER }}
           password: \${{ secrets.REGISTRY_PASSWORD }}
 `;
 
@@ -35,6 +35,7 @@ on:
 env:
   AWS_REGION: us-west-2
   PROJECT_NAME: ${config.projectName}
+  REGISTRY_USER: ${config.registryUser}
 ${registryEnv ? '  ' + registryEnv : ''}
 
 jobs:
