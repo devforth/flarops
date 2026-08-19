@@ -468,6 +468,82 @@ variable "ssh_public_key" {
     }
   }
 
+  // Parse docker-compose.yml environment blocks
+  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  let composeContent = null;
+  for (const cf of composeFiles) {
+    try {
+      composeContent = fs.readFileSync(path.join(currentDir, cf), 'utf8');
+      break;
+    } catch(e) {}
+  }
+
+  if (composeContent) {
+    const serviceRegex = /^  ([a-zA-Z0-9_-]+):/gm;
+    let match;
+    const services = [];
+    while ((match = serviceRegex.exec(composeContent)) !== null) {
+      services.push({ name: match[1], index: match.index });
+    }
+    
+    for (let i = 0; i < services.length; i++) {
+      const start = services[i].index;
+      const end = i + 1 < services.length ? services[i + 1].index : composeContent.length;
+      const block = composeContent.substring(start, end);
+      
+      let isBackend = ['api', 'backend', 'server'].includes(services[i].name) || (backendInfo.backendPath && backendInfo.backendPath.includes(services[i].name));
+      let isFrontend = ['frontend', 'client', 'ui', 'web'].includes(services[i].name) || (frontendInfo.frontendPath && frontendInfo.frontendPath.includes(services[i].name));
+      
+      if (!isBackend && !isFrontend) continue;
+      
+      const lines = block.split('\n');
+      let inEnv = false;
+      let envIndent = 0;
+      
+      for (const line of lines) {
+        if (!inEnv) {
+          const m = line.match(/^([ \t]+)environment:\s*$/);
+          if (m) {
+            inEnv = true;
+            envIndent = m[1].length;
+          }
+        } else {
+          if (line.trim() === '') continue;
+          const indentMatch = line.match(/^([ \t]*)/);
+          const lineIndent = indentMatch ? indentMatch[1].length : 0;
+          
+          if (lineIndent <= envIndent) {
+            if (lineIndent === envIndent && line.trim().startsWith('-')) {
+              // Valid list item at same indent
+            } else {
+              inEnv = false;
+              break; // exit environment block
+            }
+          }
+          
+          const envLineMatch = line.match(/^[ \t]+(?:-\s+)?([A-Z_][A-Z0-9_]*)\s*[:=]\s*(.*)$/);
+          if (envLineMatch) {
+            const key = envLineMatch[1];
+            const val = envLineMatch[2].replace(/^["']|["']$/g, '').trim();
+            
+            if (foundDbUrls[key]) continue;
+            if (key.match(/^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)$/i)) continue;
+            
+            if (sensitiveRegex.test(key)) {
+              const fullLine = `${key}=${val}`;
+              if (!sensitiveEnvContent.includes(fullLine)) {
+                sensitiveEnvContent += `${fullLine}\n`;
+              }
+            } else {
+              if (isBackend) apiEnv[key] = val;
+              if (isFrontend) frontendEnv[key] = val;
+            }
+          }
+        }
+      }
+    }
+  }
+
   let finalDbPasswordKey = 'DATABASE_PASSWORD';
   let finalDbPassword = '';
   if (foundDbPasswords.length > 0) {
@@ -588,8 +664,25 @@ appVersion: "1.0.0"
   const finalDbUser = config.dbUser || defaultDbUser;
   const finalDbName = config.dbName || 'appdb';
 
-  let apiEnvString = Object.keys(apiEnv).length > 0 ? Object.entries(apiEnv).map(([k, v]) => `    ${k}: "${v}"`).join('\n') : '    # KEY: "VALUE"';
-  let frontendEnvString = Object.keys(frontendEnv).length > 0 ? Object.entries(frontendEnv).map(([k, v]) => `    ${k}: "${v}"`).join('\n') : '    # KEY: "VALUE"';
+  let hasLocalhostWarnings = false;
+
+  let apiEnvString = Object.keys(apiEnv).length > 0 ? Object.entries(apiEnv).map(([k, v]) => {
+    let line = `    ${k}: "${v}"`;
+    if (String(v).toLowerCase().includes('localhost')) {
+      hasLocalhostWarnings = true;
+      line += ` # Change "localhost" to your endpoint service name (api, frontend or db)`;
+    }
+    return line;
+  }).join('\n') : '    # KEY: "VALUE"';
+  
+  let frontendEnvString = Object.keys(frontendEnv).length > 0 ? Object.entries(frontendEnv).map(([k, v]) => {
+    let line = `    ${k}: "${v}"`;
+    if (String(v).toLowerCase().includes('localhost')) {
+      hasLocalhostWarnings = true;
+      line += ` # Change "localhost" to your endpoint service name (api, frontend or db)`;
+    }
+    return line;
+  }).join('\n') : '    # KEY: "VALUE"';
 
   // Write values.yaml
   let valuesYaml = `projectName: ${projectName}
@@ -668,4 +761,10 @@ ${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
   console.log("# Next, follow the instructions in FLAROPS.md to deploy the application for the first time. #");
   console.log("#############################################################################################");
   console.log("");
+  
+  if (hasLocalhostWarnings) {
+    console.log(`\x1b[36mATTENTION: We found "localhost" references in your environment variables.\x1b[0m`);
+    console.log(`\x1b[36mPlease open deploy/helm/values.yaml and change "localhost" to the appropriate service name (e.g. "api", "frontend", or "database") so containers can communicate properly in Kubernetes!\x1b[0m`);
+    console.log("");
+  }
 };
