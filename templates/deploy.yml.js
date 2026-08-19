@@ -104,7 +104,7 @@ ${loginStep}
             --parallel-tasks-limit=3 \\
             --repo ${repoString} \\
             --env production \\
-${setEnvs}            --set database.password=\${{ secrets.DATABASE_PASSWORD }}${loginRegistryHost === 'docker.io' ? '' : `
+${setEnvs}            --set database.password=\${{ secrets.${config.dbPasswordKey} }}${loginRegistryHost === 'docker.io' ? '' : `
 
       - name: Cleanup old images
         run: |

@@ -476,6 +476,15 @@ variable "ssh_public_key" {
     if (foundDbPasswords.length > 1) {
        console.log(`\x1b[33mWARNING: Found multiple database passwords in .env files. Using ${finalDbPasswordKey} from ${foundDbPasswords[0].file}\x1b[0m`);
     }
+  } else if (dbInfo.hasDb) {
+    if (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql') finalDbPasswordKey = 'POSTGRES_PASSWORD';
+    else if (dbInfo.dbType === 'mysql') finalDbPasswordKey = 'MYSQL_ROOT_PASSWORD';
+    else if (dbInfo.dbType === 'mariadb') finalDbPasswordKey = 'MARIADB_ROOT_PASSWORD';
+    else if (dbInfo.dbType === 'mongodb') finalDbPasswordKey = 'MONGO_INITDB_ROOT_PASSWORD';
+    else finalDbPasswordKey = 'DATABASE_PASSWORD';
+
+    finalDbPassword = require('crypto').randomBytes(16).toString('hex');
+    console.log(`\x1b[34mINFO: No database password found in .env files. Generated a secure random fallback password for ${finalDbPasswordKey}\x1b[0m`);
   }
 
   let envContent = `# These secrets must be saved in Github repository secrets with the same name
