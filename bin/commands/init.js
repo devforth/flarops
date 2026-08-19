@@ -38,6 +38,52 @@ function askPassword(query) {
   }));
 }
 
+function ensureDir(dirPath, logMessage) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+    if (logMessage) console.log(logMessage);
+  }
+}
+
+function writeFileIfNotExists(filePath, content, logMessage, logIfExistsMessage) {
+  if (!fs.existsSync(filePath) || fs.readFileSync(filePath, 'utf8').trim() === '') {
+    fs.writeFileSync(filePath, content);
+    if (logMessage) console.log(logMessage);
+  } else {
+    if (logIfExistsMessage) console.log(logIfExistsMessage);
+  }
+}
+
+const sensitiveRegex = /(PASSWORD|KEY|SECRET|TOKEN|CREDENTIALS|AUTH|SALT|CERT)/i;
+const dbPasswordRegex = /^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)$/i;
+
+function processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext) {
+  if (foundDbUrls[key]) return;
+  if (dbPasswordRegex.test(key)) return;
+
+  if (sensitiveRegex.test(key)) {
+    const fullLine = `${key}=${val}`;
+    if (!sensitiveContext.content.includes(fullLine)) {
+      sensitiveContext.content += `${fullLine}\n`;
+    }
+  } else {
+    if (isBackend) apiEnv[key] = val;
+    if (isFrontend) frontendEnv[key] = val;
+  }
+}
+
+function generateEnvString(envObj, context) {
+  if (Object.keys(envObj).length === 0) return '    # KEY: "VALUE"';
+  return Object.entries(envObj).map(([k, v]) => {
+    let line = `    ${k}: "${v}"`;
+    if (String(v).toLowerCase().includes('localhost')) {
+      context.hasLocalhostWarnings = true;
+      line += ` # Change "localhost" to your endpoint service name (api, frontend or db)`;
+    }
+    return line;
+  }).join('\n');
+}
+
 module.exports = async function init() {
   const currentDir = process.cwd();
   const gitDir = path.join(currentDir, '.git');
@@ -48,10 +94,7 @@ module.exports = async function init() {
   }
 
   const keysDir = path.join(currentDir, '.keys');
-  if (!fs.existsSync(keysDir)) {
-    fs.mkdirSync(keysDir);
-    console.log("Created .keys/ directory");
-  }
+  ensureDir(keysDir, "Created .keys/ directory");
 
   const privateKeyPath = path.join(keysDir, 'deploy_rsa');
   const publicKeyPath = path.join(keysDir, 'deploy_rsa.pub');
@@ -120,7 +163,9 @@ module.exports = async function init() {
 
   const awsCmd = ensureAwsCli();
   const defaultBucketName = `${projectName}-remote-state`;
-  const remoteStateBucket = await handleS3Bucket(awsCmd, defaultBucketName, awsCredentials, askQuestion);
+  const bucketResult = await handleS3Bucket(awsCmd, defaultBucketName, awsCredentials, askQuestion);
+  const remoteStateBucket = bucketResult.bucket;
+  let s3BucketWarning = bucketResult.warning;
 
   const deployDir = path.join(currentDir, 'deploy');
   const terraformDir = path.join(deployDir, 'terraform');
@@ -165,15 +210,8 @@ module.exports = async function init() {
     }
   }
 
-  if (!fs.existsSync(deployDir)) {
-    fs.mkdirSync(deployDir);
-    console.log("Created deploy/ directory");
-  }
-
-  if (!fs.existsSync(terraformDir)) {
-    fs.mkdirSync(terraformDir);
-    console.log("Created deploy/terraform/ directory");
-  }
+  ensureDir(deployDir, "Created deploy/ directory");
+  ensureDir(terraformDir, "Created deploy/terraform/ directory");
 
   const mainTfContent = `terraform {
   backend "s3" {
@@ -346,20 +384,10 @@ variable "ssh_public_key" {
 `;
 
   const mainTfFile = path.join(terraformDir, 'main.tf');
-  if (!fs.existsSync(mainTfFile) || fs.readFileSync(mainTfFile, 'utf8').trim() === '') {
-    fs.writeFileSync(mainTfFile, mainTfContent);
-    console.log("Created deploy/terraform/main.tf");
-  } else {
-    console.log("deploy/terraform/main.tf already exists and is not empty");
-  }
+  writeFileIfNotExists(mainTfFile, mainTfContent, "Created deploy/terraform/main.tf", "deploy/terraform/main.tf already exists and is not empty");
 
   const variablesTfFile = path.join(terraformDir, 'variables.tf');
-  if (!fs.existsSync(variablesTfFile)) {
-    fs.writeFileSync(variablesTfFile, variablesTfContent);
-    console.log("Created deploy/terraform/variables.tf");
-  } else {
-    console.log("deploy/terraform/variables.tf already exists");
-  }
+  writeFileIfNotExists(variablesTfFile, variablesTfContent, "Created deploy/terraform/variables.tf", "deploy/terraform/variables.tf already exists");
 
   const ignoredDirs = new Set(['node_modules', '.git', 'deploy', 'dist', 'build', '.keys']);
   function findEnvFiles(dir, fileList = []) {
@@ -451,19 +479,10 @@ variable "ssh_public_key" {
         const key = lineMatch[1];
         const val = lineMatch[2];
         
-        if (foundDbUrls[key]) continue;
-        if (key.match(/^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)$/i)) continue;
-
-        if (sensitiveRegex.test(key)) {
-          // Avoid duplicating identical sensitive lines
-          if (!sensitiveEnvContent.includes(line)) {
-            sensitiveEnvContent += `${line}\n`;
-          }
-        } else {
-          const cleanedVal = val.replace(/^["']|["']$/g, '').trim();
-          if (isBackend) apiEnv[key] = cleanedVal;
-          if (isFrontend) frontendEnv[key] = cleanedVal;
-        }
+        const cleanedVal = val.replace(/^["']|["']$/g, '').trim();
+        let sensitiveContext = { content: sensitiveEnvContent };
+        processEnvVariable(key, cleanedVal, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext);
+        sensitiveEnvContent = sensitiveContext.content;
       }
     }
   }
@@ -526,18 +545,9 @@ variable "ssh_public_key" {
             const key = envLineMatch[1];
             const val = envLineMatch[2].replace(/^["']|["']$/g, '').trim();
             
-            if (foundDbUrls[key]) continue;
-            if (key.match(/^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)$/i)) continue;
-            
-            if (sensitiveRegex.test(key)) {
-              const fullLine = `${key}=${val}`;
-              if (!sensitiveEnvContent.includes(fullLine)) {
-                sensitiveEnvContent += `${fullLine}\n`;
-              }
-            } else {
-              if (isBackend) apiEnv[key] = val;
-              if (isFrontend) frontendEnv[key] = val;
-            }
+            let sensitiveContext = { content: sensitiveEnvContent };
+            processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext);
+            sensitiveEnvContent = sensitiveContext.content;
           }
         }
       }
@@ -665,24 +675,12 @@ appVersion: "1.0.0"
   const finalDbName = config.dbName || 'appdb';
 
   let hasLocalhostWarnings = false;
+  let contextObj = { hasLocalhostWarnings };
 
-  let apiEnvString = Object.keys(apiEnv).length > 0 ? Object.entries(apiEnv).map(([k, v]) => {
-    let line = `    ${k}: "${v}"`;
-    if (String(v).toLowerCase().includes('localhost')) {
-      hasLocalhostWarnings = true;
-      line += ` # Change "localhost" to your endpoint service name (api, frontend or db)`;
-    }
-    return line;
-  }).join('\n') : '    # KEY: "VALUE"';
+  let apiEnvString = generateEnvString(apiEnv, contextObj);
+  let frontendEnvString = generateEnvString(frontendEnv, contextObj);
   
-  let frontendEnvString = Object.keys(frontendEnv).length > 0 ? Object.entries(frontendEnv).map(([k, v]) => {
-    let line = `    ${k}: "${v}"`;
-    if (String(v).toLowerCase().includes('localhost')) {
-      hasLocalhostWarnings = true;
-      line += ` # Change "localhost" to your endpoint service name (api, frontend or db)`;
-    }
-    return line;
-  }).join('\n') : '    # KEY: "VALUE"';
+  hasLocalhostWarnings = contextObj.hasLocalhostWarnings;
 
   // Write values.yaml
   let valuesYaml = `projectName: ${projectName}
@@ -722,38 +720,31 @@ ${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
   const frontendDeploymentTemplate = require('../../templates/frontend/deployment.js');
   const frontendServiceTemplate = require('../../templates/frontend/service.js');
 
-  fs.writeFileSync(path.join(helmTemplatesDir, '01-ingress.yaml'), ingressTemplate());
-  fs.writeFileSync(path.join(helmTemplatesDir, 'secret.yaml'), secretTemplate());
+  const templatesToGenerate = [
+    { file: path.join(helmTemplatesDir, '01-ingress.yaml'), content: ingressTemplate() },
+    { file: path.join(helmTemplatesDir, 'secret.yaml'), content: secretTemplate() },
+    { file: path.join(helmTemplatesDir, 'api.yaml'), content: apiServiceTemplate() + '\n---\n' + apiDeploymentTemplate(config) },
+    { file: path.join(helmTemplatesDir, 'frontend.yaml'), content: frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate() }
+  ];
 
   if (config.dbType) {
-    const databaseYaml = dbServiceTemplate() + '\n---\n' + dbDeploymentTemplate(config);
-    fs.writeFileSync(path.join(helmTemplatesDir, 'database.yaml'), databaseYaml);
+    templatesToGenerate.push({ file: path.join(helmTemplatesDir, 'database.yaml'), content: dbServiceTemplate() + '\n---\n' + dbDeploymentTemplate(config) });
   }
 
-  const apiYaml = apiServiceTemplate() + '\n---\n' + apiDeploymentTemplate(config);
-  fs.writeFileSync(path.join(helmTemplatesDir, 'api.yaml'), apiYaml);
-
-  const frontendYaml = frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate();
-  fs.writeFileSync(path.join(helmTemplatesDir, 'frontend.yaml'), frontendYaml);
+  templatesToGenerate.forEach(t => fs.writeFileSync(t.file, t.content));
 
   // Generate GitHub Actions pipeline
   const githubDir = path.join(currentDir, '.github', 'workflows');
-  if (!fs.existsSync(githubDir)) {
-    fs.mkdirSync(githubDir, { recursive: true });
-    console.log("Created .github/workflows/ directory");
-  }
-  const deployYmlTemplate = require('../../templates/deploy.yml.js');
-  fs.writeFileSync(path.join(githubDir, 'deploy.yml'), deployYmlTemplate(config));
+  ensureDir(githubDir, "Created .github/workflows/ directory");
 
-  // Generate Werf files
-  const werfYmlTemplate = require('../../templates/werf.yaml.js');
-  fs.writeFileSync(path.join(currentDir, 'werf.yaml'), werfYmlTemplate(config));
+  const otherFilesToGenerate = [
+    { file: path.join(githubDir, 'deploy.yml'), content: require('../../templates/deploy.yml.js')(config) },
+    { file: path.join(currentDir, 'werf.yaml'), content: require('../../templates/werf.yaml.js')(config) },
+    { file: path.join(currentDir, 'werf-giterminism.yaml'), content: require('../../templates/werf-giterminism.yaml.js')() },
+    { file: path.join(currentDir, 'FLAROPS.md'), content: require('../../templates/FLAROPS.md.js')() }
+  ];
 
-  const werfGiterminismTemplate = require('../../templates/werf-giterminism.yaml.js');
-  fs.writeFileSync(path.join(currentDir, 'werf-giterminism.yaml'), werfGiterminismTemplate());
-
-  const flaropsMdTemplate = require('../../templates/FLAROPS.md.js');
-  fs.writeFileSync(path.join(currentDir, 'FLAROPS.md'), flaropsMdTemplate());
+  otherFilesToGenerate.forEach(f => fs.writeFileSync(f.file, f.content));
 
   console.log("");
   console.log("#############################################################################################");
@@ -761,6 +752,11 @@ ${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
   console.log("# Next, follow the instructions in FLAROPS.md to deploy the application for the first time. #");
   console.log("#############################################################################################");
   console.log("");
+  
+  if (s3BucketWarning) {
+    console.log(s3BucketWarning);
+    console.log("");
+  }
   
   if (hasLocalhostWarnings) {
     console.log(`\x1b[36mATTENTION: We found "localhost" references in your environment variables.\x1b[0m`);

@@ -93,8 +93,10 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion) {
         // Exists and we have access
         const answer = await askQuestion(`Bucket [${currentBucket}] is already exist, are you sure you want to use it? [y/N]: `);
         if (answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes') {
-          console.log("\nWARNING: Make sure that this bucket does not currently store the state of any other infrastructure, so as not to corrupt it. If you think it would be better to use a different bucket, create it in the AWS console and manually update the deploy/terraform/main.tf file.\n");
-          resolve(currentBucket);
+          resolve({
+            bucket: currentBucket,
+            warning: `\x1b[33mWARNING: Make sure that this bucket does not currently store the state of any other infrastructure, so as not to corrupt it. If you think it would be better to use a different bucket, create it in the AWS console and manually update the deploy/terraform/main.tf file.\x1b[0m`
+          });
           return;
         } else {
           currentBucket = await askQuestion('Enter new bucket name: ');
@@ -111,7 +113,7 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion) {
           try {
             console.log(`Creating S3 bucket: ${currentBucket} in us-west-2...`);
             execSync(`${awsCmd} s3api create-bucket --bucket ${currentBucket} --region us-west-2 --create-bucket-configuration LocationConstraint=us-west-2`, { env, stdio: 'pipe' });
-            resolve(currentBucket);
+            resolve({ bucket: currentBucket, warning: null });
             return;
           } catch (createErr) {
             console.error(`Failed to create bucket ${currentBucket}.`);
