@@ -26,6 +26,13 @@ spec:
             - secretRef:
                 name: {{ .Values.projectName }}-secrets
 {{- end }}
+{{- if .Values.frontend.env }}
+          env:
+{{- range $key, $value := .Values.frontend.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}
           resources:
             requests:
               memory: "64Mi"

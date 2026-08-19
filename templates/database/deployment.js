@@ -47,6 +47,14 @@ module.exports = (config) => {
     volumeMountPath = '/data/db';
   }
 
+  envBlock += `
+{{- if .Values.database.env }}
+{{- range $key, $value := .Values.database.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}`;
+
   return `
 apiVersion: apps/v1
 kind: StatefulSet

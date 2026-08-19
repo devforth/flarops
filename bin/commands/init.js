@@ -480,6 +480,11 @@ database:
   user: "${finalDbUser}"
   password: null
   name: "${finalDbName}"
+  env: {}
+api:
+  env: {}
+frontend:
+  env: {}
 apiPorts:
 ${config.apiPorts.map(p => `  - ${p}`).join('\n')}
 frontendPorts:
