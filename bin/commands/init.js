@@ -383,17 +383,41 @@ variable "ssh_public_key" {
     return fileList;
   }
 
+  const { analyzeBackend, analyzeFrontend } = require('../../utils/analyzer.js');
+  const { analyzeDatabase } = require('../../utils/dbAnalyzer.js');
+
+  const [backendInfo, frontendInfo] = await Promise.all([
+    analyzeBackend(currentDir),
+    analyzeFrontend(currentDir)
+  ]);
+
+  const dbInfo = await analyzeDatabase(currentDir, backendInfo.backendPath);
+
   const envFiles = findEnvFiles(currentDir);
   let foundDbPasswords = [];
   let foundDbUrls = {};
-  let rootEnvContent = '';
+  
+  let apiEnv = {};
+  let frontendEnv = {};
+  const sensitiveRegex = /(PASSWORD|KEY|SECRET|TOKEN|CREDENTIALS|AUTH|SALT|CERT)/i;
+  let sensitiveEnvContent = '';
 
   for (const file of envFiles) {
     const content = fs.readFileSync(file, 'utf8');
-    if (file === path.join(currentDir, '.env')) {
-      rootEnvContent = content;
-    }
+    const isRoot = file === path.join(currentDir, '.env');
     
+    let isBackend = false;
+    let isFrontend = false;
+    
+    if (backendInfo.backendPath && file.startsWith(backendInfo.backendPath)) {
+      isBackend = true;
+    } else if (frontendInfo.frontendPath && file.startsWith(frontendInfo.frontendPath)) {
+      isFrontend = true;
+    } else if (isRoot) {
+      isBackend = true;
+      isFrontend = true;
+    }
+
     const passwordRegex = /^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)\s*=\s*(.*)$/gm;
     let match;
     while ((match = passwordRegex.exec(content)) !== null) {
@@ -412,12 +436,34 @@ variable "ssh_public_key" {
       if (val && !foundDbUrls[key]) {
         let query = '';
         try {
-          // Temporarily encode brackets in bash variables to make them valid URLs for the parser
           const tempVal = val.replace(/\${([^}]+)}/g, 'BASH_VAR_$1');
           const urlObj = new URL(tempVal);
           query = urlObj.search || '';
         } catch (e) {}
         foundDbUrls[key] = { key, query };
+      }
+    }
+    
+    const lines = content.split('\n');
+    for (const line of lines) {
+      const lineMatch = line.match(/^([A-Z_][A-Z0-9_]*)\s*=(.*)$/);
+      if (lineMatch) {
+        const key = lineMatch[1];
+        const val = lineMatch[2];
+        
+        if (foundDbUrls[key]) continue;
+        if (key.match(/^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)$/i)) continue;
+
+        if (sensitiveRegex.test(key)) {
+          // Avoid duplicating identical sensitive lines
+          if (!sensitiveEnvContent.includes(line)) {
+            sensitiveEnvContent += `${line}\n`;
+          }
+        } else {
+          const cleanedVal = val.replace(/^["']|["']$/g, '').trim();
+          if (isBackend) apiEnv[key] = cleanedVal;
+          if (isFrontend) frontendEnv[key] = cleanedVal;
+        }
       }
     }
   }
@@ -442,25 +488,11 @@ CLOUDFLARE_API_TOKEN=
 CLOUDFLARE_ZONE_ID=
 `;
 
-  if (rootEnvContent) {
-    let lines = rootEnvContent.split('\n');
-    let finalRootEnv = [];
-    for (let line of lines) {
-      const match = line.match(/^([A-Z_][A-Z0-9_]*)\s*=/);
-      if (match && foundDbUrls[match[1]]) {
-        // Exclude this line so it doesn't get generated in the Kubernetes Secret
-      } else {
-        finalRootEnv.push(line);
-      }
-    }
-    envContent += `\n# Variables from root .env\n` + finalRootEnv.join('\n') + `\n`;
-  }
+  envContent += `\n# Extracted sensitive variables from project .env files\n${sensitiveEnvContent}`;
 
   if (finalDbPassword && !envContent.includes(`${finalDbPasswordKey}=`)) {
     envContent += `${finalDbPasswordKey}="${finalDbPassword}"\n`;
   }
-
-
 
   const envFile = path.join(deployDir, '.env');
   if (!fs.existsSync(envFile)) {
@@ -469,16 +501,6 @@ CLOUDFLARE_ZONE_ID=
   } else {
     console.log("deploy/.env already exists");
   }
-
-  const { analyzeBackend, analyzeFrontend } = require('../../utils/analyzer.js');
-  const { analyzeDatabase } = require('../../utils/dbAnalyzer.js');
-
-  const [backendInfo, frontendInfo] = await Promise.all([
-    analyzeBackend(currentDir),
-    analyzeFrontend(currentDir)
-  ]);
-
-  const dbInfo = await analyzeDatabase(currentDir, backendInfo.backendPath);
 
   const envSafetyFile = path.join(deployDir, '.env.safety');
   const envSafetyContent = `DATABASE_USER=
@@ -499,8 +521,6 @@ DOMAIN=${domain}
     fs.mkdirSync(helmTemplatesDir, { recursive: true });
     console.log("Created deploy/helm and deploy/helm/templates directories");
   }
-
-
 
   const relativeBackendPath = backendInfo.backendPath ? path.relative(currentDir, backendInfo.backendPath) || '.' : null;
   const relativeFrontendPath = frontendInfo.frontendPath ? path.relative(currentDir, frontendInfo.frontendPath) || '.' : null;
@@ -559,6 +579,9 @@ appVersion: "1.0.0"
   const finalDbUser = config.dbUser || defaultDbUser;
   const finalDbName = config.dbName || 'appdb';
 
+  let apiEnvString = Object.keys(apiEnv).length > 0 ? Object.entries(apiEnv).map(([k, v]) => `    ${k}: "${v}"`).join('\n') : '    # KEY: "VALUE"';
+  let frontendEnvString = Object.keys(frontendEnv).length > 0 ? Object.entries(frontendEnv).map(([k, v]) => `    ${k}: "${v}"`).join('\n') : '    # KEY: "VALUE"';
+
   // Write values.yaml
   let valuesYaml = `projectName: ${projectName}
 domain: "${domain}"
@@ -577,10 +600,10 @@ database:
     # KEY: "VALUE"
 api:
   env:
-    # KEY: "VALUE"
+${apiEnvString}
 frontend:
   env:
-    # KEY: "VALUE"
+${frontendEnvString}
 apiPorts:
 ${config.apiPorts.map(p => `  - ${p}`).join('\n')}
 frontendPorts:
