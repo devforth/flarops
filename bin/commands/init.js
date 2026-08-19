@@ -361,10 +361,57 @@ variable "ssh_public_key" {
     console.log("deploy/terraform/variables.tf already exists");
   }
 
-  const rootEnvFile = path.join(currentDir, '.env');
+  const ignoredDirs = new Set(['node_modules', '.git', 'deploy', 'dist', 'build', '.keys']);
+  function findEnvFiles(dir, fileList = []) {
+    let files = [];
+    try {
+      files = fs.readdirSync(dir);
+    } catch (e) { return fileList; }
+    
+    for (const file of files) {
+      if (ignoredDirs.has(file)) continue;
+      const fullPath = path.join(dir, file);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          findEnvFiles(fullPath, fileList);
+        } else if (file === '.env') {
+          fileList.push(fullPath);
+        }
+      } catch (e) {}
+    }
+    return fileList;
+  }
+
+  const envFiles = findEnvFiles(currentDir);
+  let foundDbPasswords = [];
   let rootEnvContent = '';
-  if (fs.existsSync(rootEnvFile)) {
-    rootEnvContent = fs.readFileSync(rootEnvFile, 'utf8');
+
+  for (const file of envFiles) {
+    const content = fs.readFileSync(file, 'utf8');
+    if (file === path.join(currentDir, '.env')) {
+      rootEnvContent = content;
+    }
+    
+    const passwordRegex = /^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)\s*=\s*(.*)$/gm;
+    let match;
+    while ((match = passwordRegex.exec(content)) !== null) {
+      const key = match[1];
+      const val = match[2].replace(/^["']|["']$/g, '').trim();
+      if (val) {
+        foundDbPasswords.push({ file: path.relative(currentDir, file) || '.env', key, value: val });
+      }
+    }
+  }
+
+  let finalDbPasswordKey = 'DATABASE_PASSWORD';
+  let finalDbPassword = '';
+  if (foundDbPasswords.length > 0) {
+    finalDbPasswordKey = foundDbPasswords[0].key;
+    finalDbPassword = foundDbPasswords[0].value;
+    if (foundDbPasswords.length > 1) {
+       console.log(`\x1b[33mWARNING: Found multiple database passwords in .env files. Using ${finalDbPasswordKey} from ${foundDbPasswords[0].file}\x1b[0m`);
+    }
   }
 
   let envContent = `# These secrets must be saved in Github repository secrets with the same name
@@ -375,11 +422,14 @@ REGISTRY_USER="${registryUser}"
 REGISTRY_PASSWORD="${registryPassword}"
 CLOUDFLARE_API_TOKEN=
 CLOUDFLARE_ZONE_ID=
-DATABASE_PASSWORD=
 `;
 
   if (rootEnvContent) {
     envContent += `\n# Variables from root .env\n` + rootEnvContent + `\n`;
+  }
+
+  if (finalDbPassword && !envContent.includes(`${finalDbPasswordKey}=`)) {
+    envContent += `${finalDbPasswordKey}="${finalDbPassword}"\n`;
   }
 
   const envFile = path.join(deployDir, '.env');
@@ -457,7 +507,8 @@ DOMAIN=${domain}
     dbName: dbInfo.hasDb ? dbInfo.dbName : null,
     dbHasLocalDockerfile: dbInfo.hasDb ? dbInfo.hasLocalDockerfile : false,
     dbLocalDockerfile: dbInfo.hasDb ? dbInfo.localDbDockerfile : null,
-    dbContext: dbInfo.hasDb ? dbInfo.dbContext : null
+    dbContext: dbInfo.hasDb ? dbInfo.dbContext : null,
+    dbPasswordKey: finalDbPasswordKey
   };
 
   // Write Chart.yaml

@@ -12,7 +12,4 @@ stringData:
   {{ $key }}: {{ $value | quote }}
 {{- end }}
 {{- end }}
-{{- if .Values.database }}
-  DATABASE_PASSWORD: {{ .Values.database.password | quote }}
-{{- end }}
 `.trim();

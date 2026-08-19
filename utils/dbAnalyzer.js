@@ -22,6 +22,7 @@ function fetchDockerTags(image) {
 async function getLatestDbImage(dbType) {
   let image = 'postgres';
   if (dbType === 'mysql') image = 'mysql';
+  else if (dbType === 'mariadb') image = 'mariadb';
   else if (dbType === 'mongodb') image = 'mongo';
   else return null;
 
@@ -36,6 +37,7 @@ async function getLatestDbImage(dbType) {
   if (validTags.length === 0) {
     if (dbType === 'postgres') return 'postgres:15-alpine';
     if (dbType === 'mysql') return 'mysql:8';
+    if (dbType === 'mariadb') return 'mariadb:10';
     if (dbType === 'mongodb') return 'mongo:latest';
   }
 
@@ -56,6 +58,7 @@ async function getLatestDbImage(dbType) {
 const DB_PORTS = {
   postgres: 5432,
   mysql: 3306,
+  mariadb: 3306,
   mongodb: 27017,
   sqlite: 0
 };
@@ -79,6 +82,9 @@ async function checkEnvVars(baseDir, backendPath, onlyFiles = ['.env']) {
           }
           if (testRegex(content, 'mysql:\\/\\/') || testRegex(content, 'MYSQL_DATABASE')) {
             return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
+          }
+          if (testRegex(content, 'mariadb:\\/\\/') || testRegex(content, 'MARIADB_DATABASE')) {
+            return { hasDb: true, dbType: 'mariadb', port: DB_PORTS.mariadb };
           }
           if (testRegex(content, 'mongodb(?:\\+srv)?:\\/\\/') || testRegex(content, 'MONGO_URI')) {
             return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
@@ -113,6 +119,7 @@ async function checkORM(baseDir, backendPath) {
           const content = await fs.readFile(path.join(dir, file), 'utf8');
           if (testRegex(content, 'type\\s*[:=]\\s*["\']postgres["\']')) return { hasDb: true, dbType: 'postgres', port: DB_PORTS.postgres };
           if (testRegex(content, 'type\\s*[:=]\\s*["\']mysql["\']')) return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
+          if (testRegex(content, 'type\\s*[:=]\\s*["\']mariadb["\']')) return { hasDb: true, dbType: 'mariadb', port: DB_PORTS.mariadb };
           if (testRegex(content, 'type\\s*[:=]\\s*["\']mongodb["\']')) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
         } catch (e) {}
       }
@@ -133,6 +140,7 @@ async function checkPackageJson(backendPath) {
 
     if (deps['pg'] || deps['pg-promise']) return { hasDb: true, dbType: 'postgres', port: DB_PORTS.postgres };
     if (deps['mysql2'] || deps['mysql']) return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
+    if (deps['mariadb']) return { hasDb: true, dbType: 'mariadb', port: DB_PORTS.mariadb };
     if (deps['mongoose'] || deps['mongodb']) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
     if (deps['sqlite3']) return { hasDb: true, dbType: 'sqlite', port: DB_PORTS.sqlite };
   } catch (err) {}
@@ -154,8 +162,8 @@ async function extractDbCredentials(baseDir, backendPath) {
   let dbUser = null;
   let dbName = null;
 
-  const userRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_USER|DB_USER|POSTGRES_USER|MYSQL_USER|MONGO_INITDB_ROOT_USERNAME)\s*[:=]\s*["']?([^"'\s]+)["']?/im;
-  const nameRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_DB|DB_NAME|DATABASE_NAME|POSTGRES_DB|MYSQL_DATABASE|MONGO_INITDB_DATABASE)\s*[:=]\s*["']?([^"'\s]+)["']?/im;
+  const userRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_USER|DB_USER|POSTGRES_USER|MYSQL_USER|MARIADB_USER|MONGO_INITDB_ROOT_USERNAME)\s*[:=]\s*["']?([^"'\s]+)["']?/im;
+  const nameRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_DB|DB_NAME|DATABASE_NAME|POSTGRES_DB|MYSQL_DATABASE|MARIADB_DATABASE|MONGO_INITDB_DATABASE)\s*[:=]\s*["']?([^"'\s]+)["']?/im;
 
   for (const file of filesToScan) {
     try {
@@ -163,6 +171,7 @@ async function extractDbCredentials(baseDir, backendPath) {
       
       const urlMatch = content.match(/postgres(?:ql)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i) ||
                        content.match(/mysql:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i) ||
+                       content.match(/mariadb:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i) ||
                        content.match(/mongodb(?:\+srv)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i);
       
       if (urlMatch && !dbUser && !dbName) {

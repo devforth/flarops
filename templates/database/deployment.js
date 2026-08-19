@@ -10,27 +10,28 @@ module.exports = (config) => {
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.projectName }}-secrets
-                  key: DATABASE_PASSWORD
+                  key: ${config.dbPasswordKey}
             - name: POSTGRES_DB
               value: {{ .Values.database.name | quote }}`;
     volumeMountPath = '/var/lib/postgresql/data';
-  } else if (config.dbType === 'mysql') {
+  } else if (config.dbType === 'mysql' || config.dbType === 'mariadb') {
+    const prefix = config.dbType === 'mariadb' ? 'MARIADB' : 'MYSQL';
     envBlock = `
-            - name: MYSQL_DATABASE
+            - name: ${prefix}_DATABASE
               value: {{ .Values.database.name | quote }}
-            - name: MYSQL_ROOT_PASSWORD
+            - name: ${prefix}_ROOT_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.projectName }}-secrets
-                  key: DATABASE_PASSWORD
+                  key: ${config.dbPasswordKey}
 {{- if ne .Values.database.user "root" }}
-            - name: MYSQL_USER
+            - name: ${prefix}_USER
               value: {{ .Values.database.user | quote }}
-            - name: MYSQL_PASSWORD
+            - name: ${prefix}_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.projectName }}-secrets
-                  key: DATABASE_PASSWORD
+                  key: ${config.dbPasswordKey}
 {{- end }}`;
     volumeMountPath = '/var/lib/mysql';
   } else if (config.dbType === 'mongodb') {
@@ -41,7 +42,7 @@ module.exports = (config) => {
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.projectName }}-secrets
-                  key: DATABASE_PASSWORD
+                  key: ${config.dbPasswordKey}
             - name: MONGO_INITDB_DATABASE
               value: {{ .Values.database.name | quote }}`;
     volumeMountPath = '/data/db';
