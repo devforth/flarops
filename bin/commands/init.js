@@ -593,7 +593,27 @@ CLOUDFLARE_ZONE_ID=
     fs.writeFileSync(envFile, envContent);
     console.log("Created deploy/.env");
   } else {
-    console.log("deploy/.env already exists");
+    let existingEnv = fs.readFileSync(envFile, 'utf8');
+    let appended = false;
+    
+    if (finalDbPassword && !existingEnv.includes(`${finalDbPasswordKey}=`)) {
+      fs.appendFileSync(envFile, `\n${finalDbPasswordKey}="${finalDbPassword}"\n`);
+      console.log(`Appended fallback ${finalDbPasswordKey} to deploy/.env`);
+      appended = true;
+    }
+    
+    // Also append any new sensitive variables that aren't already there
+    const sensitiveLines = sensitiveEnvContent.split('\\n');
+    for (const sLine of sensitiveLines) {
+      if (sLine.trim() && !existingEnv.includes(sLine.split('=')[0] + '=')) {
+        fs.appendFileSync(envFile, `${sLine}\\n`);
+        appended = true;
+      }
+    }
+    
+    if (!appended) {
+      console.log("deploy/.env already exists and is up to date");
+    }
   }
 
   const envSafetyFile = path.join(deployDir, '.env.safety');

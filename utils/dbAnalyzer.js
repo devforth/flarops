@@ -147,6 +147,21 @@ async function checkPackageJson(backendPath) {
   return null;
 }
 
+async function checkRequirementsTxt(backendPath) {
+  try {
+    const reqPath = path.join(backendPath, 'requirements.txt');
+    const content = await fs.readFile(reqPath, 'utf8');
+    const lines = content.split('\n').map(l => l.toLowerCase());
+    
+    for (const line of lines) {
+      if (line.includes('psycopg2') || line.includes('asyncpg') || line.includes('sqlalchemy')) return { hasDb: true, dbType: 'postgres', port: DB_PORTS.postgres }; // Defaulting SQLAlchemy to Postgres, common
+      if (line.includes('mysqlclient') || line.includes('pymysql')) return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
+      if (line.includes('pymongo') || line.includes('mongoengine')) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
+    }
+  } catch (err) {}
+  return null;
+}
+
 async function extractDbCredentials(baseDir, backendPath) {
   const filesToScan = [
     path.join(baseDir, '.env'),
@@ -248,6 +263,12 @@ async function analyzeDatabase(baseDir, backendPath) {
   if (!result) {
     const pkgResult = await checkPackageJson(backendPath);
     if (pkgResult) result = pkgResult;
+  }
+
+  // Priority 2.5: Python requirements.txt
+  if (!result) {
+    const reqResult = await checkRequirementsTxt(backendPath);
+    if (reqResult) result = reqResult;
   }
 
   // Priority 3: Environment Variables (real .env)
