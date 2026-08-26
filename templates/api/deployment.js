@@ -2,13 +2,29 @@ module.exports = (config) => {
   let dbUrlEnvBlock = '';
   if (config.dbUrlVars && config.dbUrlVars.length > 0 && config.dbType) {
     let scheme = 'postgres';
-    if (config.dbType === 'mysql' || config.dbType === 'mariadb') scheme = 'mysql';
-    else if (config.dbType === 'mongodb') scheme = 'mongodb';
+    let defaultPort = 5432;
+    let mongoAuth = '';
+    
+    if (config.dbType === 'mysql' || config.dbType === 'mariadb') {
+      scheme = 'mysql';
+      defaultPort = 3306;
+    } else if (config.dbType === 'mongodb') {
+      scheme = 'mongodb';
+      defaultPort = 27017;
+      mongoAuth = '?authSource=admin';
+    }
+
+    if (config.dbPort) defaultPort = config.dbPort;
 
     for (const urlVar of config.dbUrlVars) {
+      let query = urlVar.query || '';
+      if (scheme === 'mongodb' && !query.includes('authSource')) {
+        query += (query ? '&' : '') + mongoAuth;
+      }
+      
       dbUrlEnvBlock += `
             - name: ${urlVar.key}
-              value: "${scheme}://{{ .Values.database.user }}:$(${config.dbPasswordKey})@database:{{ .Values.dbPort | default 5432 }}/{{ .Values.database.name }}${urlVar.query}"`;
+              value: "${scheme}://{{ .Values.database.user }}:$(${config.dbPasswordKey})@database:{{ .Values.dbPort | default ${defaultPort} }}/{{ .Values.database.name }}${query}"`;
     }
   }
 
@@ -48,6 +64,12 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
 {{- end }}${dbUrlEnvBlock}
+{{- if .Values.database }}
+            - name: DATABASE_PASSWORD
+              value: {{ .Values.database.password | quote }}
+            - name: {{ "${config.dbPasswordKey}" }}
+              value: {{ .Values.database.password | quote }}
+{{- end }}
 {{- end }}
           resources:
             requests:
@@ -56,5 +78,19 @@ spec:
             limits:
               memory: "256Mi"
               cpu: "500m"
+{{- if .Values.api.healthRoute }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.api.healthRoute }}
+              port: {{ index .Values.apiPorts 0 | default 3000 }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.api.healthRoute }}
+              port: {{ index .Values.apiPorts 0 | default 3000 }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+{{- end }}
 `.trim();
 };

@@ -16,6 +16,17 @@ spec:
     - http:
 {{- end }}
         paths:
+{{- if .Values.apiRoutes }}
+{{- range $route := .Values.apiRoutes }}
+          - path: {{ $route }}
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: {{ index $.Values.apiPorts 0 | default 3000 }}
+{{- end }}
+{{- end }}
           - path: /
             pathType: Prefix
             backend:

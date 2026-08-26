@@ -40,4 +40,16 @@ spec:
             limits:
               memory: "128Mi"
               cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: {{ index .Values.frontendPorts 0 | default 80 }}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /
+              port: {{ index .Values.frontendPorts 0 | default 80 }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
 `.trim();

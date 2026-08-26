@@ -57,6 +57,28 @@ function writeFileIfNotExists(filePath, content, logMessage, logIfExistsMessage)
 const sensitiveRegex = /(PASSWORD|KEY|SECRET|TOKEN|CREDENTIALS|AUTH|SALT|CERT)/i;
 const dbPasswordRegex = /^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)$/i;
 
+const crypto = require('crypto');
+const generatedVarsCache = {};
+
+function sanitizeEnvValue(val) {
+  let cleaned = val;
+  const commentIdx = cleaned.indexOf('#');
+  if (commentIdx !== -1) {
+    cleaned = cleaned.substring(0, commentIdx).trim();
+  }
+  cleaned = cleaned.replace(/^["']|["']$/g, '').trim();
+
+  const varRegex = /\$\{\{?([^}]+)\}\}?|\$([a-zA-Z_][a-zA-Z0-9_]*)/g;
+  cleaned = cleaned.replace(varRegex, (match, g1, g2) => {
+    const varName = (g1 || g2).trim();
+    if (!generatedVarsCache[varName]) {
+      generatedVarsCache[varName] = crypto.randomBytes(8).toString('hex');
+    }
+    return generatedVarsCache[varName];
+  });
+  return cleaned;
+}
+
 function processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext) {
   if (foundDbUrls[key]) return;
   if (dbPasswordRegex.test(key)) return;
@@ -141,6 +163,16 @@ module.exports = async function init() {
 
   const domainAnswer = await askQuestion('enter project domain (Press enter if you not using domain name): ');
   const domain = domainAnswer.trim();
+
+  let cloudflareApiToken = '';
+  let cloudflareZoneId = '';
+  if (domain) {
+    const useCloudflare = await askQuestion('Do you want to configure Cloudflare DNS for this domain automatically? (y/n): ');
+    if (useCloudflare.trim().toLowerCase() === 'y' || useCloudflare.trim().toLowerCase() === 'yes') {
+      cloudflareApiToken = (await askPassword('Enter Cloudflare API Token: ')).trim();
+      cloudflareZoneId = (await askQuestion('Enter Cloudflare Zone ID: ')).trim();
+    }
+  }
   let projectName = path.basename(currentDir).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
   if (!projectName) projectName = 'flarops-project';
   let awsCredentials = { accessKey: '', secretKey: '' };
@@ -213,17 +245,36 @@ module.exports = async function init() {
   ensureDir(deployDir, "Created deploy/ directory");
   ensureDir(terraformDir, "Created deploy/terraform/ directory");
 
+  const cloudflareProviderBlock = cloudflareApiToken && cloudflareZoneId ? `
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 4.0"
+    }` : '';
+
+  const cloudflareProviderConfig = cloudflareApiToken && cloudflareZoneId ? `
+provider "cloudflare" {
+  api_token = var.cloudflare_api_token
+}
+` : '';
+
   const mainTfContent = `terraform {
   backend "s3" {
     bucket = "${remoteStateBucket}"
     key    = "terraform.tfstate"
     region = "us-west-2"
   }
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }${cloudflareProviderBlock}
+  }
 }
 
 provider "aws" {
   region = var.aws_region
 }
+${cloudflareProviderConfig}
 
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
@@ -345,11 +396,50 @@ resource "aws_eip" "eip" {
   instance = aws_instance.server.id
   domain   = "vpc"
 }
+`;
 
+  const cloudflareResourceBlock = cloudflareApiToken && cloudflareZoneId ? `
+resource "cloudflare_record" "domain" {
+  count   = var.cloudflare_zone_id != "" ? 1 : 0
+  zone_id = var.cloudflare_zone_id
+  name    = var.domain
+  value   = aws_eip.eip.public_ip
+  type    = "A"
+  proxied = true
+}
+
+resource "cloudflare_record" "wildcard" {
+  count   = var.cloudflare_zone_id != "" ? 1 : 0
+  zone_id = var.cloudflare_zone_id
+  name    = "*"
+  value   = aws_eip.eip.public_ip
+  type    = "A"
+  proxied = true
+}
+` : '';
+
+  const mainTfContentEnd = `
 output "public_ip" {
   value = aws_eip.eip.public_ip
 }
-`;
+${cloudflareResourceBlock}`;
+
+  const finalMainTfContent = mainTfContent + mainTfContentEnd;
+
+  const cloudflareVarsBlock = cloudflareApiToken && cloudflareZoneId ? `
+variable "cloudflare_api_token" {
+  description = "Cloudflare API Token"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "cloudflare_zone_id" {
+  description = "Cloudflare Zone ID"
+  type        = string
+  default     = ""
+}
+` : '';
 
   const variablesTfContent = `variable "aws_region" {
   description = "AWS region"
@@ -381,10 +471,16 @@ variable "ssh_public_key" {
   default     = "${publicKey}"
   sensitive   = true
 }
+${cloudflareVarsBlock}
+variable "domain" {
+  description = "Domain Name"
+  type        = string
+  default     = "${domain}"
+}
 `;
 
   const mainTfFile = path.join(terraformDir, 'main.tf');
-  writeFileIfNotExists(mainTfFile, mainTfContent, "Created deploy/terraform/main.tf", "deploy/terraform/main.tf already exists and is not empty");
+  writeFileIfNotExists(mainTfFile, finalMainTfContent, "Created deploy/terraform/main.tf", "deploy/terraform/main.tf already exists and is not empty");
 
   const variablesTfFile = path.join(terraformDir, 'variables.tf');
   writeFileIfNotExists(variablesTfFile, variablesTfContent, "Created deploy/terraform/variables.tf", "deploy/terraform/variables.tf already exists");
@@ -395,7 +491,7 @@ variable "ssh_public_key" {
     try {
       files = fs.readdirSync(dir);
     } catch (e) { return fileList; }
-    
+
     for (const file of files) {
       if (ignoredDirs.has(file)) continue;
       const fullPath = path.join(dir, file);
@@ -406,13 +502,15 @@ variable "ssh_public_key" {
         } else if (file === '.env') {
           fileList.push(fullPath);
         }
-      } catch (e) {}
+      } catch (e) { }
     }
     return fileList;
   }
 
-  const { analyzeBackend, analyzeFrontend } = require('../../utils/analyzer.js');
-  const { analyzeDatabase } = require('../../utils/dbAnalyzer.js');
+  const { analyzeBackend, analyzeFrontend } = require('../../utils/analyzer');
+  const { analyzeDatabase } = require('../../utils/dbAnalyzer');
+  const { analyzeFrontendRoutes } = require('../../utils/routeAnalyzer');
+  const { refactorFrontendEnv, refactorBackendDbUrl, refactorNginxConf } = require('../../utils/envRefactor');
 
   const [backendInfo, frontendInfo] = await Promise.all([
     analyzeBackend(currentDir),
@@ -421,10 +519,51 @@ variable "ssh_public_key" {
 
   const dbInfo = await analyzeDatabase(currentDir, backendInfo.backendPath);
 
-  const envFiles = findEnvFiles(currentDir);
-  let foundDbPasswords = [];
+  let refactoredEnvKey = null;
+  let refactoredRoutes = [];
+  if (frontendInfo.frontendPath && backendInfo.ports && backendInfo.ports.length > 0) {
+    const doRefactor = await askQuestion('\x1b[36m? \x1b[0mDo you want to automatically refactor hardcoded frontend API URLs to environment variables? (y/n) ');
+    if (doRefactor.toLowerCase() === 'y' || doRefactor.toLowerCase() === 'yes') {
+      const refactorResult = await refactorFrontendEnv(frontendInfo.frontendPath, backendInfo.ports);
+      const nginxRefactorCount = await refactorNginxConf(frontendInfo.frontendPath, backendInfo.ports);
+      if (nginxRefactorCount > 0) {
+        console.log(`\x1b[32mSuccessfully refactored ${nginxRefactorCount} Nginx config files to point to the correct Kubernetes backend service.\x1b[0m`);
+      }
+      if (refactorResult) {
+        refactoredEnvKey = refactorResult.envVarKey;
+        if (refactorResult.discoveredRoutes) {
+          refactoredRoutes = refactorResult.discoveredRoutes;
+        }
+        console.log(`\x1b[32mSuccessfully refactored ${refactorResult.filesChanged} files to use ${refactoredEnvKey}.\x1b[0m`);
+      }
+    }
+  }
+
   let foundDbUrls = {};
   
+  if (backendInfo.backendPath && dbInfo.hasDb) {
+    let dbRefactorResult = await refactorBackendDbUrl(backendInfo.backendPath, false);
+    
+    if (dbRefactorResult && dbRefactorResult.hasHardcoded) {
+      const doDbRefactor = await askQuestion('\x1b[36m? \x1b[0mDo you want to automatically refactor hardcoded database URLs in the backend to environment variables? (y/n) ');
+      if (doDbRefactor.toLowerCase() === 'y' || doDbRefactor.toLowerCase() === 'yes') {
+        dbRefactorResult = await refactorBackendDbUrl(backendInfo.backendPath, true);
+        if (dbRefactorResult && dbRefactorResult.filesChanged > 0) {
+          console.log(`\x1b[32mSuccessfully refactored ${dbRefactorResult.filesChanged} backend files to use ${dbRefactorResult.discoveredVars.join(', ')}.\x1b[0m`);
+        }
+      }
+    }
+    
+    if (dbRefactorResult && dbRefactorResult.discoveredVars.length > 0) {
+      for (const dbVar of dbRefactorResult.discoveredVars) {
+        foundDbUrls[dbVar] = { key: dbVar, query: '' };
+      }
+    }
+  }
+
+  const envFiles = findEnvFiles(currentDir);
+  let foundDbPasswords = [];
+
   let apiEnv = {};
   let frontendEnv = {};
   const sensitiveRegex = /(PASSWORD|KEY|SECRET|TOKEN|CREDENTIALS|AUTH|SALT|CERT)/i;
@@ -433,10 +572,10 @@ variable "ssh_public_key" {
   for (const file of envFiles) {
     const content = fs.readFileSync(file, 'utf8');
     const isRoot = file === path.join(currentDir, '.env');
-    
+
     let isBackend = false;
     let isFrontend = false;
-    
+
     if (backendInfo.backendPath && file.startsWith(backendInfo.backendPath)) {
       isBackend = true;
     } else if (frontendInfo.frontendPath && file.startsWith(frontendInfo.frontendPath)) {
@@ -467,24 +606,28 @@ variable "ssh_public_key" {
           const tempVal = val.replace(/\${([^}]+)}/g, 'BASH_VAR_$1');
           const urlObj = new URL(tempVal);
           query = urlObj.search || '';
-        } catch (e) {}
+        } catch (e) { }
         foundDbUrls[key] = { key, query };
       }
     }
-    
+
     const lines = content.split('\n');
     for (const line of lines) {
       const lineMatch = line.match(/^([A-Z_][A-Z0-9_]*)\s*=(.*)$/);
       if (lineMatch) {
         const key = lineMatch[1];
-        const val = lineMatch[2];
-        
-        const cleanedVal = val.replace(/^["']|["']$/g, '').trim();
+        let val = lineMatch[2];
+        val = sanitizeEnvValue(val);
+
         let sensitiveContext = { content: sensitiveEnvContent };
-        processEnvVariable(key, cleanedVal, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext);
+        processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext);
         sensitiveEnvContent = sensitiveContext.content;
       }
     }
+  }
+
+  if (refactoredEnvKey) {
+    frontendEnv[refactoredEnvKey] = '';
   }
 
   // Parse docker-compose.yml environment blocks
@@ -494,7 +637,7 @@ variable "ssh_public_key" {
     try {
       composeContent = fs.readFileSync(path.join(currentDir, cf), 'utf8');
       break;
-    } catch(e) {}
+    } catch (e) { }
   }
 
   if (composeContent) {
@@ -504,21 +647,21 @@ variable "ssh_public_key" {
     while ((match = serviceRegex.exec(composeContent)) !== null) {
       services.push({ name: match[1], index: match.index });
     }
-    
+
     for (let i = 0; i < services.length; i++) {
       const start = services[i].index;
       const end = i + 1 < services.length ? services[i + 1].index : composeContent.length;
       const block = composeContent.substring(start, end);
-      
+
       let isBackend = ['api', 'backend', 'server'].includes(services[i].name) || (backendInfo.backendPath && backendInfo.backendPath.includes(services[i].name));
       let isFrontend = ['frontend', 'client', 'ui', 'web'].includes(services[i].name) || (frontendInfo.frontendPath && frontendInfo.frontendPath.includes(services[i].name));
-      
+
       if (!isBackend && !isFrontend) continue;
-      
+
       const lines = block.split('\n');
       let inEnv = false;
       let envIndent = 0;
-      
+
       for (const line of lines) {
         if (!inEnv) {
           const m = line.match(/^([ \t]+)environment:\s*$/);
@@ -530,7 +673,7 @@ variable "ssh_public_key" {
           if (line.trim() === '') continue;
           const indentMatch = line.match(/^([ \t]*)/);
           const lineIndent = indentMatch ? indentMatch[1].length : 0;
-          
+
           if (lineIndent <= envIndent) {
             if (lineIndent === envIndent && line.trim().startsWith('-')) {
               // Valid list item at same indent
@@ -539,12 +682,12 @@ variable "ssh_public_key" {
               break; // exit environment block
             }
           }
-          
+
           const envLineMatch = line.match(/^[ \t]+(?:-\s+)?([A-Z_][A-Z0-9_]*)\s*[:=]\s*(.*)$/);
           if (envLineMatch) {
             const key = envLineMatch[1];
-            const val = envLineMatch[2].replace(/^["']|["']$/g, '').trim();
-            
+            let val = sanitizeEnvValue(envLineMatch[2]);
+
             let sensitiveContext = { content: sensitiveEnvContent };
             processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext);
             sensitiveEnvContent = sensitiveContext.content;
@@ -554,13 +697,38 @@ variable "ssh_public_key" {
     }
   }
 
+  if (dbInfo.hasDb) {
+    let defaultDbPort = 3306;
+    if (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql') defaultDbPort = 5432;
+    else if (dbInfo.dbType === 'mongodb') defaultDbPort = 27017;
+    else if (dbInfo.dbType === 'redis') defaultDbPort = 6379;
+
+    const dbHostKeys = Object.keys(apiEnv).filter(k => /(_HOST|_HOSTNAME|_SERVER|_SERVER_NAME)$/i.test(k));
+    
+    let dbPrefix = 'DATABASE';
+    if (dbHostKeys.length > 0) {
+      dbPrefix = dbHostKeys[0].replace(/(_HOST|_HOSTNAME|_SERVER|_SERVER_NAME)$/i, '');
+      dbHostKeys.forEach(k => {
+        const val = String(apiEnv[k]).toLowerCase();
+        if (/(db|database|mysql|postgres|mariadb|mongo|redis|localhost|127\.0\.0\.1)/i.test(val)) {
+          apiEnv[k] = 'database';
+        }
+      });
+    }
+
+    const portKey = `${dbPrefix}_PORT`;
+    if (!apiEnv[portKey] || isNaN(apiEnv[portKey])) {
+      apiEnv[portKey] = String(defaultDbPort);
+    }
+  }
+
   let finalDbPasswordKey = 'DATABASE_PASSWORD';
   let finalDbPassword = '';
   if (foundDbPasswords.length > 0) {
     finalDbPasswordKey = foundDbPasswords[0].key;
     finalDbPassword = foundDbPasswords[0].value;
     if (foundDbPasswords.length > 1) {
-       console.log(`\x1b[33mWARNING: Found multiple database passwords in .env files. Using ${finalDbPasswordKey} from ${foundDbPasswords[0].file}\x1b[0m`);
+      console.log(`\x1b[33mWARNING: Found multiple database passwords in .env files. Using ${finalDbPasswordKey} from ${foundDbPasswords[0].file}\x1b[0m`);
     }
   } else if (dbInfo.hasDb) {
     if (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql') finalDbPasswordKey = 'POSTGRES_PASSWORD';
@@ -578,11 +746,16 @@ AWS_ACCESS_KEY_ID="${awsCredentials.accessKey}"
 AWS_SECRET_ACCESS_KEY="${awsCredentials.secretKey}"
 SSH_PRIVATE_KEY="${privateKey}"
 REGISTRY_PASSWORD="${registryPassword}"
-CLOUDFLARE_API_TOKEN=
-CLOUDFLARE_ZONE_ID=
 `;
 
-  envContent += `\n# Extracted sensitive variables from project .env files\n${sensitiveEnvContent}`;
+  if (cloudflareApiToken && cloudflareZoneId) {
+    envContent += `CLOUDFLARE_API_TOKEN="${cloudflareApiToken}"\n`;
+    envContent += `CLOUDFLARE_ZONE_ID="${cloudflareZoneId}"\n`;
+  }
+
+  if (sensitiveEnvContent && sensitiveEnvContent.trim()) {
+    envContent += `\n# Extracted sensitive variables from project .env files\n${sensitiveEnvContent}`;
+  }
 
   if (finalDbPassword && !envContent.includes(`${finalDbPasswordKey}=`)) {
     envContent += `${finalDbPasswordKey}="${finalDbPassword}"\n`;
@@ -595,13 +768,13 @@ CLOUDFLARE_ZONE_ID=
   } else {
     let existingEnv = fs.readFileSync(envFile, 'utf8');
     let appended = false;
-    
+
     if (finalDbPassword && !existingEnv.includes(`${finalDbPasswordKey}=`)) {
       fs.appendFileSync(envFile, `\n${finalDbPasswordKey}="${finalDbPassword}"\n`);
       console.log(`Appended fallback ${finalDbPasswordKey} to deploy/.env`);
       appended = true;
     }
-    
+
     // Also append any new sensitive variables that aren't already there
     const sensitiveLines = sensitiveEnvContent.split('\\n');
     for (const sLine of sensitiveLines) {
@@ -610,7 +783,7 @@ CLOUDFLARE_ZONE_ID=
         appended = true;
       }
     }
-    
+
     if (!appended) {
       console.log("deploy/.env already exists and is up to date");
     }
@@ -635,6 +808,16 @@ DOMAIN=${domain}
     fs.mkdirSync(helmTemplatesDir, { recursive: true });
     console.log("Created deploy/helm and deploy/helm/templates directories");
   }
+
+  let apiRoutes = ['/api'];
+  if (refactoredRoutes && refactoredRoutes.length > 0) {
+    apiRoutes = refactoredRoutes;
+    console.log(`Using API Routes discovered during refactoring: ${apiRoutes.join(', ')}`);
+  } else if (frontendInfo.frontendPath) {
+    apiRoutes = await analyzeFrontendRoutes(frontendInfo.frontendPath);
+    console.log(`Discovered API Routes in frontend: ${apiRoutes.join(', ')}`);
+  }
+  
 
   const relativeBackendPath = backendInfo.backendPath ? path.relative(currentDir, backendInfo.backendPath) || '.' : null;
   const relativeFrontendPath = frontendInfo.frontendPath ? path.relative(currentDir, frontendInfo.frontendPath) || '.' : null;
@@ -674,8 +857,15 @@ DOMAIN=${domain}
     dbLocalDockerfile: dbInfo.hasDb ? dbInfo.localDbDockerfile : null,
     dbContext: dbInfo.hasDb ? dbInfo.dbContext : null,
     dbPasswordKey: finalDbPasswordKey,
-    dbUrlVars: Object.values(foundDbUrls)
+    dbUrlVars: Object.values(foundDbUrls),
+    apiRoutes,
+    apiHealthRoute: backendInfo.healthRoute || null,
+    hasCloudflare: !!(cloudflareApiToken && cloudflareZoneId)
   };
+
+  if (backendInfo.hasBackend && backendInfo.healthRoute) {
+    console.log(`Discovered Backend Health Route: ${backendInfo.healthRoute}`);
+  }
 
   // Write Chart.yaml
   const chartYaml = `apiVersion: v2
@@ -694,12 +884,22 @@ appVersion: "1.0.0"
   const finalDbUser = config.dbUser || defaultDbUser;
   const finalDbName = config.dbName || 'appdb';
 
+  if (config.dbType) {
+    const dbUserKeys = ['DATABASE_USER', 'DB_USER', 'POSTGRES_USER', 'MYSQL_USER', 'MARIADB_USER', 'MONGO_INITDB_ROOT_USERNAME'];
+    const dbNameKeys = ['DATABASE_DB', 'DB_NAME', 'DATABASE_NAME', 'POSTGRES_DB', 'MYSQL_DATABASE', 'MARIADB_DATABASE', 'MONGO_INITDB_DATABASE'];
+    
+    for (const key of Object.keys(apiEnv)) {
+      if (dbUserKeys.includes(key)) apiEnv[key] = finalDbUser;
+      if (dbNameKeys.includes(key)) apiEnv[key] = finalDbName;
+    }
+  }
+
   let hasLocalhostWarnings = false;
   let contextObj = { hasLocalhostWarnings };
 
   let apiEnvString = generateEnvString(apiEnv, contextObj);
   let frontendEnvString = generateEnvString(frontendEnv, contextObj);
-  
+
   hasLocalhostWarnings = contextObj.hasLocalhostWarnings;
 
   // Write values.yaml
@@ -719,6 +919,7 @@ database:
   env:
     # KEY: "VALUE"
 api:
+  healthRoute: ${config.apiHealthRoute ? `"${config.apiHealthRoute}"` : 'null'}
   env:
 ${apiEnvString}
 frontend:
@@ -728,6 +929,8 @@ apiPorts:
 ${config.apiPorts.map(p => `  - ${p}`).join('\n')}
 frontendPorts:
 ${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
+apiRoutes:
+${config.apiRoutes.map(p => `  - "${p}"`).join('\n')}
 `;
   fs.writeFileSync(path.join(helmDir, 'values.yaml'), valuesYaml);
 
@@ -741,7 +944,7 @@ ${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
   const frontendServiceTemplate = require('../../templates/frontend/service.js');
 
   const templatesToGenerate = [
-    { file: path.join(helmTemplatesDir, '01-ingress.yaml'), content: ingressTemplate() },
+    { file: path.join(helmTemplatesDir, '01-ingress.yaml'), content: ingressTemplate(config) },
     { file: path.join(helmTemplatesDir, 'secret.yaml'), content: secretTemplate() },
     { file: path.join(helmTemplatesDir, 'api.yaml'), content: apiServiceTemplate() + '\n---\n' + apiDeploymentTemplate(config) },
     { file: path.join(helmTemplatesDir, 'frontend.yaml'), content: frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate() }
@@ -772,12 +975,12 @@ ${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
   console.log("# Next, follow the instructions in FLAROPS.md to deploy the application for the first time. #");
   console.log("#############################################################################################");
   console.log("");
-  
+
   if (s3BucketWarning) {
     console.log(s3BucketWarning);
     console.log("");
   }
-  
+
   if (hasLocalhostWarnings) {
     console.log(`\x1b[36mATTENTION: We found "localhost" references in your environment variables.\x1b[0m`);
     console.log(`\x1b[36mPlease open deploy/helm/values.yaml and change "localhost" to the appropriate service name (e.g. "api", "frontend", or "database") so containers can communicate properly in Kubernetes!\x1b[0m`);

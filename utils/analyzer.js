@@ -8,11 +8,11 @@ async function findPortsInCompose(baseDir, possibleServiceNames) {
     try {
       const content = await fs.readFile(path.join(baseDir, file), 'utf8');
       for (const serviceName of possibleServiceNames) {
-        // Match the service block
-        const serviceRegex = new RegExp('^\\s{2}' + serviceName + ':\\s*$([\\s\\S]*?)(?=^\\s{2}[a-zA-Z0-9_-]+:\\s*$|^\\S)', 'gm');
+        // Match the service block with dynamic indentation
+        const serviceRegex = new RegExp('^([ \\t]+)' + serviceName + ':\\s*$([\\s\\S]*?)(?=^\\1[a-zA-Z0-9_-]+:\\s*$|^\\S|(?![\\s\\S]))', 'gm');
         let match;
         while ((match = serviceRegex.exec(content)) !== null) {
-          const serviceBlock = match[1];
+          const serviceBlock = match[2];
           // Find port mappings like "80:80", "127.0.0.1:3000:3000"
           const portRegex = /^\s*-\s*["']?(?:\d+\.\d+\.\d+\.\d+:)?\d+:(\d+)["']?/gm;
           let portMatch;
@@ -112,11 +112,34 @@ async function findDockerfile(dir) {
   return 'Dockerfile';
 }
 
+async function findHealthRoute(backendPath) {
+  const possibleRoutes = ['\\/healthz', '\\/health', '\\/ping', '\\/status', '\\/ready', '\\/live'];
+  const regex = new RegExp(`['"\`](?:\\/api)?(${possibleRoutes.join('|')})['"\`]`, 'i');
+
+  let filesToScan = await walkDir(backendPath);
+  
+  for (const filePath of filesToScan) {
+    const ext = path.extname(filePath);
+    if (!['.js', '.ts', '.go', '.py', '.java', '.cs', '.php'].includes(ext)) continue;
+    try {
+      const content = await fs.readFile(filePath, 'utf8');
+      const match = regex.exec(content);
+      if (match && match[1]) {
+        return match[1]; // Found a health route
+      }
+    } catch(e) {}
+  }
+  
+  return null; // Fallback
+}
+
 async function analyzeBackend(baseDir) {
-  const possibleDirs = ['api', 'backend', 'server'];
+  const exactDirs = ['api', 'backend', 'server'];
+  const partialDirs = ['api', 'backend', 'server', 'app'];
   let backendPath = null;
 
-  for (const dir of possibleDirs) {
+  // 1. Try exact match first
+  for (const dir of exactDirs) {
     const fullPath = path.join(baseDir, dir);
     try {
       const stat = await fs.stat(fullPath);
@@ -127,22 +150,42 @@ async function analyzeBackend(baseDir) {
     } catch (err) { }
   }
 
+  // 2. Fallback to partial match (e.g., 'kanban-app', 'my-api')
   if (!backendPath) {
-    return { hasBackend: false, backendPath: null, port: 3000 };
+    try {
+      const files = await fs.readdir(baseDir, { withFileTypes: true });
+      for (const file of files) {
+        if (file.isDirectory() && !file.name.startsWith('.') && file.name !== 'node_modules') {
+          const lowerName = file.name.toLowerCase();
+          // Avoid matching frontend folders as backend
+          if (['ui', 'frontend', 'client', 'web', 'front'].some(k => lowerName.includes(k))) continue;
+          
+          if (partialDirs.some(k => lowerName.includes(k))) {
+            backendPath = path.join(baseDir, file.name);
+            break;
+          }
+        }
+      }
+    } catch (err) {}
+  }
+
+  if (!backendPath) {
+    return { hasBackend: false, backendPath: null, port: 3000, healthRoute: null };
   }
 
   const portNamesPattern = ['PORT', 'SERVER_PORT', 'APP_PORT', 'API_PORT', 'HTTP_PORT', 'BACKEND_PORT', 'LISTEN_PORT', 'NODE_PORT', 'SERVICE_PORT'].join('|');
   const dirPorts = await findPortsInDir(baseDir, backendPath, portNamesPattern, 3000);
-  const composePorts = await findPortsInCompose(baseDir, possibleDirs);
+  const composePorts = await findPortsInCompose(baseDir, [...partialDirs, path.basename(backendPath)]);
 
   const dockerfile = await findDockerfile(backendPath);
+  const healthRoute = await findHealthRoute(backendPath);
 
   if (dirPorts.length === 1 && dirPorts[0] === 3000 && composePorts.length > 0) {
-    return { hasBackend: true, backendPath, ports: composePorts, dockerfile };
+    return { hasBackend: true, backendPath, ports: composePorts, dockerfile, healthRoute };
   }
 
   const ports = Array.from(new Set([...dirPorts, ...composePorts]));
-  return { hasBackend: true, backendPath, ports, dockerfile };
+  return { hasBackend: true, backendPath, ports, dockerfile, healthRoute };
 }
 
 async function inferFrontendPortFromPackage(frontendPath) {
@@ -198,10 +241,11 @@ async function analyzeDockerfile(frontendPath) {
 }
 
 async function analyzeFrontend(baseDir) {
-  const possibleDirs = ['frontend', 'client', 'ui', 'web', 'front'];
+  const exactDirs = ['frontend', 'client', 'ui', 'web', 'front'];
   let frontendPath = null;
 
-  for (const dir of possibleDirs) {
+  // 1. Try exact match first
+  for (const dir of exactDirs) {
     const fullPath = path.join(baseDir, dir);
     try {
       const stat = await fs.stat(fullPath);
@@ -210,6 +254,22 @@ async function analyzeFrontend(baseDir) {
         break;
       }
     } catch (err) { }
+  }
+
+  // 2. Fallback to partial match (e.g., 'kanban-ui', 'web-app')
+  if (!frontendPath) {
+    try {
+      const files = await fs.readdir(baseDir, { withFileTypes: true });
+      for (const file of files) {
+        if (file.isDirectory() && !file.name.startsWith('.') && file.name !== 'node_modules') {
+          const lowerName = file.name.toLowerCase();
+          if (exactDirs.some(k => lowerName.includes(k))) {
+            frontendPath = path.join(baseDir, file.name);
+            break;
+          }
+        }
+      }
+    } catch (err) {}
   }
 
   if (!frontendPath) {
@@ -223,7 +283,7 @@ async function analyzeFrontend(baseDir) {
 
   const portNamesPattern = ['PORT', 'FRONTEND_PORT', 'VITE_PORT', 'REACT_APP_PORT', 'NUXT_PORT'].join('|');
   const dirPorts = await findPortsInDir(baseDir, frontendPath, portNamesPattern, primaryPort);
-  const composePorts = await findPortsInCompose(baseDir, possibleDirs);
+  const composePorts = await findPortsInCompose(baseDir, [...exactDirs, path.basename(frontendPath)]);
 
   const dockerfile = await findDockerfile(frontendPath);
 

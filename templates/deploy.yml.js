@@ -36,6 +36,7 @@ env:
   AWS_REGION: us-west-2
   PROJECT_NAME: ${config.projectName}
   REGISTRY_USER: ${config.registryUser}
+  BASE_DOMAIN: ${config.domain}
 ${registryEnv ? '  ' + registryEnv : ''}
 
 jobs:
@@ -68,6 +69,10 @@ jobs:
 
       - name: Terraform Apply
         working-directory: deploy/terraform
+        env:${config.hasCloudflare ? `
+          TF_VAR_cloudflare_api_token: \${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id: \${{ secrets.CLOUDFLARE_ZONE_ID }}` : ''}
+          TF_VAR_domain: \${{ env.BASE_DOMAIN }}
         run: terraform apply -auto-approve
 
       - name: Fetch Kubeconfig from EC2

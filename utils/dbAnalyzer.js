@@ -166,19 +166,19 @@ async function extractDbCredentials(baseDir, backendPath) {
   const filesToScan = [
     path.join(baseDir, '.env'),
     path.join(baseDir, '.env.example'),
-    path.join(backendPath, '.env'),
-    path.join(backendPath, '.env.example'),
+    backendPath ? path.join(backendPath, '.env') : null,
+    backendPath ? path.join(backendPath, '.env.example') : null,
     path.join(baseDir, 'docker-compose.yml'),
     path.join(baseDir, 'docker-compose.yaml'),
     path.join(baseDir, 'compose.yml'),
     path.join(baseDir, 'compose.yaml')
-  ];
+  ].filter(Boolean);
 
   let dbUser = null;
   let dbName = null;
 
-  const userRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_USER|DB_USER|POSTGRES_USER|MYSQL_USER|MARIADB_USER|MONGO_INITDB_ROOT_USERNAME)\s*[:=]\s*["']?([^"'\s]+)["']?/im;
-  const nameRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_DB|DB_NAME|DATABASE_NAME|POSTGRES_DB|MYSQL_DATABASE|MARIADB_DATABASE|MONGO_INITDB_DATABASE)\s*[:=]\s*["']?([^"'\s]+)["']?/im;
+  const userRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_USER|DB_USER|POSTGRES_USER|MYSQL_USER|MARIADB_USER|MONGO_INITDB_ROOT_USERNAME)\s*[:=]\s*["']?([^"'\s#]+|[^"']+)["']?/im;
+  const nameRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_DB|DB_NAME|DATABASE_NAME|POSTGRES_DB|MYSQL_DATABASE|MARIADB_DATABASE|MONGO_INITDB_DATABASE)\s*[:=]\s*["']?([^"'\s#]+|[^"']+)["']?/im;
 
   for (const file of filesToScan) {
     try {
@@ -190,19 +190,19 @@ async function extractDbCredentials(baseDir, backendPath) {
                        content.match(/mongodb(?:\+srv)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i);
       
       if (urlMatch && !dbUser && !dbName) {
-        dbUser = urlMatch[1];
-        dbName = urlMatch[2];
+        if (!/\$\{?/.test(urlMatch[1])) dbUser = urlMatch[1];
+        if (!/\$\{?/.test(urlMatch[2])) dbName = urlMatch[2];
         if (dbUser && dbName) return { user: dbUser, name: dbName };
       }
 
       if (!dbUser) {
         const userMatch = content.match(userRegex);
-        if (userMatch) dbUser = userMatch[1];
+        if (userMatch && !/\$\{?/.test(userMatch[1])) dbUser = userMatch[1].trim();
       }
 
       if (!dbName) {
         const nameMatch = content.match(nameRegex);
-        if (nameMatch) dbName = nameMatch[1];
+        if (nameMatch && !/\$\{?/.test(nameMatch[1])) dbName = nameMatch[1].trim();
       }
 
       if (dbUser && dbName) {
@@ -219,13 +219,13 @@ async function checkDockerCompose(baseDir) {
   for (const file of composeFiles) {
     try {
       const content = await fs.readFile(path.join(baseDir, file), 'utf8');
-      if (testRegex(content, 'image:\\s*postgres') || testRegex(content, 'POSTGRES_USER') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?5432"?')) {
+      if (testRegex(content, 'image:\\s*["\']?postgres') || testRegex(content, 'POSTGRES_USER') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?5432"?')) {
         return { hasDb: true, dbType: 'postgres', port: DB_PORTS.postgres };
       }
-      if (testRegex(content, 'image:\\s*mysql') || testRegex(content, 'MYSQL_DATABASE') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?3306"?')) {
+      if (testRegex(content, 'image:\\s*["\']?mysql') || testRegex(content, 'MYSQL_DATABASE') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?3306"?')) {
         return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
       }
-      if (testRegex(content, 'image:\\s*mongo') || testRegex(content, 'MONGO_URI') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?27017"?')) {
+      if (testRegex(content, 'image:\\s*["\']?mongo') || testRegex(content, 'MONGO_URI') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?27017"?')) {
         return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
       }
     } catch(e) {}
@@ -249,26 +249,24 @@ async function checkLocalDbDockerfile(baseDir) {
 }
 
 async function analyzeDatabase(baseDir, backendPath) {
-  if (!backendPath) {
-    return { hasDb: false };
-  }
-
   let result = null;
 
-  // Priority 1: ORM Configs
-  const ormResult = await checkORM(baseDir, backendPath);
-  if (ormResult) result = ormResult;
+  if (backendPath) {
+    // Priority 1: ORM Configs
+    const ormResult = await checkORM(baseDir, backendPath);
+    if (ormResult) result = ormResult;
 
-  // Priority 2: Package.json Dependencies
-  if (!result) {
-    const pkgResult = await checkPackageJson(backendPath);
-    if (pkgResult) result = pkgResult;
-  }
+    // Priority 2: Package.json Dependencies
+    if (!result) {
+      const pkgResult = await checkPackageJson(backendPath);
+      if (pkgResult) result = pkgResult;
+    }
 
-  // Priority 2.5: Python requirements.txt
-  if (!result) {
-    const reqResult = await checkRequirementsTxt(backendPath);
-    if (reqResult) result = reqResult;
+    // Priority 2.5: Python requirements.txt
+    if (!result) {
+      const reqResult = await checkRequirementsTxt(backendPath);
+      if (reqResult) result = reqResult;
+    }
   }
 
   // Priority 3: Environment Variables (real .env)
