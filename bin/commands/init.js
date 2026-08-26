@@ -508,9 +508,9 @@ variable "domain" {
   }
 
   const { analyzeBackend, analyzeFrontend } = require('../../utils/analyzer');
-  const { analyzeDatabase } = require('../../utils/dbAnalyzer');
+  const { analyzeDatabase, analyzeBackendForDbPasswordKey, analyzeBackendForDbKeys } = require('../../utils/dbAnalyzer');
   const { analyzeFrontendRoutes } = require('../../utils/routeAnalyzer');
-  const { refactorFrontendEnv, refactorBackendDbUrl, refactorNginxConf } = require('../../utils/envRefactor');
+  const { refactorFrontendEnv, refactorBackendDbUrl, refactorNginxConf, refactorLowercaseEnvVars } = require('../../utils/envRefactor');
 
   const [backendInfo, frontendInfo] = await Promise.all([
     analyzeBackend(currentDir),
@@ -722,9 +722,78 @@ variable "domain" {
     }
   }
 
+  let inferredKeys = null;
+  // Inject detected DB keys into apiEnv if not present
+  if (dbInfo.hasDb && backendInfo.hasBackend) {
+    inferredKeys = await analyzeBackendForDbKeys(backendInfo.backendPath);
+    
+    // Check for lowercase keys and collect them
+    const keysToUppercase = [];
+    ['hostKey', 'userKey', 'nameKey', 'passwordKey', 'portKey'].forEach(k => {
+      const val = inferredKeys[k];
+      if (val && val !== val.toUpperCase() && !keysToUppercase.includes(val)) {
+        keysToUppercase.push(val);
+      }
+    });
+
+    if (keysToUppercase.length > 0) {
+      let didUppercase = false;
+      if (options.yes) {
+         didUppercase = true;
+      } else {
+         const { confirmRefactor } = await require('inquirer').prompt([
+           {
+             type: 'confirm',
+             name: 'confirmRefactor',
+             message: `Found lowercase environment variables in backend code (${keysToUppercase.join(', ')}). Standard convention is UPPERCASE. Do you want to automatically refactor them?`,
+             default: true
+           }
+         ]);
+         didUppercase = confirmRefactor;
+      }
+
+      if (didUppercase) {
+        const { modifiedCount } = await refactorLowercaseEnvVars(backendInfo.backendPath, keysToUppercase, true);
+        if (modifiedCount > 0) {
+           console.log(`\x1b[34mINFO: Refactored lowercase environment variables to uppercase in ${modifiedCount} backend files.\x1b[0m`);
+        }
+        
+        // Update inferredKeys with their uppercase counterparts so they are injected properly
+        ['hostKey', 'userKey', 'nameKey', 'passwordKey', 'portKey'].forEach(k => {
+          if (inferredKeys[k]) inferredKeys[k] = inferredKeys[k].toUpperCase();
+        });
+      }
+    }
+    if (inferredKeys.hostKey && !apiEnv[inferredKeys.hostKey]) {
+      apiEnv[inferredKeys.hostKey] = 'database';
+      console.log(`\x1b[34mINFO: Analyzed backend code and found expected database host key: ${inferredKeys.hostKey}\x1b[0m`);
+    }
+    if (inferredKeys.userKey && !apiEnv[inferredKeys.userKey]) {
+      apiEnv[inferredKeys.userKey] = dbInfo.dbUser || (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql' ? 'postgres' : 'root');
+      console.log(`\x1b[34mINFO: Analyzed backend code and found expected database user key: ${inferredKeys.userKey}\x1b[0m`);
+    }
+    if (inferredKeys.nameKey && !apiEnv[inferredKeys.nameKey]) {
+      apiEnv[inferredKeys.nameKey] = dbInfo.dbName || 'appdb';
+      console.log(`\x1b[34mINFO: Analyzed backend code and found expected database name key: ${inferredKeys.nameKey}\x1b[0m`);
+    }
+  }
+
   let finalDbPasswordKey = 'DATABASE_PASSWORD';
   let finalDbPassword = '';
-  if (foundDbPasswords.length > 0) {
+  
+  const analyzedKey = (inferredKeys && inferredKeys.passwordKey) ? inferredKeys.passwordKey : (backendInfo.hasBackend ? await analyzeBackendForDbPasswordKey(backendInfo.backendPath) : null);
+  
+  if (analyzedKey) {
+    finalDbPasswordKey = analyzedKey;
+    finalDbPassword = require('crypto').randomBytes(16).toString('hex');
+    console.log(`\x1b[34mINFO: Analyzed backend code and found expected database password key: ${finalDbPasswordKey}\x1b[0m`);
+    
+    const envMatch = foundDbPasswords.find(p => p.key === finalDbPasswordKey);
+    if (envMatch) {
+      finalDbPassword = envMatch.value;
+      console.log(`\x1b[34mINFO: Found matching password for ${finalDbPasswordKey} in ${envMatch.file}\x1b[0m`);
+    }
+  } else if (foundDbPasswords.length > 0) {
     finalDbPasswordKey = foundDbPasswords[0].key;
     finalDbPassword = foundDbPasswords[0].value;
     if (foundDbPasswords.length > 1) {
@@ -757,7 +826,7 @@ REGISTRY_PASSWORD="${registryPassword}"
     envContent += `\n# Extracted sensitive variables from project .env files\n${sensitiveEnvContent}`;
   }
 
-  if (finalDbPassword && !envContent.includes(`${finalDbPasswordKey}=`)) {
+  if (finalDbPassword && !new RegExp('^' + finalDbPasswordKey + '=', 'm').test(envContent)) {
     envContent += `${finalDbPasswordKey}="${finalDbPassword}"\n`;
   }
 
@@ -769,7 +838,7 @@ REGISTRY_PASSWORD="${registryPassword}"
     let existingEnv = fs.readFileSync(envFile, 'utf8');
     let appended = false;
 
-    if (finalDbPassword && !existingEnv.includes(`${finalDbPasswordKey}=`)) {
+    if (finalDbPassword && !new RegExp('^' + finalDbPasswordKey + '=', 'm').test(existingEnv)) {
       fs.appendFileSync(envFile, `\n${finalDbPasswordKey}="${finalDbPassword}"\n`);
       console.log(`Appended fallback ${finalDbPasswordKey} to deploy/.env`);
       appended = true;
@@ -778,9 +847,12 @@ REGISTRY_PASSWORD="${registryPassword}"
     // Also append any new sensitive variables that aren't already there
     const sensitiveLines = sensitiveEnvContent.split('\\n');
     for (const sLine of sensitiveLines) {
-      if (sLine.trim() && !existingEnv.includes(sLine.split('=')[0] + '=')) {
-        fs.appendFileSync(envFile, `${sLine}\\n`);
-        appended = true;
+      if (sLine.trim()) {
+        const key = sLine.split('=')[0];
+        if (!new RegExp('^' + key + '=', 'm').test(existingEnv)) {
+          fs.appendFileSync(envFile, `${sLine}\n`);
+          appended = true;
+        }
       }
     }
 

@@ -65,10 +65,11 @@ spec:
               value: {{ $value | quote }}
 {{- end }}${dbUrlEnvBlock}
 {{- if .Values.database }}
-            - name: DATABASE_PASSWORD
-              value: {{ .Values.database.password | quote }}
             - name: {{ "${config.dbPasswordKey}" }}
-              value: {{ .Values.database.password | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: {{ "${config.dbPasswordKey}" }}
 {{- end }}
 {{- end }}
           resources:

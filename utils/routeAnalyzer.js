@@ -51,12 +51,18 @@ async function analyzeFrontendRoutes(frontendDir) {
     }
   };
 
-  const httpCallRegex = /(?:fetch|axios(?:\.[a-z]+)?|\$http(?:\.[a-z]+)?|api(?:\.[a-z]+)?)\s*\(\s*['"`]((?:https?:\/\/[^\/]+)?\/[a-zA-Z0-9_\-\/]+)(?:\?|['"`])/gim;
+  const httpCallRegex = /(?:fetch|axios(?:\.[a-z]+)?|\$http(?:\.[a-z]+)?|api(?:\.[a-z]+)?)\s*\(\s*.*?['"`}]((?:https?:\/\/[^\/\s'"`}]+)?\/[a-zA-Z0-9_\-\/]+)(?:\?|['"`\s])/gim;
   const envUrlRegex = /^(?:VITE_|REACT_APP_|NEXT_PUBLIC_|NUXT_|VUE_APP_)?[A-Z0-9_]*(?:URL|API|ENDPOINT)\s*=\s*['"`]?((?:https?:\/\/[^\/]+)?\/[a-zA-Z0-9_\-\/]+)/gim;
 
   // Proxy configs often have '/api': { target: ... } or location /api/ { proxy_pass ... }
   const proxyRegex = /['"`](\/[a-zA-Z0-9_\-\/]+)['"`]\s*:\s*\{\s*target\s*:/gim;
   const nginxLocationRegex = /location\s+(\/[a-zA-Z0-9_\-\/]+)\/?\s*\{[^}]*proxy_pass/gim;
+  
+  // CRA simple string proxy
+  const craProxyRegex = /"proxy"\s*:\s*"https?:\/\/[^\/]+(\/[a-zA-Z0-9_\-\/]+)/gim;
+
+  // Variable assignment with URL concatenation
+  const varConcatRegex = /[A-Z0-9_]*(?:URL|API)[A-Z0-9_]*\s*=\s*(?:[a-zA-Z0-9_.]+\s*\+\s*)?['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
 
   for (const filePath of filesToScan) {
     try {
@@ -75,6 +81,9 @@ async function analyzeFrontendRoutes(frontendDir) {
              } catch(e) {}
           }
           addRoute(routePath, 1);
+        }
+        while ((match = varConcatRegex.exec(content)) !== null) {
+          addRoute(match[1], 2);
         }
       }
 
@@ -109,6 +118,14 @@ async function analyzeFrontendRoutes(frontendDir) {
         }
       }
 
+      // 5. Package.json
+      if (path.basename(filePath) === 'package.json') {
+        let match;
+        while ((match = craProxyRegex.exec(content)) !== null) {
+          addRoute(match[1], 10);
+        }
+      }
+
     } catch (e) { }
   }
 
@@ -128,14 +145,15 @@ async function analyzeFrontendRoutes(frontendDir) {
   // OR if we suspect they are common API prefixes
   const commonApiPrefixes = ['/api', '/graphql', '/backend', '/v1', '/v2', '/rpc', '/trpc', '/socket.io'];
 
+  const hasHighConfidence = finalRoutes.length > 0;
   for (const [route, score] of sortedRoutes) {
     if (score > 0 && score < 5) {
       if (commonApiPrefixes.includes(route)) {
         if (!finalRoutes.includes(route)) finalRoutes.push(route);
-      } else if (finalRoutes.length === 0) {
+      } else if (!hasHighConfidence) {
         // If absolutely nothing else was found, add it, but this might be risky.
         // If multiple low-score ones exist, we add all of them
-        finalRoutes.push(route);
+        if (!finalRoutes.includes(route)) finalRoutes.push(route);
       }
     }
   }

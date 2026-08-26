@@ -309,4 +309,121 @@ async function analyzeDatabase(baseDir, backendPath) {
   return { hasDb: false };
 }
 
-module.exports = { analyzeDatabase };
+async function analyzeBackendForDbPasswordKey(backendPath) {
+  if (!backendPath) return null;
+
+  const passwordKeys = ['DB_PASS', 'DB_PASSWORD', 'DATABASE_PASSWORD', 'DATABASE_PASS', 'DB_SECRET', 'DB_ROOT_PASSWORD', 'POSTGRES_PASSWORD', 'POSTGRESQL_PASSWORD', 'POSTGRES_PASS', 'PG_PASSWORD', 'PGPASSWORD', 'MYSQL_ROOT_PASSWORD', 'MYSQL_PASSWORD', 'MYSQL_PASS', 'MARIADB_ROOT_PASSWORD', 'MARIADB_PASSWORD', 'MONGO_INITDB_ROOT_PASSWORD', 'MONGO_PASSWORD', 'MONGO_PASS', 'MONGODB_PASSWORD', 'MONGO_ROOT_PASSWORD'];
+  const regex = new RegExp('\\b(' + passwordKeys.join('|') + ')\\b', 'g');
+  const counts = {};
+
+  const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.nuxt', '.output', '.cache']);
+
+  async function walk(dir) {
+    let filesToScan = [];
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (IGNORED_DIRS.has(entry.name) || (entry.name.startsWith('.') && entry.name !== '.env')) continue;
+          filesToScan.push(...await walk(path.join(dir, entry.name)));
+        } else {
+          const ext = path.extname(entry.name);
+          const ignoredFiles = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
+          if (ignoredFiles.has(entry.name)) continue;
+          if (['.js', '.ts', '.json', '.yaml', '.yml', '.py', '.go', '.sh', '.java', '.cs', '.php'].includes(ext) || entry.name.startsWith('.env') || entry.name.toLowerCase().includes('dockerfile')) {
+            filesToScan.push(path.join(dir, entry.name));
+          }
+        }
+      }
+    } catch (e) {}
+    return filesToScan;
+  }
+
+  const files = await walk(backendPath);
+  for (const file of files) {
+    try {
+      const content = await fs.readFile(file, 'utf8');
+      let match;
+      while ((match = regex.exec(content)) !== null) {
+        const key = match[1];
+        counts[key] = (counts[key] || 0) + 1;
+      }
+    } catch (e) {}
+  }
+
+  const sortedKeys = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  if (sortedKeys.length > 0) {
+    return sortedKeys[0][0]; // Return the most frequently used key
+  }
+
+  return null;
+}
+
+async function analyzeBackendForDbKeys(backendPath) {
+  if (!backendPath) return { hostKey: null, userKey: null, nameKey: null, passwordKey: null, portKey: null };
+
+  const hostCounts = {};
+  const userCounts = {};
+  const nameCounts = {};
+  const passwordCounts = {};
+  const portCounts = {};
+
+  const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.nuxt', '.output', '.cache']);
+
+  async function walk(dir) {
+    let filesToScan = [];
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (IGNORED_DIRS.has(entry.name) || (entry.name.startsWith('.') && entry.name !== '.env')) continue;
+          filesToScan.push(...await walk(path.join(dir, entry.name)));
+        } else {
+          const ext = path.extname(entry.name);
+          const ignoredFiles = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
+          if (ignoredFiles.has(entry.name)) continue;
+          if (['.js', '.ts', '.py', '.go', '.java', '.cs', '.php'].includes(ext)) {
+            filesToScan.push(path.join(dir, entry.name));
+          }
+        }
+      }
+    } catch (e) {}
+    return filesToScan;
+  }
+
+  const files = await walk(backendPath);
+  
+  const envVarRegex = /(?:process\.env\.|os\.Getenv\(['"`]|getenv\(['"`]|System\.getenv\(['"`]|Environment\.GetEnvironmentVariable\(['"`]|\$ENV\[['"`]|\$_ENV\[['"`])([a-zA-Z0-9_]+)/g;
+
+  for (const file of files) {
+    try {
+      const content = await fs.readFile(file, 'utf8');
+      let match;
+      while ((match = envVarRegex.exec(content)) !== null) {
+        const key = match[1];
+        const lowerKey = key.toLowerCase();
+        
+        if (lowerKey.match(/host|hostname/)) hostCounts[key] = (hostCounts[key] || 0) + 1;
+        else if (lowerKey.match(/^user$|username|db_user|dbuser/)) userCounts[key] = (userCounts[key] || 0) + 1;
+        else if (lowerKey.match(/^database$|^db$|dbname|db_name|^name$/)) nameCounts[key] = (nameCounts[key] || 0) + 1;
+        else if (lowerKey.match(/password|pass/)) passwordCounts[key] = (passwordCounts[key] || 0) + 1;
+        else if (lowerKey.match(/port/)) portCounts[key] = (portCounts[key] || 0) + 1;
+      }
+    } catch (e) {}
+  }
+
+  const getTopKey = (counts) => {
+    const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    return sorted.length > 0 ? sorted[0][0] : null;
+  };
+
+  return {
+    hostKey: getTopKey(hostCounts),
+    userKey: getTopKey(userCounts),
+    nameKey: getTopKey(nameCounts),
+    passwordKey: getTopKey(passwordCounts),
+    portKey: getTopKey(portCounts)
+  };
+}
+
+module.exports = { analyzeDatabase, analyzeBackendForDbPasswordKey, analyzeBackendForDbKeys };

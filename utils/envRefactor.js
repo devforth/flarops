@@ -121,6 +121,35 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
   let refactoredFilesCount = 0;
   let backendDetectedUrl = null;
   const discoveredRoutes = new Set();
+  
+  // Try to find an existing API env var in the code
+  const existingEnvVars = {};
+  for (const filePath of filesToScan) {
+    if (!['.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte'].includes(path.extname(filePath))) continue;
+    let content = await fsPromises.readFile(filePath, 'utf8');
+    
+    // Look for process.env.XXXXX or import.meta.env.XXXXX
+    const envRegex = /(?:process\.env\.|import\.meta\.env\.)([A-Z0-9_]+)/g;
+    let match;
+    while ((match = envRegex.exec(content)) !== null) {
+      const key = match[1];
+      if (key.match(/^(NODE_ENV|PUBLIC_URL)$/)) continue;
+      if (key.match(/API|URL|BASE/i)) {
+        existingEnvVars[key] = (existingEnvVars[key] || 0) + 1;
+      }
+    }
+  }
+  
+  if (Object.keys(existingEnvVars).length > 0) {
+    // Sort by count
+    const sorted = Object.entries(existingEnvVars).sort((a, b) => b[1] - a[1]);
+    envVarKey = sorted[0][0];
+    if (envVarSyntax.startsWith('import.meta.env.')) {
+      envVarSyntax = `import.meta.env.${envVarKey}`;
+    } else {
+      envVarSyntax = `process.env.${envVarKey}`;
+    }
+  }
 
   for (const filePath of filesToScan) {
     if (!['.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte'].includes(path.extname(filePath))) continue;
@@ -178,9 +207,23 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
     } else {
       await fsPromises.writeFile(envLocalPath, `# Added by Flarops\n${envEntry}`);
     }
+
+    // 4. Ensure .env.local is ignored in .dockerignore and .gitignore
+    const ignoreFiles = ['.dockerignore', '.gitignore'];
+    for (const ignoreFile of ignoreFiles) {
+      const ignorePath = path.join(frontendDir, ignoreFile);
+      if (fs.existsSync(ignorePath)) {
+        const content = await fsPromises.readFile(ignorePath, 'utf8');
+        if (!content.includes('.env.local')) {
+          await fsPromises.appendFile(ignorePath, `\n.env.local\n`);
+        }
+      } else {
+        await fsPromises.writeFile(ignorePath, `.env.local\n`);
+      }
+    }
   }
 
-  if (refactoredFilesCount > 0) {
+  if (refactoredFilesCount > 0 || Object.keys(existingEnvVars).length > 0) {
     return {
       filesChanged: refactoredFilesCount,
       envVarKey: envVarKey,
@@ -210,7 +253,7 @@ async function refactorBackendDbUrl(backendDir, doModify = false) {
     let match;
     while ((match = envRegex.exec(content)) !== null) {
       const key = match[1];
-      if (key.match(/USER|USERNAME|PASSWORD|PASS|HOST|HOSTNAME|PORT|NAME|_DB$|^DB$|DATABASE_DB|DB_NAME/i)) continue;
+      if (key.match(/USER|USERNAME|PASSWORD|PASS|HOST|HOSTNAME|PORT|NAME|_DB$|^DB$|^DATABASE$|^DB_DATABASE$|DATABASE_DB|DB_NAME/i)) continue;
       discoveredVars.add(key);
     }
 
@@ -287,8 +330,51 @@ async function refactorNginxConf(frontendDir, backendPorts) {
   return filesChanged;
 }
 
+async function refactorLowercaseEnvVars(backendDir, keysToUppercase, doModify = false) {
+  if (!backendDir || !keysToUppercase || keysToUppercase.length === 0) return { modifiedCount: 0 };
+  
+  const filesToScan = await walkDir(backendDir);
+  let modifiedCount = 0;
+
+  for (const filePath of filesToScan) {
+    if (!['.js', '.ts', '.go', '.py', '.java', '.php', '.cs'].includes(path.extname(filePath))) continue;
+
+    let content = await fsPromises.readFile(filePath, 'utf8');
+    let modified = false;
+
+    for (const key of keysToUppercase) {
+      if (key === key.toUpperCase()) continue;
+      
+      const regex = new RegExp(`((?:process\\.env\\.|os\\.Getenv\\(['"\`]|getenv\\(['"\`]|System\\.getenv\\(['"\`]|Environment\\.GetEnvironmentVariable\\(['"\`]|\\$ENV\\[['"\`]|\\$_ENV\\[['"\`]))(${key})\\b`, 'g');
+      
+      let match;
+      while ((match = regex.exec(content)) !== null) {
+        if (match[2] === key) {
+          modified = true;
+        }
+      }
+      
+      if (modified) {
+         content = content.replace(regex, (m, prefix, k) => {
+           return prefix + k.toUpperCase();
+         });
+      }
+    }
+
+    if (modified && doModify) {
+      await fsPromises.writeFile(filePath, content, 'utf8');
+      modifiedCount++;
+    } else if (modified) {
+      modifiedCount++; // count files that would be modified
+    }
+  }
+  
+  return { modifiedCount };
+}
+
 module.exports = {
   refactorFrontendEnv,
   refactorBackendDbUrl,
-  refactorNginxConf
+  refactorNginxConf,
+  refactorLowercaseEnvVars
 };
