@@ -51,7 +51,7 @@ async function analyzeFrontendRoutes(frontendDir) {
     }
   };
 
-  const httpCallRegex = /(?:fetch|axios(?:\.[a-z]+)?|\$http(?:\.[a-z]+)?|api(?:\.[a-z]+)?)\s*\(\s*.*?['"`}]((?:https?:\/\/[^\/\s'"`}]+)?\/[a-zA-Z0-9_\-\/]+)(?:\?|['"`\s])/gim;
+  const httpCallRegex = /(?:fetch|axios(?:\.[a-z]+)?|\$http(?:\.[a-z]+)?|http(?:\.[a-z]+)?|client(?:\.[a-z]+)?|request(?:\.[a-z]+)?|api(?:\.[a-z]+)?)\s*\(\s*.*?['"`}]((?:https?:\/\/[^\/\s'"`}]+)?\/[a-zA-Z0-9_\-\/]+)(?:\?|['"`\s])/gim;
   const envUrlRegex = /^(?:VITE_|REACT_APP_|NEXT_PUBLIC_|NUXT_|VUE_APP_)?[A-Z0-9_]*(?:URL|API|ENDPOINT)\s*=\s*['"`]?((?:https?:\/\/[^\/]+)?\/[a-zA-Z0-9_\-\/]+)/gim;
 
   // Proxy configs often have '/api': { target: ... } or location /api/ { proxy_pass ... }
@@ -63,6 +63,9 @@ async function analyzeFrontendRoutes(frontendDir) {
 
   // Variable assignment with URL concatenation
   const varConcatRegex = /[A-Z0-9_]*(?:URL|API)[A-Z0-9_]*\s*=\s*(?:[a-zA-Z0-9_.]+\s*\+\s*)?['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
+  
+  // Axios/fetch base URL config
+  const baseUrlRegex = /baseURL\s*:\s*[^,'"`}\n]*['"`](\/[a-zA-Z0-9_\-\/]+)['"`]/gim;
 
   for (const filePath of filesToScan) {
     try {
@@ -84,6 +87,9 @@ async function analyzeFrontendRoutes(frontendDir) {
         }
         while ((match = varConcatRegex.exec(content)) !== null) {
           addRoute(match[1], 2);
+        }
+        while ((match = baseUrlRegex.exec(content)) !== null) {
+          addRoute(match[1], 5); // Base URL config has high confidence
         }
       }
 

@@ -394,20 +394,32 @@ async function analyzeBackendForDbKeys(backendPath) {
   const files = await walk(backendPath);
   
   const envVarRegex = /(?:process\.env\.|os\.Getenv\(['"`]|getenv\(['"`]|System\.getenv\(['"`]|Environment\.GetEnvironmentVariable\(['"`]|\$ENV\[['"`]|\$_ENV\[['"`])([a-zA-Z0-9_]+)/g;
+  const destructureRegex = /(?:const|let|var)\s*\{([^}]+)\}\s*=\s*process\.env/g;
 
   for (const file of files) {
     try {
       const content = await fs.readFile(file, 'utf8');
-      let match;
-      while ((match = envVarRegex.exec(content)) !== null) {
-        const key = match[1];
+      
+      const processKey = (key) => {
         const lowerKey = key.toLowerCase();
-        
         if (lowerKey.match(/host|hostname/)) hostCounts[key] = (hostCounts[key] || 0) + 1;
         else if (lowerKey.match(/^user$|username|db_user|dbuser/)) userCounts[key] = (userCounts[key] || 0) + 1;
         else if (lowerKey.match(/^database$|^db$|dbname|db_name|^name$/)) nameCounts[key] = (nameCounts[key] || 0) + 1;
         else if (lowerKey.match(/password|pass/)) passwordCounts[key] = (passwordCounts[key] || 0) + 1;
         else if (lowerKey.match(/port/)) portCounts[key] = (portCounts[key] || 0) + 1;
+      };
+
+      let match;
+      while ((match = envVarRegex.exec(content)) !== null) {
+        processKey(match[1]);
+      }
+      
+      let destructureMatch;
+      while ((destructureMatch = destructureRegex.exec(content)) !== null) {
+        const keys = destructureMatch[1].split(',').map(k => k.split(':')[0].trim()).filter(k => k);
+        for (const key of keys) {
+          processKey(key);
+        }
       }
     } catch (e) {}
   }
