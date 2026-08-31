@@ -4,7 +4,7 @@ module.exports = (config) => {
     let scheme = 'postgres';
     let defaultPort = 5432;
     let mongoAuth = '';
-    
+
     if (config.dbType === 'mysql' || config.dbType === 'mariadb') {
       scheme = 'mysql';
       defaultPort = 3306;
@@ -21,7 +21,7 @@ module.exports = (config) => {
       if (scheme === 'mongodb' && !query.includes('authSource')) {
         query += (query ? '&' : '') + mongoAuth;
       }
-      
+
       dbUrlEnvBlock += `
             - name: ${urlVar.key}
               value: "${scheme}://{{ .Values.database.user }}:$(${config.dbPasswordKey})@database:{{ .Values.dbPort | default ${defaultPort} }}/{{ .Values.database.name }}${query}"`;
@@ -29,7 +29,7 @@ module.exports = (config) => {
   }
 
   let hasCustomEnv = config.dbUrlVars && config.dbUrlVars.length > 0;
-  
+
   return `
 apiVersion: apps/v1
 kind: Deployment
@@ -74,11 +74,11 @@ spec:
 {{- end }}
           resources:
             requests:
-              memory: "128Mi"
-              cpu: "100m"
-            limits:
               memory: "256Mi"
               cpu: "500m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
 {{- if .Values.api.healthRoute }}
           livenessProbe:
             httpGet:

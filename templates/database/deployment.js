@@ -93,11 +93,11 @@ spec:
           env:${envBlock}
           resources:
             requests:
-              memory: "128Mi"
-              cpu: "100m"
-            limits:
-              memory: "512Mi"
+              memory: "256Mi"
               cpu: "500m"
+            limits:
+              memory: "1024Mi"
+              cpu: "1000m"
           volumeMounts:
             - name: data
               mountPath: ${volumeMountPath}
