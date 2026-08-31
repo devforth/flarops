@@ -54,12 +54,12 @@ async function walkDir(dir, fileList = []) {
 
 async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort) {
   const regexList = [
-    new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?<!DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)(?:${portNamesPattern})\\s*[:=]\\s*["']?(\\d+)["']?`, 'gim'),
-    new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?:process\\.env\\.)?(?<!DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)(?:${portNamesPattern})\\s*\\|\\|\\s*(\\d+)`, 'gim'),
-    new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?<!DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)port\\s*[:=]\\s*["']?(\\d+)["']?`, 'gim'),
+    new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)(?:${portNamesPattern})\\s*[:=]\\s*["']?(\\d+)["']?`, 'gim'),
+    new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?:process\\.env\\.)?(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)(?:${portNamesPattern})\\s*\\|\\|\\s*(\\d+)`, 'gim'),
+    new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)port\\s*[:=]\\s*["']?(\\d+)["']?`, 'gim'),
     new RegExp(`^(?!\\s*(?:#|\\/\\/)).*--inspect(?:-brk)?=(?:[^:]+:)?(\\d+)`, 'gim'),
     new RegExp(`(?:^|\\s)(?:--port|-p)\\s*[=:]?\\s*(\\d+)`, 'gim'),
-    new RegExp(`(?<!DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)\\bport\\b.{0,15}?(?<![a-zA-Z0-9.-])(\\d{2,5})\\b`, 'gim'),
+    new RegExp(`(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)\\bport\\b.{0,15}?(?<![a-zA-Z0-9.-])(\\d{2,5})\\b`, 'gim'),
     new RegExp(`^\\s*EXPOSE\\s+(\\d+)`, 'gim')
   ];
 

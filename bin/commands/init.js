@@ -653,8 +653,8 @@ variable "domain" {
       const end = i + 1 < services.length ? services[i + 1].index : composeContent.length;
       const block = composeContent.substring(start, end);
 
-      let isBackend = ['api', 'backend', 'server'].includes(services[i].name) || (backendInfo.backendPath && backendInfo.backendPath.includes(services[i].name));
-      let isFrontend = ['frontend', 'client', 'ui', 'web'].includes(services[i].name) || (frontendInfo.frontendPath && frontendInfo.frontendPath.includes(services[i].name));
+      let isBackend = ['api', 'backend', 'server'].includes(services[i].name) || (backendInfo.backendPath && path.basename(backendInfo.backendPath) === services[i].name);
+      let isFrontend = ['frontend', 'client', 'ui', 'web'].includes(services[i].name) || (frontendInfo.frontendPath && path.basename(frontendInfo.frontendPath) === services[i].name);
 
       if (!isBackend && !isFrontend) continue;
 

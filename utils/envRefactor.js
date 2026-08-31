@@ -144,7 +144,7 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
     // Sort by count
     const sorted = Object.entries(existingEnvVars).sort((a, b) => b[1] - a[1]);
     envVarKey = sorted[0][0];
-    if (envVarSyntax.startsWith('import.meta.env.')) {
+    if (envVarKey.startsWith('VITE_') || envVarKey.startsWith('PUBLIC_')) {
       envVarSyntax = `import.meta.env.${envVarKey}`;
     } else {
       envVarSyntax = `process.env.${envVarKey}`;

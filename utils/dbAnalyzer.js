@@ -177,7 +177,7 @@ async function extractDbCredentials(baseDir, backendPath) {
   let dbUser = null;
   let dbName = null;
 
-  const userRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_USER|DB_USER|POSTGRES_USER|MYSQL_USER|MARIADB_USER|MONGO_INITDB_ROOT_USERNAME)\s*[:=]\s*["']?([^"'\s#]+|[^"']+)["']?/im;
+  const userRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_USER|DATABASE_USERNAME|DB_USER|DB_USERNAME|POSTGRES_USER|MYSQL_USER|MARIADB_USER|MONGO_INITDB_ROOT_USERNAME)\s*[:=]\s*["']?([^"'\s#]+|[^"']+)["']?/im;
   const nameRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_DB|DB_NAME|DATABASE_NAME|POSTGRES_DB|MYSQL_DATABASE|MARIADB_DATABASE|MONGO_INITDB_DATABASE)\s*[:=]\s*["']?([^"'\s#]+|[^"']+)["']?/im;
 
   for (const file of filesToScan) {
@@ -416,7 +416,7 @@ async function analyzeBackendForDbKeys(backendPath) {
       
       let destructureMatch;
       while ((destructureMatch = destructureRegex.exec(content)) !== null) {
-        const keys = destructureMatch[1].split(',').map(k => k.split(':')[0].trim()).filter(k => k);
+        const keys = destructureMatch[1].split(',').map(k => k.split(':')[0].split('=')[0].trim()).filter(k => k);
         for (const key of keys) {
           processKey(key);
         }
