@@ -267,7 +267,15 @@ provider "cloudflare" {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
-    }${cloudflareProviderBlock}
+    }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 4.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
   }
 }
 
@@ -308,10 +316,23 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
+resource "random_password" "k3s_token" {
+  length  = 32
+  special = false
+}
+
 resource "aws_security_group" "sg" {
   name        = "\${var.instance_name}-sg"
   description = "Allow SSH, HTTP, and Kubernetes API"
   vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "Intra-cluster communication"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
+  }
 
   ingress {
     description = "SSH"
@@ -379,7 +400,7 @@ resource "aws_instance" "server" {
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --tls-san $(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)" sh -
+    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --token \${random_password.k3s_token.result} --tls-san $(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)" sh -
   EOF
   )
 
@@ -395,6 +416,43 @@ resource "aws_instance" "server" {
 resource "aws_eip" "eip" {
   instance = aws_instance.server.id
   domain   = "vpc"
+}
+
+resource "aws_instance" "worker" {
+  count                  = var.worker_count
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.sg.id]
+
+  root_block_device {
+    volume_size = var.volume_size
+    volume_type = "gp3"
+  }
+
+  user_data = sensitive(<<-EOF
+    #!/bin/bash
+    HOSTNAME="\${var.instance_name}-worker-\${count.index + 1}"
+    hostnamectl set-hostname $HOSTNAME
+
+    mkdir -p /home/ubuntu/.ssh
+    echo "\${var.ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
+    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+    chmod 700 /home/ubuntu/.ssh
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+
+    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" K3S_URL=https://\${aws_instance.server.private_ip}:6443 K3S_TOKEN=\${random_password.k3s_token.result} sh -
+  EOF
+  )
+
+  tags = {
+    Name = "\${var.instance_name}-worker-\${count.index + 1}"
+    Role = "worker"
+  }
+
+  lifecycle {
+    ignore_changes = [ami]
+  }
 }
 `;
 
@@ -448,9 +506,15 @@ variable "cloudflare_zone_id" {
 }
 
 variable "instance_name" {
-  description = "Name of the instance"
+  description = "Name tag for the EC2 instance"
   type        = string
-  default     = "${path.basename(currentDir)}-instance"
+  default     = "${projectName}-instance"
+}
+
+variable "worker_count" {
+  description = "Number of worker nodes for horizontal scaling"
+  type        = number
+  default     = 0
 }
 
 variable "instance_type" {
@@ -1034,6 +1098,7 @@ ${config.apiRoutes.map(p => `  - "${p}"`).join('\n')}
 
   const otherFilesToGenerate = [
     { file: path.join(githubDir, 'deploy.yml'), content: require('../../templates/deploy.yml.js')(config) },
+    { file: path.join(githubDir, 'pr-capsule.yml'), content: require('../../templates/pr-capsule.yml.js')(config) },
     { file: path.join(currentDir, 'werf.yaml'), content: require('../../templates/werf.yaml.js')(config) },
     { file: path.join(currentDir, 'werf-giterminism.yaml'), content: require('../../templates/werf-giterminism.yaml.js')() },
     { file: path.join(currentDir, 'FLAROPS.md'), content: require('../../templates/FLAROPS.md.js')() }
