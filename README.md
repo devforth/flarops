@@ -50,4 +50,5 @@ After initialization, Flarops will generate the following structure in your repo
 ```
 
 ## 📄 License
-MIT
+
+This project is licensed under the MIT License.
