@@ -63,9 +63,9 @@ jobs:
         working-directory: deploy/terraform
         run: terraform init
 
-      - name: Select or Create Terraform Workspace
+      - name: Terraform Workspace
         working-directory: deploy/terraform
-        run: terraform workspace select -or-create \${{ github.ref_name }}
+        run: terraform workspace select -or-create main
 
       - name: Terraform Apply
         working-directory: deploy/terraform
@@ -73,15 +73,19 @@ jobs:
           TF_VAR_cloudflare_api_token: \${{ secrets.CLOUDFLARE_API_TOKEN }}
           TF_VAR_cloudflare_zone_id: \${{ secrets.CLOUDFLARE_ZONE_ID }}` : ''}
           TF_VAR_domain: \${{ env.BASE_DOMAIN }}
-        run: terraform apply -auto-approve
+        run: |
+          CURRENT_WORKERS=$(terraform state list 2>/dev/null | grep 'aws_instance.worker\\[' | wc -l || echo "0")
+          echo "Preserving existing $CURRENT_WORKERS worker nodes."
+          terraform apply -var="worker_count=$CURRENT_WORKERS" -auto-approve
 
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: \${{ secrets.SSH_PRIVATE_KEY }}
+          
       - name: Fetch Kubeconfig from EC2
         working-directory: deploy/terraform
         run: |
-          mkdir -p ~/.ssh
-          echo "\${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          
           export EC2_IP=$(terraform output -raw public_ip)
           
           echo "Waiting for K3s to be ready on $EC2_IP..."

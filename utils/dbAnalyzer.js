@@ -1,6 +1,8 @@
 const fs = require('fs').promises;
 const path = require('path');
 const https = require('https');
+const { walkDir, logDebug } = require('./fsHelper');
+const { DB_PORTS } = require('./constants');
 
 function fetchDockerTags(image) {
   return new Promise((resolve) => {
@@ -55,13 +57,7 @@ async function getLatestDbImage(dbType) {
   return `${image}:${validTags[0]}`;
 }
 
-const DB_PORTS = {
-  postgres: 5432,
-  mysql: 3306,
-  mariadb: 3306,
-  mongodb: 27017,
-  sqlite: 0
-};
+
 
 function testRegex(content, regexString) {
   const regex = new RegExp(`^(?!\\s*(?:#|\\/\\/)).*${regexString}`, 'im');
@@ -89,7 +85,7 @@ async function checkEnvVars(baseDir, backendPath, onlyFiles = ['.env']) {
           if (testRegex(content, 'mongodb(?:\\+srv)?:\\/\\/') || testRegex(content, 'MONGO_URI')) {
             return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
           }
-        } catch (e) {}
+        } catch (e) { logDebug(e); }
         return null;
       })());
     }
@@ -111,7 +107,7 @@ async function checkORM(baseDir, backendPath) {
         if (testRegex(prismaContent, 'provider\\s*=\\s*["\']mysql["\']')) return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
         if (testRegex(prismaContent, 'provider\\s*=\\s*["\']mongodb["\']')) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
         if (testRegex(prismaContent, 'provider\\s*=\\s*["\']sqlite["\']')) return { hasDb: true, dbType: 'sqlite', port: DB_PORTS.sqlite };
-      } catch (e) {}
+      } catch (e) { logDebug(e); }
 
       const typeormFiles = ['ormconfig.json', 'typeorm.config.ts', 'typeorm.config.js'];
       for (const file of typeormFiles) {
@@ -121,7 +117,7 @@ async function checkORM(baseDir, backendPath) {
           if (testRegex(content, 'type\\s*[:=]\\s*["\']mysql["\']')) return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
           if (testRegex(content, 'type\\s*[:=]\\s*["\']mariadb["\']')) return { hasDb: true, dbType: 'mariadb', port: DB_PORTS.mariadb };
           if (testRegex(content, 'type\\s*[:=]\\s*["\']mongodb["\']')) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
-        } catch (e) {}
+        } catch (e) { logDebug(e); }
       }
       return null;
     })());
@@ -143,7 +139,7 @@ async function checkPackageJson(backendPath) {
     if (deps['mariadb']) return { hasDb: true, dbType: 'mariadb', port: DB_PORTS.mariadb };
     if (deps['mongoose'] || deps['mongodb']) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
     if (deps['sqlite3']) return { hasDb: true, dbType: 'sqlite', port: DB_PORTS.sqlite };
-  } catch (err) {}
+  } catch (err) { logDebug(err); }
   return null;
 }
 
@@ -158,7 +154,7 @@ async function checkRequirementsTxt(backendPath) {
       if (line.includes('mysqlclient') || line.includes('pymysql')) return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
       if (line.includes('pymongo') || line.includes('mongoengine')) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
     }
-  } catch (err) {}
+  } catch (err) { logDebug(err); }
   return null;
 }
 
@@ -208,7 +204,7 @@ async function extractDbCredentials(baseDir, backendPath) {
       if (dbUser && dbName) {
          break;
       }
-    } catch (e) {}
+    } catch (e) { logDebug(e); }
   }
 
   return { user: dbUser, name: dbName };
@@ -228,7 +224,7 @@ async function checkDockerCompose(baseDir) {
       if (testRegex(content, 'image:\\s*["\']?mongo') || testRegex(content, 'MONGO_URI') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?27017"?')) {
         return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
       }
-    } catch(e) {}
+    } catch(e) { logDebug(e); }
   }
   return null;
 }
@@ -243,7 +239,7 @@ async function checkLocalDbDockerfile(baseDir) {
       if (dockerfileMatch) {
         return path.join(dir, dockerfileMatch);
       }
-    } catch(e) {}
+    } catch(e) { logDebug(e); }
   }
   return null;
 }
@@ -316,30 +312,7 @@ async function analyzeBackendForDbPasswordKey(backendPath) {
   const regex = new RegExp('\\b(' + passwordKeys.join('|') + ')\\b', 'g');
   const counts = {};
 
-  const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.nuxt', '.output', '.cache']);
-
-  async function walk(dir) {
-    let filesToScan = [];
-    try {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          if (IGNORED_DIRS.has(entry.name) || (entry.name.startsWith('.') && entry.name !== '.env')) continue;
-          filesToScan.push(...await walk(path.join(dir, entry.name)));
-        } else {
-          const ext = path.extname(entry.name);
-          const ignoredFiles = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
-          if (ignoredFiles.has(entry.name)) continue;
-          if (['.js', '.ts', '.json', '.yaml', '.yml', '.py', '.go', '.sh', '.java', '.cs', '.php'].includes(ext) || entry.name.startsWith('.env') || entry.name.toLowerCase().includes('dockerfile')) {
-            filesToScan.push(path.join(dir, entry.name));
-          }
-        }
-      }
-    } catch (e) {}
-    return filesToScan;
-  }
-
-  const files = await walk(backendPath);
+  const files = await walkDir(backendPath);
   for (const file of files) {
     try {
       const content = await fs.readFile(file, 'utf8');
@@ -348,7 +321,7 @@ async function analyzeBackendForDbPasswordKey(backendPath) {
         const key = match[1];
         counts[key] = (counts[key] || 0) + 1;
       }
-    } catch (e) {}
+    } catch (e) { logDebug(e); }
   }
 
   const sortedKeys = Object.entries(counts).sort((a, b) => b[1] - a[1]);
@@ -368,30 +341,7 @@ async function analyzeBackendForDbKeys(backendPath) {
   const passwordCounts = {};
   const portCounts = {};
 
-  const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.nuxt', '.output', '.cache']);
-
-  async function walk(dir) {
-    let filesToScan = [];
-    try {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          if (IGNORED_DIRS.has(entry.name) || (entry.name.startsWith('.') && entry.name !== '.env')) continue;
-          filesToScan.push(...await walk(path.join(dir, entry.name)));
-        } else {
-          const ext = path.extname(entry.name);
-          const ignoredFiles = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
-          if (ignoredFiles.has(entry.name)) continue;
-          if (['.js', '.ts', '.py', '.go', '.java', '.cs', '.php'].includes(ext)) {
-            filesToScan.push(path.join(dir, entry.name));
-          }
-        }
-      }
-    } catch (e) {}
-    return filesToScan;
-  }
-
-  const files = await walk(backendPath);
+  const files = await walkDir(backendPath);
   
   const envVarRegex = /(?:process\.env\.|os\.Getenv\(['"`]|getenv\(['"`]|System\.getenv\(['"`]|Environment\.GetEnvironmentVariable\(['"`]|\$ENV\[['"`]|\$_ENV\[['"`])([a-zA-Z0-9_]+)/g;
   const destructureRegex = /(?:const|let|var)\s*\{([^}]+)\}\s*=\s*process\.env/g;
@@ -421,7 +371,7 @@ async function analyzeBackendForDbKeys(backendPath) {
           processKey(key);
         }
       }
-    } catch (e) {}
+    } catch (e) { logDebug(e); }
   }
 
   const getTopKey = (counts) => {

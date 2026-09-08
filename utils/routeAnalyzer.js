@@ -1,30 +1,7 @@
 const fs = require('fs').promises;
 const path = require('path');
-
-const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.nuxt', '.output', '.cache']);
-
-async function walkDir(dir, fileList = []) {
-  try {
-    const files = await fs.readdir(dir, { withFileTypes: true });
-    for (const file of files) {
-      if (file.isDirectory()) {
-        if (IGNORED_DIRS.has(file.name) || (file.name.startsWith('.') && file.name !== '.env')) {
-          continue;
-        }
-        await walkDir(path.join(dir, file.name), fileList);
-      } else {
-        const ext = path.extname(file.name);
-        const ignoredFiles = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
-        if (ignoredFiles.has(file.name)) continue;
-
-        if (['.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte', '.html', '.conf', '.json'].includes(ext) || file.name.startsWith('.env') || file.name.includes('config')) {
-          fileList.push(path.join(dir, file.name));
-        }
-      }
-    }
-  } catch (err) { }
-  return fileList;
-}
+const { walkDir, logDebug } = require('./fsHelper');
+const { COMMON_API_PREFIXES } = require('./constants');
 
 function getRootSegment(fullPath) {
   const parts = fullPath.split('?')[0].split('/');
@@ -51,7 +28,7 @@ async function analyzeFrontendRoutes(frontendDir) {
     }
   };
 
-  const httpCallRegex = /(?:fetch|axios(?:\.[a-z]+)?|\$http(?:\.[a-z]+)?|http(?:\.[a-z]+)?|client(?:\.[a-z]+)?|request(?:\.[a-z]+)?|api(?:\.[a-z]+)?)\s*\(\s*.*?['"`}]((?:https?:\/\/[^\/\s'"`}]+)?\/[a-zA-Z0-9_\-\/]+)(?:\?|['"`\s])/gim;
+  const httpCallRegex = /(?:fetch|axios|(?:\0)http|client|request|api)(?:\s*\.\s*[a-zA-Z]+)?\s*\(\s*.{0,200}?['"`}]((?:https?:\/\/[^\/\s'"`}]+)?\/[a-zA-Z0-9_\-\/]+)(?:\?|['"`\s])/gims;
   const envUrlRegex = /^(?:VITE_|REACT_APP_|NEXT_PUBLIC_|NUXT_|VUE_APP_)?[A-Z0-9_]*(?:URL|API|ENDPOINT)\s*=\s*['"`]?((?:https?:\/\/[^\/]+)?\/[a-zA-Z0-9_\-\/]+)/gim;
 
   // Proxy configs often have '/api': { target: ... } or location /api/ { proxy_pass ... }
@@ -132,7 +109,7 @@ async function analyzeFrontendRoutes(frontendDir) {
         }
       }
 
-    } catch (e) { }
+    } catch (e) { logDebug(e); }
   }
 
   // Sort by score
@@ -148,25 +125,60 @@ async function analyzeFrontendRoutes(frontendDir) {
   }
 
   // For low-confidence routes (score < 5), we only add them if we don't have any high confidence ones
-  // OR if we suspect they are common API prefixes
-  const commonApiPrefixes = ['/api', '/graphql', '/backend', '/v1', '/v2', '/rpc', '/trpc', '/socket.io'];
-
   const hasHighConfidence = finalRoutes.length > 0;
   for (const [route, score] of sortedRoutes) {
     if (score > 0 && score < 5) {
-      if (commonApiPrefixes.includes(route)) {
-        if (!finalRoutes.includes(route)) finalRoutes.push(route);
-      } else if (!hasHighConfidence) {
-        // If absolutely nothing else was found, add it, but this might be risky.
-        // If multiple low-score ones exist, we add all of them
+      if (COMMON_API_PREFIXES.includes(route)) {
         if (!finalRoutes.includes(route)) finalRoutes.push(route);
       }
+      // Removed the risky fallback that included all low-confidence routes
     }
   }
 
   return finalRoutes;
 }
 
-module.exports = {
+
+async function analyzeBackendExposedRoutes(backendDir) {
+  if (!backendDir) return [];
+  const filesToScan = await walkDir(backendDir);
+  const routeScores = {};
+
+  const addRoute = (route, score) => {
+    const root = getRootSegment(route);
+    if (root && root !== '/') {
+      routeScores[root] = (routeScores[root] || 0) + score;
+    }
+  };
+
+  // Detect express: app.use('/api', ...), router.get('/users', ...)
+  // Detect Gin: r.Group("/api")
+  // Detect FastAPI: @app.get("/api")
+  const listenRouteRegex = /(?:app|router|r|server|http|mux)\.(?:use|get|post|put|delete|patch|all|Group|HandleFunc|Handle)\s*\(\s*['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
+  const pythonRouteRegex = /@(?:app|router|server)\.(?:route|get|post|put|delete|patch)\s*\(\s*['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
+  
+  for (const filePath of filesToScan) {
+    if (filePath.includes('node_modules') || filePath.includes('.git') || filePath.includes('dist')) continue;
+    try {
+      const ext = path.extname(filePath);
+      if (!['.js', '.ts', '.go', '.py', '.java', '.php', '.rb'].includes(ext)) continue;
+      
+      const fileContent = await fs.readFile(filePath, 'utf8');
+      
+      let match;
+      while ((match = listenRouteRegex.exec(fileContent)) !== null) {
+        addRoute(match[1], 1);
+      }
+      while ((match = pythonRouteRegex.exec(fileContent)) !== null) {
+        addRoute(match[1], 1);
+      }
+    } catch (e) {}
+  }
+  
+  const sortedRoutes = Object.entries(routeScores).sort((a, b) => b[1] - a[1]);
+  return sortedRoutes.map(r => r[0]);
+}
+
+module.exports = { analyzeBackendExposedRoutes, 
   analyzeFrontendRoutes
 };

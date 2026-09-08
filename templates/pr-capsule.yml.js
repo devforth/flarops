@@ -30,16 +30,13 @@ module.exports = function prCapsuleYmlTemplate(config) {
   if (config.hasDb) {
     if (config.dbType === 'postgres') {
       dbDumpCmd = `kubectl exec -n \${{ env.MAIN_NAMESPACE }} database-0 -- pg_dump -U \${{ env.DB_USER }} \${{ env.DB_NAME }} > dump.sql`;
-      checkDbEmptyCmd = `kubectl exec -n \${{ env.PR_NAMESPACE }} database-0 -- psql -U \${{ env.DB_USER }} \${{ env.DB_NAME }} -c "\\dt" | grep "No relations found."`;
       dbRestoreCmd = `kubectl exec -i -n \${{ env.PR_NAMESPACE }} database-0 -- psql -U \${{ env.DB_USER }} \${{ env.DB_NAME }} < dump.sql`;
     } else if (config.dbType === 'mysql' || config.dbType === 'mariadb') {
       dbDumpCmd = `kubectl exec -n \${{ env.MAIN_NAMESPACE }} database-0 -- mysqldump -u \${{ env.DB_USER }} -p\${{ secrets.${config.dbPasswordKey} }} \${{ env.DB_NAME }} > dump.sql`;
-      checkDbEmptyCmd = `kubectl exec -n \${{ env.PR_NAMESPACE }} database-0 -- mysql -u \${{ env.DB_USER }} -p\${{ secrets.${config.dbPasswordKey} }} -e "SHOW TABLES IN \${{ env.DB_NAME }};" | wc -l | grep "^0$"`;
       dbRestoreCmd = `kubectl exec -i -n \${{ env.PR_NAMESPACE }} database-0 -- mysql -u \${{ env.DB_USER }} -p\${{ secrets.${config.dbPasswordKey} }} \${{ env.DB_NAME }} < dump.sql`;
     } else if (config.dbType === 'mongodb') {
-      const mongoAuth = config.dbUser ? `-u \${{ env.DB_USER }} -p \${{ secrets.${config.dbPasswordKey} }} --authenticationDatabase admin` : '';
+      const mongoAuth = `-u \${{ env.DB_USER }} -p \${{ secrets.${config.dbPasswordKey} }} --authenticationDatabase admin`;
       dbDumpCmd = `kubectl exec -n \${{ env.MAIN_NAMESPACE }} database-0 -- mongodump ${mongoAuth} --db \${{ env.DB_NAME }} --archive > dump.archive`;
-      checkDbEmptyCmd = `kubectl exec -n \${{ env.PR_NAMESPACE }} database-0 -- mongosh \${{ env.DB_NAME }} --quiet --eval "db.getCollectionNames().length" | grep "^0$"`;
       dbRestoreCmd = `kubectl exec -i -n \${{ env.PR_NAMESPACE }} database-0 -- mongorestore ${mongoAuth} --archive --nsInclude="\${{ env.DB_NAME }}.*" --drop < dump.archive`;
     }
   }
@@ -54,41 +51,56 @@ module.exports = function prCapsuleYmlTemplate(config) {
           echo "Waiting for PR database to be ready..."
           kubectl rollout status statefulset/database -n \${{ env.PR_NAMESPACE }} --timeout=120s
           
-          # Check if DB is empty
-          echo "Checking if PR database is empty..."
-          if ${checkDbEmptyCmd} > /dev/null 2>&1 || true; then
-            echo "Database seems empty, performing dump & restore..."
+          # Check if DB has been cloned before
+          echo "Checking if PR database was already cloned..."
+          if ! kubectl get configmap flarops-db-cloned -n \${{ env.PR_NAMESPACE }} > /dev/null 2>&1; then
+            echo "Database has not been cloned yet, performing dump & restore..."
             ${dbDumpCmd}
             
             echo "Restoring to PR database..."
             ${dbRestoreCmd}
             
+            echo "Marking database as cloned..."
+            kubectl create configmap flarops-db-cloned -n \${{ env.PR_NAMESPACE }}
+            
             echo "Restarting API pod to pick up restored data..."
-            kubectl rollout restart deployment api -n \${{ env.PR_NAMESPACE }}
-            kubectl rollout status deployment/api -n \${{ env.PR_NAMESPACE }} --timeout=120s
+            kubectl rollout restart deployment api -n \${{ env.PR_NAMESPACE }} || true
+            kubectl rollout status deployment/api -n \${{ env.PR_NAMESPACE }} --timeout=120s || true
           else
-            echo "Database is not empty, skipping clone to preserve data."
+            echo "Database was already cloned, skipping clone to preserve data."
           fi
 ` : '';
 
   const envsBlock = config.hasDb ? `  DB_USER: ${config.dbUser || 'root'}
   DB_NAME: ${config.dbName || 'appdb'}` : '';
 
-  return \`name: Flarops PR Capsule
+
+  const domainParts = config.domain.split('.');
+  let prDomainLogic;
+  if (domainParts.length > 2) {
+    const subdomain = domainParts[0];
+    const baseDomain = domainParts.slice(1).join('.');
+    prDomainLogic = `${subdomain}-pr-\${{ github.event.pull_request.number }}.${baseDomain}`;
+  } else {
+    prDomainLogic = `pr-\${{ github.event.pull_request.number }}.${config.domain}`;
+  }
+
+  return `name: Flarops PR Capsule
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
 
 env:
+  AWS_REGION: us-west-2
   PROJECT_NAME: ${config.projectName}
   REGISTRY_USER: ${config.registryUser}
   BASE_DOMAIN: ${config.domain}
   MAIN_NAMESPACE: ${config.projectName}-production
   PR_NAMESPACE: ${config.projectName}-pr-\${{ github.event.pull_request.number }}
   PR_ENV_NAME: pr-\${{ github.event.pull_request.number }}
-  PR_DOMAIN: pr-\${{ github.event.pull_request.number }}.${config.domain}
-\${envsBlock ? envsBlock + '\\n' : ''}\${registryEnv ? '  ' + registryEnv + '\\n' : ''}
+  PR_DOMAIN: ${prDomainLogic}
+${envsBlock ? envsBlock + '\n' : ''}${registryEnv ? '  ' + registryEnv + '\n' : ''}
 
 jobs:
   deploy-capsule:
@@ -101,6 +113,24 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: \${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: \${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: \${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: terraform init
+
+      - name: Terraform Workspace
+        working-directory: deploy/terraform
+        run: terraform workspace select -or-create main
+
       - name: Fetch Kubeconfig from EC2
         run: |
           mkdir -p ~/.ssh
@@ -108,11 +138,7 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           
           # Retrieve EC2 IP using Terraform or from secrets if exported
-          export EC2_IP=\${{ secrets.EC2_IP }}
-          if [ -z "$EC2_IP" ]; then
-            echo "::error::EC2_IP secret is missing. Please ensure Terraform exports EC2_IP or set it as a Repository Secret."
-            exit 1
-          fi
+          export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
           
           mkdir -p ~/.kube
           ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
@@ -120,20 +146,10 @@ jobs:
           
           sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: \${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: \${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-west-2
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
       - name: Verify Cluster Resources & Autoscale
-        env:\${config.hasCloudflare ? `
-          TF_VAR_cloudflare_api_token: \\\${{ secrets.CLOUDFLARE_API_TOKEN }}
-          TF_VAR_cloudflare_zone_id: \\\${{ secrets.CLOUDFLARE_ZONE_ID }}` : ''}
+        env:${config.hasCloudflare ? `
+          TF_VAR_cloudflare_api_token: \${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id: \${{ secrets.CLOUDFLARE_ZONE_ID }}` : ''}
           TF_VAR_domain: \${{ env.BASE_DOMAIN }}
         run: |
           echo "Checking available resources on Kubernetes cluster..."
@@ -174,7 +190,7 @@ jobs:
             echo "Waiting for new worker node to join the cluster..."
             sleep 45
             
-            export EC2_IP=\${{ secrets.EC2_IP }}
+            export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
             ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "kubectl wait --for=condition=Ready node --all --timeout=120s"
           else
             echo "Sufficient resources available. Proceeding with deployment."
@@ -189,7 +205,7 @@ ${loginStep}
             --parallel-tasks-limit=3 \\
             --repo ${repoString} \\
             --env \${{ env.PR_ENV_NAME }} \\
-            --set ingress.domain=\${{ env.PR_DOMAIN }} \\
+            --set domain=\${{ env.PR_DOMAIN }} \\
 ${setEnvs}            --set database.password=\${{ secrets.${config.dbPasswordKey} }}${loginRegistryHost === 'docker.io' ? '' : `
 
       - name: Cleanup old images
@@ -207,17 +223,31 @@ ${dbCloningLogic}
         with:
           fetch-depth: 0
 
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: \${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: \${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: \${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: terraform init
+
+      - name: Terraform Workspace
+        working-directory: deploy/terraform
+        run: terraform workspace select -or-create main
+
       - name: Fetch Kubeconfig from EC2
         run: |
           mkdir -p ~/.ssh
           echo "\${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
-          export EC2_IP=\${{ secrets.EC2_IP }}
-          if [ -z "$EC2_IP" ]; then
-            echo "::error::EC2_IP secret is missing. Cannot proceed with cleanup."
-            exit 1
-          fi
+          export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
           
           mkdir -p ~/.kube
           ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
@@ -236,12 +266,12 @@ ${loginStep}
             --with-namespace
 
       - name: Check and Scale Down Idle Nodes
-        env:\${config.hasCloudflare ? `
-          TF_VAR_cloudflare_api_token: \\\${{ secrets.CLOUDFLARE_API_TOKEN }}
-          TF_VAR_cloudflare_zone_id: \\\${{ secrets.CLOUDFLARE_ZONE_ID }}` : ''}
+        env:${config.hasCloudflare ? `
+          TF_VAR_cloudflare_api_token: \${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id: \${{ secrets.CLOUDFLARE_ZONE_ID }}` : ''}
           TF_VAR_domain: \${{ env.BASE_DOMAIN }}
         run: |
-          export EC2_IP=\${{ secrets.EC2_IP }}
+          export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
           ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "bash -s" << 'EOF'
             CURRENT_WORKERS=$(kubectl get nodes -l node-role.kubernetes.io/master!=true --no-headers 2>/dev/null | wc -l || echo "0")
             if [ "$CURRENT_WORKERS" -eq 0 ]; then
@@ -279,5 +309,5 @@ ${loginStep}
             terraform workspace select -or-create production
             terraform apply -var="worker_count=$NEW_WORKERS" -auto-approve
           fi
-\`;
+`;
 };

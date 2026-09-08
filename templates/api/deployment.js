@@ -53,29 +53,35 @@ spec:
       containers:
         - name: api
           image: {{ if .Values.werf }}{{ .Values.werf.image.api }}{{ else }}{{ .Values.images.api | default "api:latest" }}{{ end }}
-{{- if .Values.env }}
-          envFrom:
-            - secretRef:
-                name: {{ .Values.projectName }}-secrets
-{{- end }}
-{{- if or .Values.api.env ${hasCustomEnv ? 'true' : 'false'} }}
+{{- if or .Values.api.env .Values.api.secretKeys .Values.database ${hasCustomEnv ? 'true' : 'false'} }}
           env:
+{{- if .Values.api.env }}
 {{- range $key, $value := .Values.api.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
-{{- end }}${dbUrlEnvBlock}
+{{- end }}
+{{- end }}
+{{- if .Values.api.secretKeys }}
+{{- range $key := .Values.api.secretKeys }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: {{ $key }}
+{{- end }}
+{{- end }}
 {{- if .Values.database }}
             - name: {{ "${config.dbPasswordKey}" }}
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.projectName }}-secrets
                   key: {{ "${config.dbPasswordKey}" }}
-{{- end }}
+{{- end }}${dbUrlEnvBlock}
 {{- end }}
           resources:
             requests:
               memory: "256Mi"
-              cpu: "500m"
+              cpu: "300m"
             limits:
               memory: "512Mi"
               cpu: "1000m"

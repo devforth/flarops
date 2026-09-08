@@ -1,5 +1,6 @@
 const fs = require('fs').promises;
 const path = require('path');
+const { walkDir, logDebug } = require('./fsHelper');
 
 async function findPortsInCompose(baseDir, possibleServiceNames) {
   const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
@@ -21,36 +22,12 @@ async function findPortsInCompose(baseDir, possibleServiceNames) {
           }
         }
       }
-    } catch (e) { }
+    } catch (e) { logDebug(e); }
   }
   return Array.from(ports);
 }
 
-const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.nuxt', '.output', '.cache']);
 
-async function walkDir(dir, fileList = []) {
-  try {
-    const files = await fs.readdir(dir, { withFileTypes: true });
-    for (const file of files) {
-      if (file.isDirectory()) {
-        if (IGNORED_DIRS.has(file.name) || (file.name.startsWith('.') && file.name !== '.env')) {
-          continue;
-        }
-        await walkDir(path.join(dir, file.name), fileList);
-      } else {
-        const ext = path.extname(file.name);
-        // Only scan text-like files and completely ignore lockfiles
-        const ignoredFiles = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
-        if (ignoredFiles.has(file.name)) continue;
-
-        if (['.js', '.ts', '.json', '.yaml', '.yml', '.py', '.go', '.sh'].includes(ext) || file.name.startsWith('.env') || file.name.toLowerCase().includes('dockerfile')) {
-          fileList.push(path.join(dir, file.name));
-        }
-      }
-    }
-  } catch (err) { }
-  return fileList;
-}
 
 async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort) {
   const regexList = [
@@ -108,7 +85,7 @@ async function findDockerfile(dir) {
     
     const partialMatch = files.find(f => f.toLowerCase().includes('dockerfile'));
     if (partialMatch) return partialMatch;
-  } catch(e) {}
+  } catch(e) { logDebug(e); }
   return 'Dockerfile';
 }
 
@@ -127,7 +104,7 @@ async function findHealthRoute(backendPath) {
       if (match && match[1]) {
         return match[1]; // Found a health route
       }
-    } catch(e) {}
+    } catch(e) { logDebug(e); }
   }
   
   return null; // Fallback
@@ -166,7 +143,7 @@ async function analyzeBackend(baseDir) {
           }
         }
       }
-    } catch (err) {}
+    } catch (err) { logDebug(err); }
   }
 
   if (!backendPath) {
@@ -207,7 +184,7 @@ async function inferFrontendPortFromPackage(frontendPath) {
         if (deps['@vue/cli-service']) return 8080;
         if (deps['gatsby']) return 8000;
         if (deps['svelte'] || deps['@sveltejs/kit']) return 5173;
-      } catch (e) { }
+      } catch (e) { logDebug(e); }
     }
   } catch (e) { }
   return 80;
@@ -235,7 +212,7 @@ async function analyzeDockerfile(frontendPath) {
         return 80;
       }
     }
-  } catch (e) { }
+  } catch (e) { logDebug(e); }
   
   return null;
 }
@@ -253,7 +230,7 @@ async function analyzeFrontend(baseDir) {
         frontendPath = fullPath;
         break;
       }
-    } catch (err) { }
+    } catch (err) { logDebug(err); }
   }
 
   // 2. Fallback to partial match (e.g., 'kanban-ui', 'web-app')
@@ -269,7 +246,7 @@ async function analyzeFrontend(baseDir) {
           }
         }
       }
-    } catch (err) {}
+    } catch (err) { logDebug(err); }
   }
 
   if (!frontendPath) {
@@ -295,4 +272,86 @@ async function analyzeFrontend(baseDir) {
   return { hasFrontend: true, frontendPath, ports, dockerfile };
 }
 
-module.exports = { analyzeBackend, analyzeFrontend };
+
+async function extractUsedEnvVars(serviceDir) {
+  const { walkDir, logDebug } = require('./fsHelper');
+  const envVars = new Set();
+  
+  if (!serviceDir) return Array.from(envVars);
+
+  try {
+    const files = await walkDir(serviceDir);
+    const envVarRegex = /(?:process\.env\.|os\.Getenv\(['"`]|getenv\(['"`]|System\.getenv\(['"`]|Environment\.GetEnvironmentVariable\(['"`]\$?|\$ENV\[['"`]|\$_ENV\[['"`]|\$\b)([a-zA-Z_][a-zA-Z0-9_]+)/g;
+    const destructureRegex = /(?:const|let|var)\s*\{([^}]+)\}\s*=\s*process\.env/g;
+
+    for (const file of files) {
+      if (file.includes('node_modules') || file.includes('.git') || file.includes('dist') || file.includes('build')) continue;
+      try {
+        const fileContent = fs.readFileSync(file, 'utf8');
+        
+        let match;
+        while ((match = envVarRegex.exec(fileContent)) !== null) {
+          envVars.add(match[1]);
+        }
+        
+        let destructureMatch;
+        while ((destructureMatch = destructureRegex.exec(fileContent)) !== null) {
+          const keys = destructureMatch[1].split(',').map(k => k.split(':')[0].split('=')[0].trim()).filter(k => k);
+          for (const key of keys) {
+            envVars.add(key);
+          }
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  
+  return Array.from(envVars);
+}
+
+async function analyzeAdditionalServices(baseDir, knownPaths) {
+  const { walkDir, logDebug } = require('./fsHelper');
+  const services = [];
+  try {
+    const files = await fs.promises.readdir(baseDir, { withFileTypes: true });
+    for (const file of files) {
+      if (!file.isDirectory() || file.name.startsWith('.') || ['node_modules', 'deploy', 'dist', 'build', 'templates', 'dashboard'].includes(file.name)) continue;
+      
+      const fullPath = require('path').join(baseDir, file.name);
+      if (knownPaths.includes(fullPath)) continue;
+      
+      const dockerfile = await findDockerfile(fullPath);
+      if (!dockerfile) continue;
+      
+      // It has a Dockerfile, so it's a service
+      // Let's find its port, healthRoute, usedEnvVars, and exposed HTTP routes
+      const portNamesPattern = ['PORT', 'SERVER_PORT', 'APP_PORT', 'API_PORT', 'HTTP_PORT', 'SERVICE_PORT'].join('|');
+      const dirPorts = await findPortsInDir(baseDir, fullPath, portNamesPattern, null);
+      const composePorts = await findPortsInCompose(baseDir, [file.name]);
+      
+      let ports = Array.from(new Set([...dirPorts, ...composePorts])).filter(p => p !== null);
+      if (ports.length === 0) ports = [80]; // fallback
+      
+      const healthRoute = await findHealthRoute(fullPath);
+      const usedEnvVars = await extractUsedEnvVars(fullPath);
+      
+      // Try to find if it exposes any HTTP routes that should be public
+      const { analyzeBackendExposedRoutes } = require('./routeAnalyzer');
+      const apiRoutes = await analyzeBackendExposedRoutes(fullPath); 
+      // Reusing routeAnalyzer since it looks for fetch/axios/proxies, but actually we need to find what it *listens* on.
+      // Wait, routeAnalyzer finds what it calls, not what it listens on!
+      
+      services.push({
+        name: file.name,
+        path: fullPath,
+        ports,
+        healthRoute,
+        usedEnvVars,
+        dockerfile,
+        exposedRoutes: apiRoutes
+      });
+    }
+  } catch(e) {}
+  return services;
+}
+
+module.exports = { analyzeAdditionalServices, extractUsedEnvVars,  analyzeBackend, analyzeFrontend };

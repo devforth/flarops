@@ -25,5 +25,21 @@ dockerfile: ${config.dbLocalDockerfile}
 context: ${config.dbContext === '.' ? '.' : config.dbContext}
 `;
   }
+  
+  if (config.additionalServices && config.additionalServices.length > 0) {
+    for (const s of config.additionalServices) {
+      yaml += `---
+image: ${s.name}
+dockerfile: ${s.dockerfile || 'Dockerfile'}
+context: ${s.path}
+`;
+    }
+  }
+
+  yaml += `---
+image: dashboard
+dockerfile: Dockerfile
+context: deploy/dashboard
+`;
   return yaml;
 };

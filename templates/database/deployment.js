@@ -94,10 +94,10 @@ spec:
           resources:
             requests:
               memory: "256Mi"
-              cpu: "500m"
+              cpu: "200m"
             limits:
               memory: "1024Mi"
-              cpu: "1000m"
+              cpu: "500m"
           volumeMounts:
             - name: data
               mountPath: ${volumeMountPath}

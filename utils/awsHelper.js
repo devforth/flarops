@@ -2,7 +2,7 @@ const fs = require('fs');
 const fsPromises = require('fs').promises;
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 
 function getDefaultAWSCredentials() {
   try {
@@ -60,12 +60,11 @@ function ensureAwsCli() {
     const extractPath = path.join(tmpDir, 'awscli-install');
     
     try {
-      execSync(`curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "${zipPath}"`, { stdio: 'inherit' });
-      execSync(`unzip -q -o "${zipPath}" -d "${extractPath}"`, { stdio: 'ignore' });
+      execFileSync('curl', ['https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip', '-o', zipPath], { stdio: 'inherit' });
+      execFileSync('unzip', ['-q', '-o', zipPath, '-d', extractPath], { stdio: 'ignore' });
       
       const localDir = path.join(os.homedir(), '.local');
-      const installCmd = `${path.join(extractPath, 'aws', 'install')} -i ${path.join(localDir, 'aws-cli')} -b ${path.join(localDir, 'bin')}`;
-      execSync(installCmd, { stdio: 'inherit' });
+      execFileSync(path.join(extractPath, 'aws', 'install'), ['-i', path.join(localDir, 'aws-cli'), '-b', path.join(localDir, 'bin')], { stdio: 'inherit' });
       
       console.log("AWS CLI installed successfully.");
       return localAwsPath;
@@ -88,7 +87,7 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion) {
     
     while (true) {
       try {
-        execSync(`${awsCmd} s3api head-bucket --bucket ${currentBucket}`, { env, stdio: 'pipe' });
+        execFileSync(awsCmd, ['s3api', 'head-bucket', '--bucket', currentBucket], { env, stdio: 'pipe' });
         
         // Exists and we have access
         const answer = await askQuestion(`Bucket [${currentBucket}] is already exist, are you sure you want to use it? [y/N]: `);
@@ -112,7 +111,7 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion) {
           // Doesn't exist, we can create it
           try {
             console.log(`Creating S3 bucket: ${currentBucket} in us-west-2...`);
-            execSync(`${awsCmd} s3api create-bucket --bucket ${currentBucket} --region us-west-2 --create-bucket-configuration LocationConstraint=us-west-2`, { env, stdio: 'pipe' });
+            execFileSync(awsCmd, ['s3api', 'create-bucket', '--bucket', currentBucket, '--region', 'us-west-2', '--create-bucket-configuration', 'LocationConstraint=us-west-2'], { env, stdio: 'pipe' });
             resolve({ bucket: currentBucket, warning: null });
             return;
           } catch (createErr) {

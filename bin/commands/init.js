@@ -79,11 +79,12 @@ function sanitizeEnvValue(val) {
   return cleaned;
 }
 
-function processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext) {
-  if (foundDbUrls[key]) return;
-  if (dbPasswordRegex.test(key)) return;
 
-  if (sensitiveRegex.test(key)) {
+function processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext, matchedAdditionalServices) {
+  if (foundDbUrls[key]) return;
+  if (DB_PASSWORD_REGEX.test(key)) return;
+
+  if (SENSITIVE_REGEX.test(key)) {
     const fullLine = `${key}=${val}`;
     if (!sensitiveContext.content.includes(fullLine)) {
       sensitiveContext.content += `${fullLine}\n`;
@@ -91,8 +92,14 @@ function processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv
   } else {
     if (isBackend) apiEnv[key] = val;
     if (isFrontend) frontendEnv[key] = val;
+    if (matchedAdditionalServices && matchedAdditionalServices.length > 0) {
+      for (const s of matchedAdditionalServices) {
+        s.env[key] = val;
+      }
+    }
   }
 }
+
 
 function generateEnvString(envObj, context) {
   if (Object.keys(envObj).length === 0) return '    # KEY: "VALUE"';
@@ -571,7 +578,7 @@ variable "domain" {
     return fileList;
   }
 
-  const { analyzeBackend, analyzeFrontend } = require('../../utils/analyzer');
+  const { analyzeBackend, analyzeFrontend, analyzeAdditionalServices, extractUsedEnvVars } = require('../../utils/analyzer');
   const { analyzeDatabase, analyzeBackendForDbPasswordKey, analyzeBackendForDbKeys } = require('../../utils/dbAnalyzer');
   const { analyzeFrontendRoutes } = require('../../utils/routeAnalyzer');
   const { refactorFrontendEnv, refactorBackendDbUrl, refactorNginxConf, refactorLowercaseEnvVars } = require('../../utils/envRefactor');
@@ -582,6 +589,39 @@ variable "domain" {
   ]);
 
   const dbInfo = await analyzeDatabase(currentDir, backendInfo.backendPath);
+
+  let knownPaths = [];
+  if (backendInfo.backendPath) {
+    knownPaths.push(backendInfo.backendPath);
+    backendInfo.usedEnvVars = await extractUsedEnvVars(backendInfo.backendPath);
+  }
+  if (frontendInfo.frontendPath) {
+    knownPaths.push(frontendInfo.frontendPath);
+    frontendInfo.usedEnvVars = await extractUsedEnvVars(frontendInfo.frontendPath);
+  }
+  
+  let additionalServices = await analyzeAdditionalServices(currentDir, knownPaths);
+  
+  // Resolve naming conflicts
+  const usedNames = new Set(['api', 'frontend', 'db', 'database', 'dashboard']);
+  for (const s of additionalServices) {
+    let baseName = s.name.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    let finalName = baseName;
+    let counter = 1;
+    while (usedNames.has(finalName)) {
+      finalName = `${baseName}-${counter}`;
+      counter++;
+    }
+    s.name = finalName;
+    usedNames.add(finalName);
+  }
+
+  // Initialize env for additional services
+  for (const s of additionalServices) {
+    s.env = {};
+    s.secretKeys = [];
+  }
+
 
   let refactoredEnvKey = null;
   let refactoredRoutes = [];
@@ -639,6 +679,13 @@ variable "domain" {
 
     let isBackend = false;
     let isFrontend = false;
+    let matchedAdditionalServices = [];
+
+    for (const s of additionalServices) {
+      if (file.startsWith(s.path) || isRoot) {
+        matchedAdditionalServices.push(s);
+      }
+    }
 
     if (backendInfo.backendPath && file.startsWith(backendInfo.backendPath)) {
       isBackend = true;
@@ -684,7 +731,7 @@ variable "domain" {
         val = sanitizeEnvValue(val);
 
         let sensitiveContext = { content: sensitiveEnvContent };
-        processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext);
+        processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext, typeof matchedAdditionalServices !== 'undefined' ? matchedAdditionalServices : []);
         sensitiveEnvContent = sensitiveContext.content;
       }
     }
@@ -719,8 +766,9 @@ variable "domain" {
 
       let isBackend = ['api', 'backend', 'server'].includes(services[i].name) || (backendInfo.backendPath && path.basename(backendInfo.backendPath) === services[i].name);
       let isFrontend = ['frontend', 'client', 'ui', 'web'].includes(services[i].name) || (frontendInfo.frontendPath && path.basename(frontendInfo.frontendPath) === services[i].name);
+      let matchedAdditionalServices = additionalServices.filter(s => s.name === services[i].name);
 
-      if (!isBackend && !isFrontend) continue;
+      if (!isBackend && !isFrontend && matchedAdditionalServices.length === 0) continue;
 
       const lines = block.split('\n');
       let inEnv = false;
@@ -753,7 +801,7 @@ variable "domain" {
             let val = sanitizeEnvValue(envLineMatch[2]);
 
             let sensitiveContext = { content: sensitiveEnvContent };
-            processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext);
+            processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext, typeof matchedAdditionalServices !== 'undefined' ? matchedAdditionalServices : []);
             sensitiveEnvContent = sensitiveContext.content;
           }
         }
@@ -966,8 +1014,21 @@ DOMAIN=${domain}
 
   const excludedKeys = new Set(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'SSH_PRIVATE_KEY', 'REGISTRY_USER', 'REGISTRY_PASSWORD', 'CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ZONE_ID']);
   const envKeysToPass = allEnvKeys.filter(k => !excludedKeys.has(k));
+  if (finalDbPasswordKey && !envKeysToPass.includes(finalDbPasswordKey)) envKeysToPass.push(finalDbPasswordKey);
 
-  const config = {
+
+  const sensitiveKeys = sensitiveEnvContent.split('\n').map(l => l.split('=')[0]).filter(k => k && k.trim());
+  if (finalDbPasswordKey && finalDbPassword) sensitiveKeys.push(finalDbPasswordKey);
+
+  const apiSecretKeys = sensitiveKeys.filter(k => backendInfo.usedEnvVars && backendInfo.usedEnvVars.includes(k));
+  const frontendSecretKeys = sensitiveKeys.filter(k => frontendInfo.usedEnvVars && frontendInfo.usedEnvVars.includes(k));
+  
+  for (const s of additionalServices) {
+    s.secretKeys = sensitiveKeys.filter(k => s.usedEnvVars && s.usedEnvVars.includes(k));
+    // Do NOT generate s.envString here, we don't have contextObj yet.
+  }
+
+  var config = {
     projectName,
     domain,
     dockerRegistry,
@@ -977,12 +1038,18 @@ DOMAIN=${domain}
     frontendPath: relativeFrontendPath,
     apiDockerfile: backendInfo.dockerfile || 'Dockerfile',
     frontendDockerfile: frontendInfo.dockerfile || 'Dockerfile',
+
+    additionalServices,
+    apiSecretKeys,
+    frontendSecretKeys,
+
     images: {
       api: 'api:latest',
       db: dbInfo.hasDb && dbInfo.hasLocalDockerfile ? 'db:latest' : (dbInfo.hasDb && dbInfo.image ? dbInfo.image : 'postgres:15-alpine'),
       frontend: 'frontend:latest'
     },
     dbCloneSource: '', // Can be updated or prompted in the future
+    hasDb: dbInfo.hasDb,
     apiPorts: backendInfo.ports || [3000],
     frontendPorts: frontendInfo.ports || [80],
     dbType: dbInfo.hasDb ? dbInfo.dbType : null,
@@ -1039,6 +1106,24 @@ appVersion: "1.0.0"
   hasLocalhostWarnings = contextObj.hasLocalhostWarnings;
 
   // Write values.yaml
+  
+  let additionalServicesYaml = '';
+  if (config.additionalServices && config.additionalServices.length > 0) {
+    additionalServicesYaml = 'additionalServices:\n';
+    for (const s of config.additionalServices) {
+      additionalServicesYaml += `  - name: ${s.name}
+    image: ${s.name}:latest
+    env:
+${generateEnvString(s.env, contextObj)}
+    secretKeys:
+${s.secretKeys.map(k => '      - ' + k).join('\n')}
+    ports:
+${s.ports.map(p => '      - ' + p).join('\n')}
+    healthRoute: ${s.healthRoute ? '"' + s.healthRoute + '"' : 'null'}
+`;
+    }
+  }
+
   let valuesYaml = `projectName: ${projectName}
 domain: "${domain}"
 images:
@@ -1046,7 +1131,7 @@ images:
   db: ${config.images.db}
   frontend: ${config.images.frontend}
 dbCloneSource: "${config.dbCloneSource}"
-dbType: ${config.dbType ? `"${config.dbType}"` : 'null'}
+dbType: ${config.dbType ? '"' + config.dbType + '"' : 'null'}
 dbPort: ${config.dbPort || 'null'}
 database:
   user: "${finalDbUser}"
@@ -1055,20 +1140,34 @@ database:
   env:
     # KEY: "VALUE"
 api:
-  healthRoute: ${config.apiHealthRoute ? `"${config.apiHealthRoute}"` : 'null'}
+  healthRoute: ${config.apiHealthRoute ? '"' + config.apiHealthRoute + '"' : 'null'}
+  secretKeys:
+${config.apiSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
 ${apiEnvString}
 frontend:
+  secretKeys:
+${config.frontendSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
 ${frontendEnvString}
+${additionalServicesYaml}
 apiPorts:
-${config.apiPorts.map(p => `  - ${p}`).join('\n')}
+${config.apiPorts.map(p => '  - ' + p).join('\n')}
 frontendPorts:
-${config.frontendPorts.map(p => `  - ${p}`).join('\n')}
+${config.frontendPorts.map(p => '  - ' + p).join('\n')}
 apiRoutes:
-${config.apiRoutes.map(p => `  - "${p}"`).join('\n')}
+${config.apiRoutes.map(p => '  - "' + p + '"').join('\n')}
 `;
+
+  if (config.additionalServices && config.additionalServices.length > 0) {
+    valuesYaml += 'additionalServicesIndices:\n';
+    for (let i = 0; i < config.additionalServices.length; i++) {
+      valuesYaml += `  ${config.additionalServices[i].name}: ${i}\n`;
+    }
+  }
+
   fs.writeFileSync(path.join(helmDir, 'values.yaml'), valuesYaml);
+
 
   const ingressTemplate = require('../../templates/01-ingress.js');
   const secretTemplate = require('../../templates/secret.js');
@@ -1078,13 +1177,27 @@ ${config.apiRoutes.map(p => `  - "${p}"`).join('\n')}
   const apiServiceTemplate = require('../../templates/api/service.js');
   const frontendDeploymentTemplate = require('../../templates/frontend/deployment.js');
   const frontendServiceTemplate = require('../../templates/frontend/service.js');
+  const dashboardYamlTemplate = require('../../templates/dashboard.yaml.js');
 
+  
+  const genericDeploymentTemplate = require('../../templates/generic/deployment.js');
+  const genericServiceTemplate = require('../../templates/generic/service.js');
+  
   const templatesToGenerate = [
     { file: path.join(helmTemplatesDir, '01-ingress.yaml'), content: ingressTemplate(config) },
     { file: path.join(helmTemplatesDir, 'secret.yaml'), content: secretTemplate() },
     { file: path.join(helmTemplatesDir, 'api.yaml'), content: apiServiceTemplate() + '\n---\n' + apiDeploymentTemplate(config) },
-    { file: path.join(helmTemplatesDir, 'frontend.yaml'), content: frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate() }
+    { file: path.join(helmTemplatesDir, 'frontend.yaml'), content: frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate() },
+    { file: path.join(helmTemplatesDir, 'dashboard.yaml'), content: dashboardYamlTemplate(config) }
   ];
+
+  if (config.additionalServices && config.additionalServices.length > 0) {
+    for (const s of config.additionalServices) {
+       let serviceContent = genericServiceTemplate(s) + '\n---\n' + genericDeploymentTemplate(s);
+       templatesToGenerate.push({ file: path.join(helmTemplatesDir, `${s.name}.yaml`), content: serviceContent });
+    }
+  }
+
 
   if (config.dbType) {
     templatesToGenerate.push({ file: path.join(helmTemplatesDir, 'database.yaml'), content: dbServiceTemplate() + '\n---\n' + dbDeploymentTemplate(config) });
@@ -1105,6 +1218,16 @@ ${config.apiRoutes.map(p => `  - "${p}"`).join('\n')}
   ];
 
   otherFilesToGenerate.forEach(f => fs.writeFileSync(f.file, f.content));
+
+  // Copy dashboard folder if it doesn't exist
+  const dashboardSourceDir = path.join(__dirname, '../../dashboard');
+  const dashboardDestDir = path.join(deployDir, 'dashboard');
+  if (fs.existsSync(dashboardSourceDir)) {
+    fs.cpSync(dashboardSourceDir, dashboardDestDir, { recursive: true });
+  } else {
+    console.warn("Dashboard source directory not found: " + dashboardSourceDir);
+  }
+
 
   console.log("");
   console.log("#############################################################################################");

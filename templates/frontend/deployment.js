@@ -21,16 +21,22 @@ spec:
       containers:
         - name: frontend
           image: {{ if .Values.werf }}{{ .Values.werf.image.frontend }}{{ else }}{{ .Values.images.frontend | default "frontend:latest" }}{{ end }}
-{{- if .Values.env }}
-          envFrom:
-            - secretRef:
-                name: {{ .Values.projectName }}-secrets
-{{- end }}
-{{- if .Values.frontend.env }}
+{{- if or .Values.frontend.env .Values.frontend.secretKeys }}
           env:
+{{- if .Values.frontend.env }}
 {{- range $key, $value := .Values.frontend.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+{{- if .Values.frontend.secretKeys }}
+{{- range $key := .Values.frontend.secretKeys }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: {{ $key }}
+{{- end }}
 {{- end }}
 {{- end }}
           resources:

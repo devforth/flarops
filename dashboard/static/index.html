@@ -1,0 +1,1937 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Capsulator — env capsule fleet dashboard</title>
+  <link rel="icon"
+    href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ctext%20y%3D%22.9em%22%20font-size%3D%2290%22%3E%F0%9F%93%A6%3C%2Ftext%3E%3C%2Fsvg%3E">
+  <style>
+    /* minimal reset — the hosted version gets this from its runtime */
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box
+    }
+
+    html {
+      -webkit-text-size-adjust: 100%
+    }
+
+    body,
+    h1,
+    h2,
+    h3,
+    p,
+    ul,
+    ol,
+    figure {
+      margin: 0
+    }
+
+    ul,
+    ol {
+      padding: 0
+    }
+
+    img,
+    svg {
+      display: block;
+      max-width: 100%
+    }
+
+    button,
+    input {
+      font: inherit;
+      color: inherit
+    }
+  </style>
+</head>
+
+<body>
+  <style>
+    /* ============================================================
+   TOKENS
+   Cold slate neutrals against a warm brass accent. Brass is reserved
+   for uptime and money — the one thread that means "this is billable".
+   The status ramp (ok / watch / hot) is separate and never used as accent.
+   ============================================================ */
+    :root {
+      --bg: #EEF0F4;
+      --surface: #FFFFFF;
+      --surface-2: #E7EAF0;
+      --inset: #DDE1E9;
+      --line: rgba(20, 28, 45, .12);
+      --line-2: rgba(20, 28, 45, .22);
+      --line-3: rgba(20, 28, 45, .34);
+      --text: #12161D;
+      --text-2: #4B5464;
+      --text-3: #79818F;
+      --brass: #8A6A16;
+      --brass-2: #A8842A;
+      --brass-tint: rgba(138, 106, 22, .10);
+      --brass-tint-2: rgba(138, 106, 22, .20);
+      --ok: #1C7A57;
+      --ok-tint: rgba(28, 122, 87, .12);
+      --watch: #9A6608;
+      --watch-tint: rgba(154, 102, 8, .12);
+      --hot: #AE2F2C;
+      --hot-tint: rgba(174, 47, 44, .12);
+      --link: #2C5FA8;
+      --link-tint: rgba(44, 95, 168, .10);
+      --prev: #4F6EA8;
+      --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 8px 24px -12px rgba(16, 24, 40, .28);
+      --shadow-sm: 0 1px 2px rgba(16, 24, 40, .07);
+      --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+    }
+
+    @media (prefers-color-scheme:dark) {
+      :root:not([data-theme="light"]) {
+        --bg: #0D1016;
+        --surface: #161A22;
+        --surface-2: #1D222C;
+        --inset: #0A0D12;
+        --line: rgba(255, 255, 255, .09);
+        --line-2: rgba(255, 255, 255, .17);
+        --line-3: rgba(255, 255, 255, .28);
+        --text: #E6EAF1;
+        --text-2: #A2AAB9;
+        --text-3: #6F7787;
+        --brass: #D9A94A;
+        --brass-2: #C79A46;
+        --brass-tint: rgba(217, 169, 74, .13);
+        --brass-tint-2: rgba(217, 169, 74, .24);
+        --ok: #46C08A;
+        --ok-tint: rgba(70, 192, 138, .14);
+        --watch: #E3A63C;
+        --watch-tint: rgba(227, 166, 60, .14);
+        --hot: #F0685E;
+        --hot-tint: rgba(240, 104, 94, .15);
+        --link: #7EA8E8;
+        --link-tint: rgba(126, 168, 232, .13);
+        --prev: #8493BC;
+        --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 28px -14px rgba(0, 0, 0, .7);
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, .35);
+      }
+    }
+
+    :root[data-theme="dark"] {
+      --bg: #0D1016;
+      --surface: #161A22;
+      --surface-2: #1D222C;
+      --inset: #0A0D12;
+      --line: rgba(255, 255, 255, .09);
+      --line-2: rgba(255, 255, 255, .17);
+      --line-3: rgba(255, 255, 255, .28);
+      --text: #E6EAF1;
+      --text-2: #A2AAB9;
+      --text-3: #6F7787;
+      --brass: #D9A94A;
+      --brass-2: #C79A46;
+      --brass-tint: rgba(217, 169, 74, .13);
+      --brass-tint-2: rgba(217, 169, 74, .24);
+      --ok: #46C08A;
+      --ok-tint: rgba(70, 192, 138, .14);
+      --watch: #E3A63C;
+      --watch-tint: rgba(227, 166, 60, .14);
+      --hot: #F0685E;
+      --hot-tint: rgba(240, 104, 94, .15);
+      --link: #7EA8E8;
+      --link-tint: rgba(126, 168, 232, .13);
+      --prev: #8493BC;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 28px -14px rgba(0, 0, 0, .7);
+      --shadow-sm: 0 1px 2px rgba(0, 0, 0, .35);
+    }
+
+    * {
+      box-sizing: border-box
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 15px;
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a {
+      color: var(--link)
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--brass);
+      outline-offset: 2px;
+      border-radius: 2px
+    }
+
+    .ic {
+      width: 1em;
+      height: 1em;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      flex: none
+    }
+
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 0 24px
+    }
+
+    /* ---------------- masthead ---------------- */
+    .masthead {
+      padding: 46px 0 24px
+    }
+
+    .masthead h1 {
+      font-size: clamp(28px, 4vw, 40px);
+      line-height: 1.06;
+      letter-spacing: -.025em;
+      margin: 0;
+      font-weight: 680
+    }
+
+    .masthead p {
+      max-width: 64ch;
+      color: var(--text-2);
+      margin: 12px 0 0
+    }
+
+    /* ---------------- developer notes ---------------- */
+    .devnotes {
+      margin: 28px 0 42px;
+      border: 1px solid var(--line-2);
+      border-radius: 10px;
+      background: var(--surface);
+      box-shadow: var(--shadow-sm);
+      overflow: hidden;
+    }
+
+    .devnotes-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 11px 20px;
+      background: var(--surface-2);
+      border-bottom: 1px solid var(--line-2);
+    }
+
+    .devnotes-head .t {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .devnotes-head .s {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--text-3);
+      margin-left: auto
+    }
+
+    .devnotes ul {
+      list-style: none;
+      margin: 0;
+      padding: 6px 0
+    }
+
+    .devnotes li {
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr);
+      gap: 18px;
+      align-items: baseline;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .devnotes li:last-child {
+      border-bottom: 0
+    }
+
+    .devnotes .k {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+      color: var(--brass);
+    }
+
+    @media (max-width:640px) {
+      .devnotes li {
+        grid-template-columns: 1fr;
+        gap: 4px
+      }
+    }
+
+    .devnotes b {
+      font-weight: 640
+    }
+
+    .devnotes .d {
+      color: var(--text-2);
+      font-size: 13.5px;
+      display: block;
+      margin-top: 3px
+    }
+
+    .devnotes code {
+      font-family: var(--font-mono);
+      font-size: .92em;
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      padding: 1px 5px;
+      color: var(--text);
+    }
+
+    /* ---------------- dashboard shell ---------------- */
+    .board-cap {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--text-3);
+      padding-bottom: 10px;
+    }
+
+    .board {
+      display: grid;
+      gap: 18px;
+      padding-bottom: 80px
+    }
+
+    .loading-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      min-height: calc(100vh - 140px);
+      color: var(--text-3);
+      font-family: var(--font-mono);
+      font-size: 13px;
+      gap: 16px
+    }
+
+    .fleetbar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px 18px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .fleetbar h2 {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 640;
+      letter-spacing: -.01em
+    }
+
+    .fleetbar .sep {
+      flex: 1
+    }
+
+    .fleetbar .lbl {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--text-2);
+      letter-spacing: .04em
+    }
+
+    .fleetbar .host {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--link);
+      text-decoration: none;
+      border-bottom: 1px solid var(--link-tint);
+    }
+
+    .fleetbar .host:hover {
+      border-bottom-color: currentColor
+    }
+
+    .cap-track {
+      display: flex;
+      gap: 4px;
+      align-items: center
+    }
+
+    .cap-track i {
+      width: 34px;
+      height: 8px;
+      border-radius: 2px;
+      background: var(--inset);
+      box-shadow: inset 0 0 0 1px var(--line)
+    }
+
+    .cap-track i.on {
+      background: var(--brass);
+      box-shadow: none
+    }
+
+    .live {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--ok);
+      letter-spacing: .06em
+    }
+
+    .live .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 2.4s ease-in-out infinite
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1
+      }
+
+      50% {
+        opacity: .3
+      }
+    }
+
+    .sortnote {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--text-3);
+      padding: 0 4px;
+    }
+
+    .sortnote .ic {
+      width: 12px;
+      height: 12px;
+      color: var(--brass)
+    }
+
+    /* ---------------- host card ---------------- */
+    .host {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      overflow: hidden
+    }
+
+    .host.alarm {
+      border-color: color-mix(in srgb, var(--hot) 45%, var(--line));
+      box-shadow: var(--shadow), 0 0 0 3px var(--hot-tint)
+    }
+
+    .hhead {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 20px 22px;
+      border-bottom: 1px solid var(--line)
+    }
+
+    .htop {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      width: 100%;
+      flex-wrap: wrap;
+      gap: 20px
+    }
+
+    .hname h3 {
+      margin: 0;
+      font-size: 19px;
+      letter-spacing: -.015em;
+      font-weight: 640
+    }
+
+    .hname {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+    }
+
+    .hname .sub {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--text-3);
+      letter-spacing: .04em
+    }
+
+    .hchips {
+      display: flex;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+
+    .chip {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: .08em;
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 2px 10px;
+      color: var(--text-2);
+      margin-right: 7px;
+    }
+
+    .chip.type {
+      color: var(--brass);
+      border-color: var(--brass-tint-2);
+      background: var(--brass-tint)
+    }
+
+    .gauges {
+      display: flex;
+      gap: 26px;
+      margin-left: auto;
+      flex-wrap: wrap
+    }
+
+    .gauge {
+      display: flex;
+      gap: 11px;
+      align-items: center
+    }
+
+    .gauge svg {
+      width: 52px;
+      height: 52px;
+      flex: none
+    }
+
+    .gauge .g-t {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--text-3)
+    }
+
+    .gauge .g-v {
+      font-family: var(--font-mono);
+      font-size: 16px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      line-height: 1.3
+    }
+
+    /* a rounded number with exact detail on hover */
+    .exact {
+      border-bottom: 1px dotted var(--line-3);
+      cursor: help
+    }
+
+    .exact:hover {
+      border-bottom-color: var(--brass)
+    }
+
+    .gauge .g-s {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-3)
+    }
+
+    .alarmline {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--hot);
+      background: var(--hot-tint);
+      padding: 9px 22px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    /* ---------------- memory allocation bar ----------------
+   The host drawn as a bin: every capsule is a segment sized by real MiB and
+   the leftover is explicit headroom. Segments are NOT colour-coded by identity
+   — a four-hue categorical set fails CVD separation at this size, and the
+   capsule name printed inside each segment identifies it far better. Colour
+   here means state: neutral = running, blue hatch = still coming up. */
+    .alloc {
+      padding: 16px 22px 0;
+      display: grid;
+      gap: 6px
+    }
+
+    .alloc-l {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--text-3);
+    }
+
+    .stack {
+      display: flex;
+      height: 46px;
+      border-radius: 5px;
+      background: var(--inset);
+      box-shadow: inset 0 0 0 1px var(--line);
+      gap: 2px;
+      padding: 2px
+    }
+
+    /* Segment width is the capsule's share of installed memory. min-width wins over
+   the share so a small capsule keeps a readable label; the shares around it
+   absorb the difference. */
+    .seg {
+      border-radius: 3px;
+      min-width: 78px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 0 9px;
+      overflow: hidden;
+      background: var(--surface-2);
+      box-shadow: inset 0 0 0 1px var(--line-2);
+    }
+
+    .seg>* {
+      min-width: 0
+    }
+
+    .seg .sn {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis
+    }
+
+    .seg .sv {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-2);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis
+    }
+
+    .seg.work {
+      background-color: var(--link-tint);
+      box-shadow: inset 0 0 0 1px var(--link);
+      background-image: repeating-linear-gradient(135deg, transparent, transparent 5px, var(--link-tint) 5px, var(--link-tint) 10px);
+    }
+
+    .seg.work .sv {
+      color: var(--link)
+    }
+
+    .seg.sys {
+      box-shadow: inset 0 0 0 1px var(--line);
+      min-width: 22px;
+      padding: 0 5px;
+      background: transparent;
+      background-image: repeating-linear-gradient(135deg, transparent, transparent 3px, var(--line) 3px, var(--line) 4px);
+    }
+
+    .seg.sys .sv {
+      color: var(--text-3)
+    }
+
+    .seg.free {
+      background: transparent;
+      box-shadow: inset 0 0 0 1px var(--line-2);
+      min-width: 88px;
+      background-image: repeating-linear-gradient(135deg, transparent, transparent 6px, var(--surface-2) 6px, var(--surface-2) 12px);
+    }
+
+    .seg.free .sn {
+      color: var(--text-2)
+    }
+
+    .seg.free .sv {
+      color: var(--text-3)
+    }
+
+    /* ---------------- capsule card ---------------- */
+    .caps {
+      padding: 16px 22px 22px;
+      display: grid;
+      gap: 14px
+    }
+
+    .cap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      overflow: hidden
+    }
+
+    .cap:hover {
+      border-color: var(--line-2)
+    }
+
+    .cap.transitional {
+      border-color: color-mix(in srgb, var(--link) 40%, var(--line))
+    }
+
+    .crow {
+      display: flex;
+      align-items: center;
+      gap: 22px;
+      flex-wrap: wrap;
+      padding: 14px 16px;
+      background: var(--surface-2)
+    }
+
+    .who {
+      display: grid;
+      gap: 6px;
+      min-width: 250px
+    }
+
+    .who a {
+      font-size: 15px;
+      font-weight: 600;
+      text-decoration: none;
+      display: inline-flex;
+      gap: 7px;
+      align-items: center;
+      color: var(--link)
+    }
+
+    .who a:hover {
+      text-decoration: underline
+    }
+
+    .who a .ic {
+      width: 12px;
+      height: 12px;
+      opacity: .65
+    }
+
+    .idrow {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center
+    }
+
+    .stats {
+      display: flex;
+      gap: 22px;
+      flex-wrap: wrap;
+      margin-left: auto;
+      align-items: flex-end
+    }
+
+    .stat {
+      min-width: 104px
+    }
+
+    .stat .l {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--text-3)
+    }
+
+    .stat .v {
+      font-family: var(--font-mono);
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      margin: 2px 0 4px
+    }
+
+    .stat .v em {
+      font-style: normal;
+      color: var(--text-3);
+      font-size: 11px
+    }
+
+    .stat .b {
+      height: 4px;
+      border-radius: 2px;
+      background: var(--inset);
+      overflow: hidden;
+      box-shadow: inset 0 0 0 1px var(--line)
+    }
+
+    .stat .b i {
+      display: block;
+      height: 100%;
+      border-radius: 2px
+    }
+
+    /* Containers vs volumes: compute and storage are different kinds of thing, so
+   they get different forms, not the same tile with a dashed border. Containers
+   are square-cornered cards on the card surface — things that run. Volumes sit
+   on a recessed shelf as rounded pills with a fill gauge — things that persist
+   and grow, and that outlive the container above them. */
+    .cbody {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(230px, 300px);
+      gap: 0;
+      align-items: stretch
+    }
+
+    @media (max-width:900px) {
+      .cbody {
+        grid-template-columns: 1fr
+      }
+    }
+
+    .zone {
+      padding: 13px 16px;
+      display: grid;
+      gap: 9px;
+      align-content: start
+    }
+
+    .zlabel {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--text-3);
+    }
+
+    .zlabel .n {
+      color: var(--text-2);
+      font-variant-numeric: tabular-nums
+    }
+
+    .zlabel .ic {
+      width: 11px;
+      height: 11px
+    }
+
+    /* Tile width is proportional to the container's resident memory (--w), so the
+   database visibly dwarfs the nginx beside it. Proportion is a flex-grow share
+   rather than a hard percentage, and min-width wins over it — a 96M sidecar
+   still gets a legible box instead of a sliver. */
+    .tiles {
+      display: flex;
+      gap: 9px;
+      flex-wrap: wrap;
+      align-items: stretch
+    }
+
+    .tile {
+      flex-grow: var(--w, 1);
+      flex-shrink: 1;
+      flex-basis: 0;
+      min-width: 126px;
+      border: 1px solid var(--line-2);
+      border-radius: 3px;
+      padding: 9px 12px;
+      background: var(--surface);
+      display: grid;
+      gap: 2px;
+      align-content: start;
+      border-top: 2px solid var(--text-3);
+    }
+
+    .tile>* {
+      min-width: 0
+    }
+
+    .tile .t-n {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--text);
+      font-weight: 600
+    }
+
+    .tile .t-i {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-3);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap
+    }
+
+    .tile .t-v {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-2);
+      font-variant-numeric: tabular-nums;
+      margin-top: 3px;
+      white-space: nowrap
+    }
+
+    .zlabel .hint {
+      color: var(--text-3);
+      letter-spacing: .06em;
+      text-transform: none;
+      font-size: 10px;
+      opacity: .85
+    }
+
+    .zone-vol {
+      background: var(--surface-2);
+      border-left: 1px solid var(--line);
+      box-shadow: inset 3px 0 6px -4px rgba(20, 28, 45, .22);
+    }
+
+    @media (max-width:900px) {
+      .zone-vol {
+        border-left: 0;
+        border-top: 1px solid var(--line);
+        box-shadow: inset 0 3px 6px -4px rgba(20, 28, 45, .22)
+      }
+    }
+
+    .vols {
+      display: grid;
+      gap: 7px
+    }
+
+    /* Each pill is a tank: the fill is the volume's size relative to the largest
+   volume in the fleet, so a bloated pgdata is visible without reading a number. */
+    .vol {
+      position: relative;
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 8px;
+      align-items: center;
+      background: transparent;
+      border: 1px solid var(--line-2);
+      border-radius: 999px;
+      padding: 6px 12px 6px 10px;
+    }
+
+    /* A translucent ink wash, so the fill darkens on a light shelf and lightens on a
+   dark one instead of needing two hard-coded colours. */
+    .vol .fill {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      z-index: 0;
+      background: color-mix(in srgb, var(--text) 11%, transparent)
+    }
+
+    .vol .fill-used {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      z-index: 0;
+      background: color-mix(in srgb, var(--text) 22%, transparent)
+    }
+
+    .vol .ic,
+    .vol .v-n,
+    .vol .v-s {
+      position: relative;
+      z-index: 1
+    }
+
+    .vol .ic {
+      width: 12px;
+      height: 12px;
+      color: var(--text-3)
+    }
+
+    .vol .v-n {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap
+    }
+
+    .vol .v-s {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--text);
+      font-variant-numeric: tabular-nums
+    }
+
+    .zone-vol .empty {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-3)
+    }
+
+    /* uptime chip — brass, because uptime is what the invoice is made of */
+    .age {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--brass);
+      background: var(--brass-tint);
+      border: 1px solid var(--brass-tint-2);
+      padding: 1px 7px;
+      border-radius: 2px;
+      width: fit-content;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .age.old {
+      background: var(--brass);
+      color: #FFFFFF;
+      border-color: var(--brass)
+    }
+
+    @media (prefers-color-scheme:dark) {
+      :root:not([data-theme="light"]) .age.old {
+        color: #191308
+      }
+    }
+
+    :root[data-theme="dark"] .age.old {
+      color: #191308
+    }
+
+    .age .ic {
+      width: 10px;
+      height: 10px
+    }
+
+    /* status pill — lifecycle state + time in that state. Colour is always
+   doubled by a label and a mark, never carried by colour alone. */
+    .st {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      width: fit-content;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      line-height: 1.5;
+      padding: 1px 7px;
+      border-radius: 2px;
+      border: 1px solid currentColor;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .st .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      flex: none
+    }
+
+    .st .ring {
+      width: 8px;
+      height: 8px;
+      flex: none;
+      border-radius: 50%;
+      border: 1.5px solid currentColor;
+      border-top-color: transparent;
+      animation: spin 1s linear infinite;
+    }
+
+    .st .lb {
+      font-weight: 600;
+      letter-spacing: .02em
+    }
+
+    .st .d {
+      color: var(--text-2);
+      border-left: 1px solid var(--line-2);
+      padding-left: 6px
+    }
+
+    .st.running {
+      color: var(--ok);
+      background: var(--ok-tint)
+    }
+
+    .st.work {
+      color: var(--link);
+      background: var(--link-tint)
+    }
+
+    /* Waiting is neither running nor working, so it gets a third mark — a hollow dot,
+   distinct in shape from the filled dot and the spinner even in monochrome. */
+    .st.wait {
+      color: var(--watch);
+      background: var(--watch-tint)
+    }
+
+    .st.wait .dot {
+      background: transparent;
+      box-shadow: inset 0 0 0 1.5px currentColor
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg)
+      }
+    }
+
+    /* ---------------- placement queue ----------------
+   Requested but unplaced. Deliberately outside the host cards: nothing here
+   holds memory or accrues cost yet, and the free host slot below is the fix. */
+    .queue {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--watch);
+      border-radius: 8px;
+      box-shadow: var(--shadow-sm);
+      overflow: hidden;
+    }
+
+    .qhead {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 13px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .qhead h3 {
+      margin: 0;
+      font-size: 14.5px;
+      font-weight: 640;
+      letter-spacing: -.01em
+    }
+
+    .qhead .note {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-3)
+    }
+
+    .qhead .sep {
+      flex: 1
+    }
+
+    .qrow {
+      display: grid;
+      grid-template-columns: minmax(210px, 1fr) minmax(150px, auto) minmax(220px, 1.2fr) minmax(190px, 1fr);
+      gap: 18px;
+      align-items: center;
+      padding: 13px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .qrow:last-child {
+      border-bottom: 0
+    }
+
+    @media (max-width:960px) {
+      .qrow {
+        grid-template-columns: 1fr;
+        gap: 10px
+      }
+    }
+
+    .qrow .qid {
+      font-family: var(--font-mono);
+      font-size: 13.5px;
+      color: var(--text);
+      font-weight: 600
+    }
+
+    .qrow .qid .u {
+      display: block;
+      font-weight: 400;
+      font-size: 11px;
+      color: var(--text-3);
+      margin-top: 2px
+    }
+
+    .qrow .qreq {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--text-2)
+    }
+
+    .qrow .qreq b {
+      color: var(--text);
+      font-weight: 600;
+      font-size: 13.5px
+    }
+
+    .qrow .why {
+      display: flex;
+      align-items: flex-start;
+      gap: 7px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--watch);
+      line-height: 1.5;
+    }
+
+    .qrow .why .ic {
+      width: 12px;
+      height: 12px;
+      margin-top: 2px
+    }
+
+    .qspec {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap
+    }
+
+    .qspec .s {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-2);
+      border: 1px solid var(--line-2);
+      border-radius: 3px;
+      padding: 2px 6px;
+    }
+
+    .qspec .s.v {
+      border-style: dashed;
+      border-radius: 999px;
+      color: var(--text-3)
+    }
+
+    /* ---------------- free slot ---------------- */
+    .slot {
+      border: 1px dashed var(--line-2);
+      border-radius: 10px;
+      padding: 22px;
+      text-align: center;
+      color: var(--text-3);
+      display: grid;
+      gap: 6px;
+      justify-items: center;
+    }
+
+    .slot b {
+      color: var(--text-2);
+      font-weight: 600;
+      font-size: 14px
+    }
+
+    .slot .hint {
+      font-family: var(--font-mono);
+      font-size: 11.5px
+    }
+
+    /* ---------------- spend ---------------- */
+    .money {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      padding: 22px
+    }
+
+    .money .head {
+      display: flex;
+      gap: 18px;
+      align-items: baseline;
+      flex-wrap: wrap;
+      margin-bottom: 18px
+    }
+
+    .money h3 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 640;
+      letter-spacing: -.01em
+    }
+
+    .money .figs {
+      display: flex;
+      gap: 34px;
+      flex-wrap: wrap;
+      margin-bottom: 18px
+    }
+
+    .fig .l {
+      font-size: 10.5px;
+      font-family: var(--font-mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--text-3)
+    }
+
+    .fig .v {
+      font-size: 30px;
+      letter-spacing: -.02em;
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      line-height: 1.15
+    }
+
+    .fig .v.sm {
+      font-size: 17px
+    }
+
+    .delta {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      font-family: var(--font-mono)
+    }
+
+    .delta.up {
+      color: var(--hot)
+    }
+
+    .delta.down {
+      color: var(--ok)
+    }
+
+    .delta .ic {
+      width: 11px;
+      height: 11px
+    }
+
+    .spend-chart {
+      display: block;
+      width: 100%;
+      height: auto
+    }
+
+    .chart-legend {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--text-2);
+      align-items: center
+    }
+
+    .chart-legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px
+    }
+
+    .swatch {
+      width: 11px;
+      height: 11px;
+      border-radius: 2px;
+      flex: none
+    }
+
+    .swatch.prev {
+      height: 0;
+      border-top: 2px dashed var(--prev);
+      border-radius: 0;
+      width: 14px
+    }
+
+    .tbl-toggle {
+      margin-top: 12px;
+      font-size: 12.5px;
+      color: var(--text-2)
+    }
+
+    .tbl-toggle summary {
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--text-3)
+    }
+
+    .tbl-toggle summary:hover {
+      color: var(--text-2)
+    }
+
+    .tbl-toggle .scroll {
+      overflow-x: auto;
+      margin-top: 10px
+    }
+
+    .tbl-toggle table {
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-variant-numeric: tabular-nums
+    }
+
+    .tbl-toggle th,
+    .tbl-toggle td {
+      padding: 3px 12px 3px 0;
+      text-align: right;
+      white-space: nowrap
+    }
+
+    .tbl-toggle th:first-child,
+    .tbl-toggle td:first-child {
+      text-align: left
+    }
+
+    .tbl-toggle th {
+      color: var(--text-3);
+      font-weight: 500;
+      border-bottom: 1px solid var(--line)
+    }
+
+    #tip {
+      position: fixed;
+      z-index: 99;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .1s;
+      background: var(--surface);
+      border: 1px solid var(--line-2);
+      box-shadow: var(--shadow);
+      border-radius: 4px;
+      padding: 8px 10px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      line-height: 1.6;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    #tip .t-d {
+      color: var(--text-3);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      font-size: 10px
+    }
+
+    #tip .t-r {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px
+    }
+
+    #tip .t-r i {
+      font-style: normal;
+      color: var(--text-2)
+    }
+
+    @media (prefers-reduced-motion:reduce) {
+      * {
+        animation: none !important;
+        transition: none !important
+      }
+    }
+  </style>
+
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-ext" viewBox="0 0 16 16">
+        <path d="M6 3H3.5A1.5 1.5 0 0 0 2 4.5v8A1.5 1.5 0 0 0 3.5 14h8a1.5 1.5 0 0 0 1.5-1.5V10" />
+        <path d="M9.5 2.5H14V7" />
+        <path d="M13.5 3 7 9.5" />
+      </symbol>
+      <symbol id="i-clock" viewBox="0 0 16 16">
+        <circle cx="8" cy="8" r="6" />
+        <path d="M8 4.6V8l2.4 1.6" />
+      </symbol>
+      <symbol id="i-vol" viewBox="0 0 16 16">
+        <ellipse cx="8" cy="4" rx="5" ry="2" />
+        <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4" />
+        <path d="M3 8c0 1.1 2.2 2 5 2s5-.9 5-2" />
+      </symbol>
+      <symbol id="i-warn" viewBox="0 0 16 16">
+        <path d="M8 2.6 14.2 13H1.8L8 2.6Z" />
+        <path d="M8 6.6v3.1" />
+        <path d="M8 11.6h.01" />
+      </symbol>
+      <symbol id="i-up" viewBox="0 0 16 16">
+        <path d="M8 12.5V4" />
+        <path d="M4 7.6 8 3.6l4 4" />
+      </symbol>
+      <symbol id="i-sort" viewBox="0 0 16 16">
+        <path d="M4 3v10" />
+        <path d="M1.8 10.8 4 13l2.2-2.2" />
+        <path d="M9 4h5" />
+        <path d="M9 8h4" />
+        <path d="M9 12h3" />
+      </symbol>
+    </defs>
+  </svg>
+
+  <div id="tip" role="status" aria-live="polite"></div>
+
+
+
+  <div class="wrap">
+
+
+    <div class="board-cap"><span style="flex:1">Fleet dashboard</span><span
+        id="board-host-name">status.mydomain.com</span><span style="flex:1;text-align:right"> · live</span></div>
+    <div class="board" data-render="board">
+      <div class="loading-state">
+        <img src="loader.gif" alt="Loading..." style="width: 84px; height: 84px; border-radius: 8px;">
+      </div>
+    </div>
+  </div>
+
+  <script>
+    "use strict";
+
+    document.addEventListener("DOMContentLoaded", () => {
+      const el = document.getElementById("board-host-name");
+      if (el) el.innerText = window.location.hostname;
+    });
+
+    /* ------------------------------------------------------------------
+       DATA — one fleet snapshot. Capsule RAM/CPU sums stay under the host
+       totals; the remainder is system + page cache.
+       cores × threads × 100 = the CPU ceiling (see developer note 3).
+       ------------------------------------------------------------------ */
+    const byStatusTime = (a, b) => a.statusSec - b.statusSec;
+    const hostStatusTime = h => {
+      if (!h.capsules || h.capsules.length === 0) return 999999999;
+      return Math.min.apply(null, h.capsules.map(c => c.statusSec));
+    };
+
+    let FLEET = { slotsUsed: 0, slotsMax: 0, domain: "Connecting..." };
+    let HOSTS = [];
+    let QUEUE = [];
+    let SPEND = {
+      mtd: 0, prevSame: 0, runRate: 0, projected: 0,
+      monthLabel: "Current", prevLabel: "Previous",
+      days: [], cur: [], prev: [], deltaPct: 0
+    };
+    let ORDERED = [];
+    let ALL_CAPS = [];
+    let FLEET_RAM = 0;
+    let FLEET_RAM_USED = 0;
+    let BIGGEST_VOL = 1;
+    let BIGGEST_CAP = 1;
+    let BLOCKED = [];
+
+    /* ------------------------------------------------------------------ helpers */
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    const mib = n => n.toLocaleString("en-US");
+
+    /* ---- sizes -------------------------------------------------------
+       Displayed rounded and compact so columns of numbers stay scannable;
+       exact MiB and the unit definition live in the hover title, because a
+       dashboard is read at a glance and audited on demand. Anything under a
+       gibibyte keeps MiB resolution — "84M" says more than "0.1G".        */
+    const sz = m => m >= 1024 ? (m / 1024).toFixed(1) + "G" : Math.round(m) + "M";
+    const szPair = (a, b) => sz(a) + " / " + sz(b);
+    const szT = m => mib(m) + " MiB";
+    const szPairT = (a, b, what) => mib(a) + " MiB of " + mib(b) + " MiB " + what;
+    /** Marks a rounded figure as having exact detail behind it. */
+    const exact = (html, title) => '<span class="exact" title="' + title + '">' + html + "</span>";
+    const usd = val => "$" + (val || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const usd0 = n => "$" + Math.round(n || 0).toLocaleString("en-US");
+    const pct = (a, b) => b === 0 ? 0 : Math.round((a / b) * 100);
+
+    function age(min) {
+      const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
+      return d + "d " + String(h).padStart(2, "0") + "h " + String(m).padStart(2, "0") + "m";
+    }
+    /** Time in the current status — seconds-precise while it matters, coarse once it doesn't. */
+    function dur(sec) {
+      const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
+        m = Math.floor(sec % 3600 / 60), s = sec % 60;
+      if (d) return h ? d + "d " + h + "h" : d + "d";
+      if (h) return h + "h " + m + "m";
+      if (m) return m + "m " + s + "s";
+      return s + "s";
+    }
+    /** Pressure ramp. Reserved for utilisation — never used as an accent or an identity colour. */
+    function tone(p) { return p >= 85 ? "hot" : p >= 70 ? "watch" : "ok"; }
+    function toneVar(p) { return "var(--" + tone(p) + ")"; }
+
+    /* CPU ceiling = hyperthreads × 100 (developer note 3) */
+    const cpuCap = h => h.cores * h.threads * 100;
+    const threadsOf = h => h.cores * h.threads;
+    const hostRam = h => pct(h.ramUsed, h.ramTotal);
+    const hostCpu = h => pct(h.cpuUsed, cpuCap(h));
+    const hostSwap = h => pct(h.swapUsed, h.swapTotal);
+
+    const STATUS = {
+      running: { label: "Running", cls: "running" },
+      building: { label: "Building image", cls: "work" },
+      preparing: { label: "Preparing data", cls: "work" },
+      waiting: { label: "Waiting for slot", cls: "wait" }
+    };
+
+
+    const volTotal = c => c.vol ? c.vol.reduce((s, v) => s + v.mib, 0) : 0;
+
+    function statusTally() {
+      const t = {};
+      ALL_CAPS.concat(QUEUE).forEach(c => { t[c.status] = (t[c.status] || 0) + 1; });
+      return Object.keys(t).map(k => t[k] + " " + STATUS[k].label.split(" ")[0].toLowerCase()).join(" · ");
+    }
+
+    const freeOf = h => h.ramTotal - h.ramUsed;
+    const roomiest = () => HOSTS.length > 0 ? HOSTS.reduce((best, h) => freeOf(h) > freeOf(best) ? h : best, HOSTS[0]) : { ramTotal: 0, ramUsed: 0 };
+    const placeable = req => req <= freeOf(roomiest());
+
+    /* ------------------------------------------------------------------ fragments */
+    function urlLink(c) {
+      return '<a href="https://' + c.host + '" target="_blank" rel="noopener">' +
+        esc(c.host) + '<svg class="ic"><use href="#i-ext"/></svg></a>';
+    }
+    function ageChip(c) {
+      const old = c.upMin >= 10080; // 7 days — past this, uptime is a billing question
+      return '<span class="age' + (old ? " old" : "") + '" title="Spawned ' + age(c.upMin) +
+        ' ago — billing accrues from spawn">' +
+        '<svg class="ic"><use href="#i-clock"/></svg>' + age(c.upMin) + "</span>";
+    }
+    function statusPill(c) {
+      const s = STATUS[c.status], working = s.cls === "work";
+      return '<span class="st ' + s.cls + '" title="' + s.label + " for " + dur(c.statusSec) + '">' +
+        (working ? '<span class="ring"></span>' : '<span class="dot"></span>') +
+        '<span class="lb">' + s.label + '</span><span class="d">' + dur(c.statusSec) + "</span></span>";
+    }
+    function deltaChip() {
+      const up = SPEND.deltaPct >= 0;
+      return '<span class="delta ' + (up ? "up" : "down") + '"><svg class="ic" style="' +
+        (up ? "" : "transform:rotate(180deg)") + '"><use href="#i-up"/></svg>' +
+        (up ? "+" : "") + SPEND.deltaPct.toFixed(1) + "% vs " + SPEND.prevLabel + "</span>";
+    }
+    function arcGauge(label, p, value, sub) {
+      const r = 21, c = 2 * Math.PI * r, dash = (Math.min(p, 100) / 100) * c;
+      return '<div class="gauge"><svg viewBox="0 0 52 52" aria-hidden="true">' +
+        '<circle cx="26" cy="26" r="' + r + '" fill="none" stroke="var(--inset)" stroke-width="5"/>' +
+        '<circle cx="26" cy="26" r="' + r + '" fill="none" stroke="' + toneVar(p) + '" stroke-width="5" ' +
+        'stroke-linecap="round" stroke-dasharray="' + dash.toFixed(1) + " " + c.toFixed(1) +
+        '" transform="rotate(-90 26 26)"/>' +
+        '<text x="26" y="30" text-anchor="middle" font-size="13" font-family="var(--font-mono)" fill="var(--text)">' +
+        p + "</text></svg><div><div class=\"g-t\">" + label + '</div><div class="g-v">' + value +
+        '</div><div class="g-s">' + sub + "</div></div></div>";
+    }
+
+    /* ------------------------------------------------------------------ chart
+       Two series, one axis: this month as filled bars, the same period last month
+       as a dashed line. Different hue and different mark, so identity never rests
+       on colour alone; legend, direct label on today, and a data table back it up.
+       ------------------------------------------------------------------ */
+    function chart() {
+      const W = 760, H = 168, padL = 4, padR = 4, padT = 18, padB = 20;
+      const n = SPEND.days.length;
+      const maxV = Math.max.apply(null, SPEND.cur.concat(SPEND.prev)) * 1.16 || 1;
+      const iw = W - padL - padR, ih = H - padT - padB;
+      const bw = iw / n, bar = Math.max(6, bw * 0.56);
+      const y = v => padT + ih - (v / maxV) * ih;
+      const cx = i => padL + bw * i + bw / 2;
+      let g = "";
+
+      const mean = SPEND.cur.reduce((a, b) => a + b, 0) / n;
+      g += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y(mean).toFixed(1) + '" y2="' +
+        y(mean).toFixed(1) + '" stroke="var(--line-2)" stroke-width="1" stroke-dasharray="2 4"/>';
+      g += '<text x="' + padL + '" y="' + (y(mean) - 5).toFixed(1) + '" font-size="9.5" ' +
+        'font-family="var(--font-mono)" fill="var(--text-3)" letter-spacing=".08em">AVG ' + usd(mean) + "/DAY</text>";
+
+      SPEND.cur.forEach((v, i) => {
+        const bh = Math.max(2, padT + ih - y(v)), x = cx(i) - bar / 2, last = i === n - 1;
+        g += '<rect class="bar" data-i="' + i + '" x="' + x.toFixed(1) + '" y="' + y(v).toFixed(1) +
+          '" width="' + bar.toFixed(1) + '" height="' + bh.toFixed(1) + '" rx="3" fill="var(--brass' +
+          (last ? "" : "-2") + ')" opacity="' + (last ? 1 : 0.88) + '"><title>Aug ' + SPEND.days[i] +
+          ": " + usd(v) + "</title></rect>";
+      });
+
+      let d = "";
+      SPEND.prev.forEach((v, i) => { d += (i ? " L" : "M") + cx(i).toFixed(1) + " " + y(v).toFixed(1); });
+      g += '<path d="' + d + '" fill="none" stroke="var(--prev)" stroke-width="2" stroke-dasharray="5 4" ' +
+        'stroke-linecap="round" stroke-linejoin="round"/>';
+      g += '<circle cx="' + cx(n - 1).toFixed(1) + '" cy="' + y(SPEND.prev[n - 1]).toFixed(1) +
+        '" r="3.2" fill="var(--prev)" stroke="var(--surface)" stroke-width="2"/>';
+
+      const lastV = SPEND.cur[n - 1];
+      g += '<text x="' + cx(n - 1).toFixed(1) + '" y="' + (y(lastV) - 6).toFixed(1) +
+        '" text-anchor="middle" font-size="11" font-family="var(--font-mono)" font-weight="600" ' +
+        'fill="var(--brass)">' + usd(lastV) + "</text>";
+
+      SPEND.days.forEach((day, i) => {
+        if (i % 2 && i !== n - 1) return;
+        g += '<text x="' + cx(i).toFixed(1) + '" y="' + (H - 6) + '" text-anchor="middle" font-size="10" ' +
+          'font-family="var(--font-mono)" fill="var(--text-3)">' + (i === n - 1 ? "today" : day) + "</text>";
+      });
+
+      return '<svg class="spend-chart" viewBox="0 0 ' + W + " " + H +
+        '" role="img" aria-label="Daily spend for ' + SPEND.monthLabel + " compared with " + SPEND.prevLabel +
+        ". Month to date " + usd(SPEND.mtd) + ", up " + SPEND.deltaPct.toFixed(1) + ' percent.">' + g + "</svg>";
+    }
+    function chartLegend() {
+      return '<div class="chart-legend">' +
+        '<span><i class="swatch" style="background:var(--brass)"></i>' + SPEND.monthLabel + " (daily)</span>" +
+        '<span><i class="swatch prev"></i>' + SPEND.prevLabel + "</span></div>";
+    }
+    function chartTable() {
+      const rows = SPEND.days.map((d, i) =>
+        "<tr><td>Aug " + d + "</td><td>" + usd(SPEND.cur[i]) + "</td><td>" + usd(SPEND.prev[i]) + "</td></tr>").join("");
+
+      let breakdownHTML = "";
+      if (SPEND.breakdown) {
+        breakdownHTML = "<h4>Run-rate Breakdown</h4><table><thead><tr><th>Service</th><th>Daily Cost</th></tr></thead><tbody>";
+        for (const [service, cost] of Object.entries(SPEND.breakdown)) {
+          breakdownHTML += "<tr><td>" + service + "</td><td>" + usd(cost) + "</td></tr>";
+        }
+        breakdownHTML += "</tbody></table>";
+      }
+
+      return '<details class="tbl-toggle"><summary>Data table</summary><div class="scroll"><table>' +
+        "<thead><tr><th>Day</th><th>" + SPEND.monthLabel + "</th><th>" + SPEND.prevLabel + "</th></tr></thead><tbody>" +
+        rows + "<tr><td>Total</td><td>" + usd(SPEND.mtd) + "</td><td>" + usd(SPEND.prevSame) +
+        "</td></tr></tbody></table>" + breakdownHTML + "</div></details>";
+    }
+
+    /* ------------------------------------------------------------------ render */
+    function capsuleCard(c, h) {
+      const tiles = c.ctr.map(x =>
+        '<div class="tile" style="--w:' + x.ram + '" title="' + x.n + " · " + esc(x.img) + " · " + szT(x.ram) +
+        " · " + x.cpu + "% cpu — box width is proportional to memory\">" +
+        '<div class="t-n">' + x.n + '</div><div class="t-i">' + esc(x.img) +
+        '</div><div class="t-v">' + exact(sz(x.ram), szT(x.ram)) + " · " + x.cpu + "% cpu</div></div>").join("");
+
+      const vols = c.vol.map(v => {
+        return '<div class="vol" title="' + szT(v.mib) + '">' +
+          '<span class="fill" style="width:100%"></span>' +
+          '<svg class="ic"><use href="#i-vol"/></svg>' +
+          '<span class="v-n">' + esc(v.n) + '</span>' +
+          '<span class="v-s">' + sz(v.mib) + "</span></div>";
+      }).join("");
+
+      const st = (l, v, sub, p, bar) => '<div class="stat"><div class="l">' + l + '</div><div class="v">' + v +
+        " <em>" + sub + "</em></div>" +
+        (bar === false ? "" : '<div class="b"><i style="width:' + Math.min(p, 100) + "%;background:" +
+          toneVar(p) + '"></i></div>') + "</div>";
+
+      return '<div class="cap' + (c.status === "running" ? "" : " transitional") + '">' +
+        '<div class="crow"><div class="who">' + urlLink(c) +
+        '<div class="idrow">' + statusPill(c) + ageChip(c) + "</div></div>" +
+        '<div class="stats">' +
+        st("RAM", exact(sz(c.ram), szPairT(c.ram, h.ramTotal, "on this host")),
+          pct(c.ram, h.ramTotal) + "% of host", pct(c.ram, h.ramTotal)) +
+        st("CPU", c.cpu + "%",
+          Math.round(c.cpu / cpuCap(h) * 100) + "% of " + cpuCap(h) + "%", c.cpu / cpuCap(h) * 100) +
+        st("Swap", c.swap ? exact(sz(c.swap), szPairT(c.swap, h.swapTotal, "of host swap")) : "0",
+          c.swap ? pct(c.swap, h.swapTotal) + "% of swap" : "not swapping",
+          c.swap ? pct(c.swap, h.swapTotal) : 0) +
+        st("Cost", usd(c.costLife), usd(c.rateH) + "/h", 0, false) +
+        "</div></div>" +
+        '<div class="cbody">' +
+        '<div class="zone zone-ctr"><div class="zlabel">Containers <span class="n">' + c.ctr.length +
+        " · " + exact(sz(c.ram), szT(c.ram) + " resident") + "</span>" +
+        '<span class="hint">· width ∝ memory</span></div>' +
+        '<div class="tiles">' + tiles + "</div></div>" +
+        '<div class="zone zone-vol"><div class="zlabel">' +
+        '<svg class="ic"><use href="#i-vol"/></svg>Volumes <span class="n">' +
+        exact(sz(volTotal(c)), szT(volTotal(c)) + " across " + c.vol.length + " volumes") +
+        '</span></div><div class="vols">' +
+        (vols || '<span class="empty">none attached</span>') + "</div></div>" +
+        "</div></div>";
+    }
+
+    function allocBar(h) {
+      const sys = h.ramUsed - h.capsules.reduce((s, c) => s + c.ram, 0);
+      const free = h.ramTotal - h.ramUsed;
+      const fits = Math.floor(free / BIGGEST_CAP);
+      const w = mib => (mib / h.ramTotal * 100).toFixed(2) + "%";
+
+      const segs = h.capsules.map(c =>
+        '<div class="seg' + (c.status === "running" ? "" : " work") + '" style="width:' + w(c.ram) +
+        '" title="' + c.id + " · " + szT(c.ram) + " · " + STATUS[c.status].label + " " + dur(c.statusSec) + '">' +
+        '<span class="sn">' + c.id + '</span><span class="sv">' +
+        (c.status === "running" ? sz(c.ram) + " · " + pct(c.ram, h.ramTotal) + "%"
+          : STATUS[c.status].label.split(" ")[0].toLowerCase() + " · " + dur(c.statusSec)) +
+        "</span></div>").join("") +
+        '<div class="seg sys" style="width:' + w(sys) + '" title="system + page cache · ' + szT(sys) + '">' +
+        /* below ~5% there is no room for a legible label; the tooltip carries it */
+        (sys / h.ramTotal >= 0.05 ? '<span class="sv">system usage</span>' : "") + "</div>" +
+        '<div class="seg free" style="width:' + w(free) + '" title="' + szT(free) +
+        " free · largest running capsule is " + sz(BIGGEST_CAP) + '">' +
+        '<span class="sn">' + sz(free) + ' free</span><span class="sv">' +
+        (fits > 0 ? "fits " + fits + " more" : "no room for another") + "</span></div>";
+
+      return '<div class="alloc"><div class="alloc-l"><span>Memory allocation · ' +
+        exact(sz(h.ramTotal) + " total", szT(h.ramTotal) + " installed") + "</span><span>" +
+        hostRam(h) + "% used · " + exact(sz(free) + " free", szT(free) + " free") +
+        '</span></div><div class="stack">' + segs + "</div></div>";
+    }
+
+    /** Names the capsule doing the paging, so the alarm points somewhere. */
+    function worstSwapper(h) {
+      const c = h.capsules.slice().sort((a, b) => b.swap - a.swap)[0];
+      return c && c.swap ? c.id + " is paging " + sz(c.swap) : "no single capsule accounts for it";
+    }
+
+    /* A queued capsule has a spec but no measurements, so it gets its own compact row
+       rather than a capsule card with empty gauges. Its domain is plain text, not a
+       link — nothing is serving there yet. */
+    function queueRow(c) {
+      const best = roomiest(), fits = placeable(c.reqRam);
+      return '<div class="qrow">' +
+        '<div class="qid">' + esc(c.host) + '<span class="u">requested capsule · not yet placed</span></div>' +
+        "<div>" + statusPill(c) + "</div>" +
+        '<div class="qreq">requests <b>' + exact(sz(c.reqRam), szT(c.reqRam) + " requested") + "</b><br>" +
+        (fits
+          ? '<span style="color:var(--ok)">fits ' + best.id + " · " + sz(freeOf(best)) + " free</span>"
+          : '<span class="why"><svg class="ic"><use href="#i-warn"/></svg>largest free block is ' +
+          sz(freeOf(best)) + " on " + best.id + " — no host can take it</span>") + "</div>" +
+        '<div class="qspec">' +
+        c.ctr.map(x => '<span class="s">' + x.n + "</span>").join("") +
+        c.vol.map(v => '<span class="s v">' + esc(v.n) + "</span>").join("") +
+        "</div></div>";
+    }
+
+    function queueSection() {
+      if (!QUEUE.length) return "";
+      return '<div class="queue"><div class="qhead"><h3>Waiting for a slot</h3>' +
+        '<span class="note">' + QUEUE.length + (QUEUE.length === 1 ? " capsule" : " capsules") +
+        " · holding no memory, accruing no cost</span>" +
+        '<span class="sep"></span><span class="note">longest wait ' +
+        dur(Math.max.apply(null, QUEUE.map(c => c.statusSec))) + "</span></div>" +
+        QUEUE.slice().sort(byStatusTime).map(queueRow).join("") + "</div>";
+    }
+
+    function hostCard(h) {
+      const alarm = h.swapUsed / h.swapTotal >= 0.5;
+      return '<div class="host' + (alarm ? " alarm" : "") + '">' +
+        '<div class="hhead"><div class="htop"><div class="hname"><h3>' + h.id + "</h3>" +
+        '<div class="sub">' + h.region + "</div></div>" +
+        '<div class="gauges">' +
+        arcGauge("RAM", hostRam(h),
+          exact(szPair(h.ramUsed, h.ramTotal), szPairT(h.ramUsed, h.ramTotal, "used")), "used") +
+        arcGauge("Swap", hostSwap(h),
+          exact(szPair(h.swapUsed, h.swapTotal), szPairT(h.swapUsed, h.swapTotal, "swapped")), "swapped") +
+        arcGauge("Disk", Math.round(((h.diskUsed || 0) / (h.diskTotal || 1)) * 100),
+          exact(szPair(h.diskUsed || 0, h.diskTotal || 0), szPairT(h.diskUsed || 0, h.diskTotal || 0, "used")), "used") +
+        arcGauge("CPU", hostCpu(h), h.cpuUsed + "% / " + cpuCap(h) + "%",
+          h.cores + " cores × " + h.threads + " = " + threadsOf(h) + " threads") +
+        "</div></div>" +
+        '<div class="hchips"><span class="chip type">' + h.type + '</span><span class="chip">' + h.cores + " cores × " + h.threads +
+        ' threads</span><span class="chip">' + usd(h.rate) + "/h</span></div></div>" +
+        (alarm ? '<div class="alarmline"><svg class="ic"><use href="#i-warn"/></svg>Swap pressure ' +
+          hostSwap(h) + "% — " + worstSwapper(h) + ". This host is over-committed, not busy.</div>" : "") +
+        allocBar(h) +
+        '<div class="caps">' + h.capsules.map(c => capsuleCard(c, h)).join("") + "</div></div>";
+    }
+
+    function render(root) {
+      const tblToggle = root.querySelector('.tbl-toggle');
+      const tblOpen = tblToggle ? tblToggle.open : false;
+
+      root.innerHTML =
+        '<div class="fleetbar"><h2>Fleet</h2>' +
+        '<span class="live"><span class="dot"></span>live</span>' +
+        '<a class="host" href="https://' + FLEET.domain + '">' + FLEET.domain + "</a>" +
+        '<span class="sep"></span>' +
+        '<span class="lbl">' + FLEET.slotsUsed + " active hosts</span>" +
+        '<span class="sep"></span>' +
+        '<span class="lbl">' + (ALL_CAPS.length + QUEUE.length) + " capsules · " + statusTally() + "</span>" +
+        '<span class="lbl">' +
+        exact(szPair(FLEET_RAM_USED, FLEET_RAM), szPairT(FLEET_RAM_USED, FLEET_RAM, "across the fleet")) +
+        "</span></div>" +
+        '<div class="sortnote"><svg class="ic"><use href="#i-sort"/></svg>' +
+        "Sorted by time in current status — shortest first</div>" +
+        queueSection() +
+        ORDERED.map(hostCard).join("") +
+        '<div class="money"><div class="head"><h3>Spend — ' + SPEND.monthLabel + "</h3>" + chartLegend() + "</div>" +
+        '<div class="figs">' +
+        '<div class="fig"><div class="l">Month to date</div><div class="v">' + usd(SPEND.mtd) + "</div>" +
+        deltaChip() + "</div>" +
+        '<div class="fig"><div class="l">' + SPEND.prevLabel + '</div><div class="v sm">' +
+        usd(SPEND.prevSame) + "</div></div>" +
+        '<div class="fig"><div class="l">Run-rate</div><div class="v sm">' + usd(SPEND.runRate) + "/day</div></div>" +
+        '<div class="fig"><div class="l">Projected month</div><div class="v sm">' + usd0(SPEND.projected) + "</div></div>" +
+        "</div>" + chart() + chartTable() + "</div>";
+
+      if (tblOpen) {
+        const newTblToggle = root.querySelector('.tbl-toggle');
+        if (newTblToggle) newTblToggle.open = true;
+      }
+    }
+    function connectWS() {
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(wsProtocol + '//' + window.location.host + '/ws');
+      ws.onmessage = function (e) {
+        const data = JSON.parse(e.data);
+        FLEET = data.FLEET;
+        HOSTS = data.HOSTS;
+        QUEUE = data.QUEUE;
+        SPEND = data.SPEND;
+
+        ORDERED = HOSTS.map(h => Object.assign({}, h, { capsules: h.capsules.slice().sort(byStatusTime) }))
+          .sort((a, b) => hostStatusTime(a) - hostStatusTime(b));
+        ALL_CAPS = HOSTS.flatMap(h => h.capsules);
+        FLEET_RAM = HOSTS.reduce((s, h) => s + h.ramTotal, 0);
+        FLEET_RAM_USED = HOSTS.reduce((s, h) => s + h.ramUsed, 0);
+        const allVols = ALL_CAPS.flatMap(c => c.vol ? c.vol.map(v => v.mib) : []);
+        BIGGEST_VOL = allVols.length > 0 ? Math.max.apply(null, allVols) : 1;
+        BIGGEST_CAP = ALL_CAPS.length > 0 ? Math.max.apply(null, ALL_CAPS.map(c => c.ram)) : 1;
+        BLOCKED = QUEUE.filter(c => !placeable(c.reqRam));
+
+        render(document.querySelector('[data-render="board"]'));
+      };
+      ws.onclose = function () {
+        setTimeout(connectWS, 2000);
+      };
+    }
+    connectWS();
+
+    /* hover layer for the spend chart */
+    const tip = document.getElementById("tip");
+    document.addEventListener("mouseover", e => {
+      const b = e.target.closest && e.target.closest("rect.bar");
+      if (!b) return;
+      const i = +b.dataset.i, d = SPEND.days[i], c = SPEND.cur[i], p = SPEND.prev[i];
+      const diff = ((c - p) / p) * 100;
+      tip.innerHTML = '<div class="t-d">Aug ' + d + (i === SPEND.days.length - 1 ? " · today" : "") + "</div>" +
+        '<div class="t-r"><i>this month</i><span>' + usd(c) + "</span></div>" +
+        '<div class="t-r"><i>Jul ' + d + "</i><span>" + usd(p) + "</span></div>" +
+        '<div class="t-r"><i>change</i><span style="color:var(--' + (diff >= 0 ? "hot" : "ok") + ')">' +
+        (diff >= 0 ? "+" : "") + diff.toFixed(0) + "%</span></div>";
+      tip.style.opacity = "1";
+    });
+    document.addEventListener("mousemove", e => {
+      if (tip.style.opacity !== "1") return;
+      tip.style.left = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 8) + "px";
+      tip.style.top = Math.max(8, e.clientY - tip.offsetHeight - 12) + "px";
+    });
+    document.addEventListener("mouseout", e => {
+      if (e.target.closest && e.target.closest("rect.bar")) tip.style.opacity = "0";
+    });
+  </script>
+</body>
+
+</html>

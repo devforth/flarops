@@ -16,6 +16,21 @@ spec:
     - http:
 {{- end }}
         paths:
+{{- if .Values.additionalServices }}
+{{- range $service := .Values.additionalServices }}
+{{- if $service.exposedRoutes }}
+{{- range $route := $service.exposedRoutes }}
+          - path: {{ $route }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $service.name }}
+                port:
+                  number: {{ index $service.ports 0 | default 80 }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if .Values.apiRoutes }}
 {{- range $route := .Values.apiRoutes }}
           - path: {{ $route }}

@@ -1,23 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const fsPromises = require('fs').promises;
-
-// Re-using the same directory walker from routeAnalyzer
-async function walkDir(dir, fileList = []) {
-  const files = await fsPromises.readdir(dir);
-  for (const file of files) {
-    const filePath = path.join(dir, file);
-    const stat = await fsPromises.stat(filePath);
-    if (stat.isDirectory()) {
-      if (!['node_modules', 'dist', 'build', '.next', '.nuxt', 'out', 'coverage', '.git'].includes(file)) {
-        await walkDir(filePath, fileList);
-      }
-    } else {
-      fileList.push(filePath);
-    }
-  }
-  return fileList;
-}
+const { walkDir, logDebug } = require('./fsHelper');
 
 function injectVariableDeclaration(content, ext, envVarSyntax) {
   const declaration = `\nconst API_URL = ${envVarSyntax} || "";\n`;
@@ -88,7 +72,7 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
     if (fs.existsSync(pkgPath)) {
       packageJson = JSON.parse(await fsPromises.readFile(pkgPath, 'utf8'));
     }
-  } catch (e) {}
+  } catch (e) { logDebug(e); }
 
   const allDeps = { ...(packageJson.dependencies || {}), ...(packageJson.devDependencies || {}) };
   let envVarSyntax = 'process.env.API_URL';
@@ -159,7 +143,7 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
 
     for (const port of backendPorts) {
       // Matches 'http://localhost:8000/some/path' or 'http://api.domain.com:8000/some/path'
-      const regex = new RegExp(`(['"\`])(https?:\\/\\/[^\\/:\`"']+:${port})(.*?)\\1`, 'g');
+      const regex = new RegExp(`(['"\`])(https?:\\/\\/[^\\/:\`"']+:${port})(.{0,100}?)\\1`, 'g');
       
       content = content.replace(regex, (match, quote, base, rest) => {
         modified = true;
