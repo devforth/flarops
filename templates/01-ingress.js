@@ -31,7 +31,7 @@ spec:
 {{- end }}
 {{- end }}
 {{- end }}
-{{- if .Values.apiRoutes }}
+{{- if and .Values.hasBackend .Values.apiRoutes }}
 {{- range $route := .Values.apiRoutes }}
           - path: {{ $route }}
             pathType: Prefix
@@ -42,6 +42,7 @@ spec:
                   number: {{ index $.Values.apiPorts 0 | default 3000 }}
 {{- end }}
 {{- end }}
+{{- if .Values.hasFrontend }}
           - path: /
             pathType: Prefix
             backend:
@@ -49,4 +50,5 @@ spec:
                 name: frontend
                 port:
                   number: {{ index .Values.frontendPorts 0 }}
+{{- end }}
 `.trim();

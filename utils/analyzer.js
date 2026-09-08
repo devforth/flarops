@@ -86,7 +86,7 @@ async function findDockerfile(dir) {
     const partialMatch = files.find(f => f.toLowerCase().includes('dockerfile'));
     if (partialMatch) return partialMatch;
   } catch(e) { logDebug(e); }
-  return 'Dockerfile';
+  return null;
 }
 
 async function findHealthRoute(backendPath) {

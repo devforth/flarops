@@ -1036,6 +1036,8 @@ DOMAIN=${domain}
     envKeysToPass,
     backendPath: relativeBackendPath,
     frontendPath: relativeFrontendPath,
+    hasBackend: backendInfo.hasBackend,
+    hasFrontend: frontendInfo.hasFrontend,
     apiDockerfile: backendInfo.dockerfile || 'Dockerfile',
     frontendDockerfile: frontendInfo.dockerfile || 'Dockerfile',
 
@@ -1126,10 +1128,12 @@ ${s.ports.map(p => '      - ' + p).join('\n')}
 
   let valuesYaml = `projectName: ${projectName}
 domain: "${domain}"
+hasBackend: ${config.hasBackend}
+hasFrontend: ${config.hasFrontend}
 images:
-  api: ${config.images.api}
+${config.hasBackend ? `  api: ${config.images.api}` : ''}
   db: ${config.images.db}
-  frontend: ${config.images.frontend}
+${config.hasFrontend ? `  frontend: ${config.images.frontend}` : ''}
 dbCloneSource: "${config.dbCloneSource}"
 dbType: ${config.dbType ? '"' + config.dbType + '"' : 'null'}
 dbPort: ${config.dbPort || 'null'}
@@ -1139,22 +1143,22 @@ database:
   name: "${finalDbName}"
   env:
     # KEY: "VALUE"
-api:
+${config.hasBackend ? `api:
   healthRoute: ${config.apiHealthRoute ? '"' + config.apiHealthRoute + '"' : 'null'}
   secretKeys:
 ${config.apiSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
 ${apiEnvString}
-frontend:
+apiPorts:
+${config.apiPorts.map(p => '  - ' + p).join('\n')}` : ''}
+${config.hasFrontend ? `frontend:
   secretKeys:
 ${config.frontendSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
 ${frontendEnvString}
-${additionalServicesYaml}
-apiPorts:
-${config.apiPorts.map(p => '  - ' + p).join('\n')}
 frontendPorts:
-${config.frontendPorts.map(p => '  - ' + p).join('\n')}
+${config.frontendPorts.map(p => '  - ' + p).join('\n')}` : ''}
+${additionalServicesYaml}
 apiRoutes:
 ${config.apiRoutes.map(p => '  - "' + p + '"').join('\n')}
 `;
@@ -1186,10 +1190,15 @@ ${config.apiRoutes.map(p => '  - "' + p + '"').join('\n')}
   const templatesToGenerate = [
     { file: path.join(helmTemplatesDir, '01-ingress.yaml'), content: ingressTemplate(config) },
     { file: path.join(helmTemplatesDir, 'secret.yaml'), content: secretTemplate() },
-    { file: path.join(helmTemplatesDir, 'api.yaml'), content: apiServiceTemplate() + '\n---\n' + apiDeploymentTemplate(config) },
-    { file: path.join(helmTemplatesDir, 'frontend.yaml'), content: frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate() },
     { file: path.join(helmTemplatesDir, 'dashboard.yaml'), content: dashboardYamlTemplate(config) }
   ];
+
+  if (config.hasBackend) {
+    templatesToGenerate.push({ file: path.join(helmTemplatesDir, 'api.yaml'), content: apiServiceTemplate() + '\n---\n' + apiDeploymentTemplate(config) });
+  }
+  if (config.hasFrontend) {
+    templatesToGenerate.push({ file: path.join(helmTemplatesDir, 'frontend.yaml'), content: frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate() });
+  }
 
   if (config.additionalServices && config.additionalServices.length > 0) {
     for (const s of config.additionalServices) {
