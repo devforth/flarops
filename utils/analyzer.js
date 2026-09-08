@@ -312,7 +312,7 @@ async function analyzeAdditionalServices(baseDir, knownPaths) {
   const { walkDir, logDebug } = require('./fsHelper');
   const services = [];
   try {
-    const files = await fs.promises.readdir(baseDir, { withFileTypes: true });
+    const files = await fs.readdir(baseDir, { withFileTypes: true });
     for (const file of files) {
       if (!file.isDirectory() || file.name.startsWith('.') || ['node_modules', 'deploy', 'dist', 'build', 'templates', 'dashboard'].includes(file.name)) continue;
       
