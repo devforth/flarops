@@ -9,7 +9,7 @@ spec:
     app: {{ .Values.projectName }}
     component: ${service.name}
   ports:
-{{- $serviceObj := index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}") }}
+{{- $serviceObj := index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}" | int) }}
 {{- range $port := $serviceObj.ports }}
     - port: {{ $port }}
       targetPort: {{ $port }}

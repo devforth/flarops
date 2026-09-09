@@ -82,9 +82,9 @@ function sanitizeEnvValue(val) {
 
 function processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext, matchedAdditionalServices) {
   if (foundDbUrls[key]) return;
-  if (DB_PASSWORD_REGEX.test(key)) return;
+  if (dbPasswordRegex.test(key)) return;
 
-  if (SENSITIVE_REGEX.test(key)) {
+  if (sensitiveRegex.test(key)) {
     const fullLine = `${key}=${val}`;
     if (!sensitiveContext.content.includes(fullLine)) {
       sensitiveContext.content += `${fullLine}\n`;
@@ -101,10 +101,10 @@ function processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv
 }
 
 
-function generateEnvString(envObj, context) {
-  if (Object.keys(envObj).length === 0) return '    # KEY: "VALUE"';
+function generateEnvString(envObj, context, indent = '    ') {
+  if (Object.keys(envObj).length === 0) return `${indent}# KEY: "VALUE"`;
   return Object.entries(envObj).map(([k, v]) => {
-    let line = `    ${k}: "${v}"`;
+    let line = `${indent}${k}: "${v}"`;
     if (String(v).toLowerCase().includes('localhost')) {
       context.hasLocalhostWarnings = true;
       line += ` # Change "localhost" to your endpoint service name (api, frontend or db)`;
@@ -1025,7 +1025,7 @@ DOMAIN=${domain}
   
   for (const s of additionalServices) {
     s.secretKeys = sensitiveKeys.filter(k => s.usedEnvVars && s.usedEnvVars.includes(k));
-    // Do NOT generate s.envString here, we don't have contextObj yet.
+    s.relativePath = path.relative(currentDir, s.path);
   }
 
   var config = {
@@ -1116,7 +1116,7 @@ appVersion: "1.0.0"
       additionalServicesYaml += `  - name: ${s.name}
     image: ${s.name}:latest
     env:
-${generateEnvString(s.env, contextObj)}
+${generateEnvString(s.env, contextObj, '      ')}
     secretKeys:
 ${s.secretKeys.map(k => '      - ' + k).join('\n')}
     ports:

@@ -21,8 +21,8 @@ spec:
     spec:
       containers:
         - name: ${service.name}
-          image: {{ if .Values.werf }}{{ index .Values.werf.image "${service.name}" }}{{ else }}{{ (index (index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}")) "image") | default "${service.name}:latest" }}{{ end }}
-{{- $serviceObj := index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}") }}
+          image: {{ if .Values.werf }}{{ index .Values.werf.image "${service.name}" }}{{ else }}{{ (index (index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}" | int)) "image") | default "${service.name}:latest" }}{{ end }}
+{{- $serviceObj := index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}" | int) }}
 {{- if or $serviceObj.env $serviceObj.secretKeys }}
           env:
 {{- if $serviceObj.env }}

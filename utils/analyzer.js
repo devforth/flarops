@@ -217,6 +217,32 @@ async function analyzeDockerfile(frontendPath) {
   return null;
 }
 
+async function scoreFrontend(fullPath) {
+  const { walkDir } = require('./fsHelper');
+  let score = 0;
+  
+  try {
+    const pkgPath = path.join(fullPath, 'package.json');
+    const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf8'));
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    if (deps['react'] || deps['vue'] || deps['@angular/core'] || deps['next'] || deps['nuxt'] || deps['svelte']) {
+       score += 10;
+    }
+  } catch(e) {}
+  
+  try {
+    const dirFiles = await walkDir(fullPath);
+    const hasIndexHtml = dirFiles.some(f => path.basename(f).toLowerCase() === 'index.html');
+    if (hasIndexHtml) score += 5;
+  } catch(e) {}
+  
+  if (['vote', 'main', 'app', 'client'].includes(path.basename(fullPath).toLowerCase())) {
+    score += 2;
+  }
+  
+  return score;
+}
+
 async function analyzeFrontend(baseDir) {
   const exactDirs = ['frontend', 'client', 'ui', 'web', 'front'];
   let frontendPath = null;
@@ -233,7 +259,7 @@ async function analyzeFrontend(baseDir) {
     } catch (err) { logDebug(err); }
   }
 
-  // 2. Fallback to partial match (e.g., 'kanban-ui', 'web-app')
+  // 2. Fallback to partial match
   if (!frontendPath) {
     try {
       const files = await fs.readdir(baseDir, { withFileTypes: true });
@@ -247,6 +273,34 @@ async function analyzeFrontend(baseDir) {
         }
       }
     } catch (err) { logDebug(err); }
+  }
+
+  // 3. Fallback: heuristic scoring of directories with Dockerfile
+  if (!frontendPath) {
+    try {
+      let bestScore = 0;
+      let bestDir = null;
+      
+      const files = await fs.readdir(baseDir, { withFileTypes: true });
+      for (const file of files) {
+        if (!file.isDirectory() || file.name.startsWith('.') || file.name === 'node_modules') continue;
+        const fullPath = path.join(baseDir, file.name);
+        
+        const df = await findDockerfile(fullPath);
+        if (!df) continue; // must be a deployable service
+        
+        const score = await scoreFrontend(fullPath);
+        
+        if (score > bestScore) {
+          bestScore = score;
+          bestDir = fullPath;
+        }
+      }
+      
+      if (bestScore > 0) {
+        frontendPath = bestDir;
+      }
+    } catch(e) { logDebug(e); }
   }
 
   if (!frontendPath) {

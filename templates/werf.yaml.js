@@ -31,7 +31,7 @@ context: ${config.dbContext === '.' ? '.' : config.dbContext}
       yaml += `---
 image: ${s.name}
 dockerfile: ${s.dockerfile || 'Dockerfile'}
-context: ${s.path}
+context: ${s.relativePath === '.' ? '.' : s.relativePath}
 `;
     }
   }
