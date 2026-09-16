@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+var pricingHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 type VantageInstance struct {
 	InstanceType string `json:"instance_type"`
 	Pricing      map[string]struct {
@@ -24,7 +26,7 @@ var (
 )
 
 func fetchAWSPrices() {
-	resp, err := http.Get("https://instances.vantage.sh/instances.json")
+	resp, err := pricingHTTPClient.Get("https://instances.vantage.sh/instances.json")
 	if err != nil {
 		log.Println("Error fetching AWS prices:", err)
 		return

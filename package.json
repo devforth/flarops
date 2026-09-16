@@ -6,6 +6,14 @@
   "bin": {
     "flarops": "bin/index.js"
   },
+  "files": [
+    "bin/",
+    "utils/",
+    "templates/",
+    "dashboard/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },

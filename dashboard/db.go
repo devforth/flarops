@@ -8,6 +8,36 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Samples are recorded roughly once a minute with no upper bound on table size.
+// Keep a year of history (comfortably more than the month-over-month spend
+// comparison in getSpendStats needs) and prune the rest so the PVC backing this
+// database doesn't grow indefinitely.
+const sampleRetention = 400 * 24 * time.Hour
+
+func startSampleRetention() {
+	pruneOldSamples()
+	ticker := time.NewTicker(24 * time.Hour)
+	go func() {
+		for range ticker.C {
+			pruneOldSamples()
+		}
+	}()
+}
+
+func pruneOldSamples() {
+	cutoff := time.Now().Add(-sampleRetention)
+	if res, err := db.Exec("DELETE FROM host_samples WHERE timestamp < ?", cutoff); err != nil {
+		log.Println("Error pruning host_samples:", err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("Pruned %d old host_samples rows", n)
+	}
+	if res, err := db.Exec("DELETE FROM capsule_samples WHERE timestamp < ?", cutoff); err != nil {
+		log.Println("Error pruning capsule_samples:", err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("Pruned %d old capsule_samples rows", n)
+	}
+}
+
 var db *sql.DB
 
 func initDB(dataSourceName string) error {

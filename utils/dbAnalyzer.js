@@ -29,10 +29,10 @@ async function getLatestDbImage(dbType) {
   else return null;
 
   const tags = await fetchDockerTags(image);
-  let validTags = tags.filter(t => /^\\d+(\\.\\d+)*$/.test(t));
-  
+  let validTags = tags.filter(t => /^\d+(\.\d+)*$/.test(t));
+
   if (dbType === 'postgres') {
-    const alpineTags = tags.filter(t => /^\\d+(\\.\\d+)*-alpine$/.test(t));
+    const alpineTags = tags.filter(t => /^\d+(\.\d+)*-alpine$/.test(t));
     if (alpineTags.length > 0) validTags = alpineTags;
   }
   
@@ -55,6 +55,37 @@ async function getLatestDbImage(dbType) {
   });
 
   return `${image}:${validTags[0]}`;
+}
+
+// If the project's own docker-compose.yml pins a specific image/tag for the
+// database (e.g. "image: mysql:5.6"), prefer that over auto-fetching the
+// latest tag from Docker Hub. The project's application code (driver
+// versions, auth plugin assumptions, SQL dialect quirks) was written and
+// tested against whatever version the author actually pinned - silently
+// upgrading to "latest" can break compatibility outright (e.g. an old
+// mysql-connector-java client that can't speak MySQL 8's default
+// caching_sha2_password auth plugin / TLS requirements).
+async function findPinnedDbImageTag(baseDir, dbType) {
+  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  const engineNames = {
+    postgres: 'postgres(?:ql)?',
+    mysql: 'mysql',
+    mariadb: 'mariadb',
+    mongodb: 'mongo'
+  };
+  const engine = engineNames[dbType];
+  if (!engine) return null;
+
+  const imageRegex = new RegExp(`image:\\s*["']?((?:[a-zA-Z0-9_.-]+/)?${engine}:[a-zA-Z0-9_.-]+)["']?`, 'i');
+
+  for (const file of composeFiles) {
+    try {
+      const content = await fs.readFile(path.join(baseDir, file), 'utf8');
+      const match = content.match(imageRegex);
+      if (match) return match[1];
+    } catch (e) { logDebug(e); }
+  }
+  return null;
 }
 
 
@@ -212,16 +243,19 @@ async function extractDbCredentials(baseDir, backendPath) {
 
 async function checkDockerCompose(baseDir) {
   const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  // Match "image: postgres:15" as well as an org-prefixed/forked image like
+  // "image: jmreif/mongodb" - the DB engine name doesn't have to be the first
+  // path segment of the image reference.
   for (const file of composeFiles) {
     try {
       const content = await fs.readFile(path.join(baseDir, file), 'utf8');
-      if (testRegex(content, 'image:\\s*["\']?postgres') || testRegex(content, 'POSTGRES_USER') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?5432"?')) {
+      if (testRegex(content, 'image:\\s*["\']?(?:[a-zA-Z0-9_.-]+\\/)?postgres') || testRegex(content, 'POSTGRES_USER') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?5432"?')) {
         return { hasDb: true, dbType: 'postgres', port: DB_PORTS.postgres };
       }
-      if (testRegex(content, 'image:\\s*["\']?mysql') || testRegex(content, 'MYSQL_DATABASE') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?3306"?')) {
+      if (testRegex(content, 'image:\\s*["\']?(?:[a-zA-Z0-9_.-]+\\/)?mysql') || testRegex(content, 'MYSQL_DATABASE') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?3306"?')) {
         return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
       }
-      if (testRegex(content, 'image:\\s*["\']?mongo') || testRegex(content, 'MONGO_URI') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?27017"?')) {
+      if (testRegex(content, 'image:\\s*["\']?(?:[a-zA-Z0-9_.-]+\\/)?mongo') || testRegex(content, 'MONGO_URI') || testRegex(content, 'MONGO_INITDB_') || testRegex(content, 'DB_PORT\\s*[:=]\\s*"?27017"?')) {
         return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
       }
     } catch(e) { logDebug(e); }
@@ -230,6 +264,7 @@ async function checkDockerCompose(baseDir) {
 }
 
 async function checkLocalDbDockerfile(baseDir) {
+  // Fixed conventional names first (fast path)...
   const possibleDirs = ['db', 'database', 'postgres', 'mysql', 'mongo', 'sql', 'data', 'docker/db', 'docker/database', 'docker/postgres', 'docker/mysql', 'storage'];
   for (const dir of possibleDirs) {
     const fullPath = path.join(baseDir, dir);
@@ -241,6 +276,42 @@ async function checkLocalDbDockerfile(baseDir) {
       }
     } catch(e) { logDebug(e); }
   }
+
+  // ...then fall back to any top-level directory whose name merely *contains* a
+  // DB engine keyword (e.g. "docker-mongodb", "postgres-init"), which the fixed
+  // list above misses entirely.
+  const dbNameKeywords = ['postgres', 'postgresql', 'mysql', 'mariadb', 'mongo', 'redis'];
+  try {
+    const entries = await fs.readdir(baseDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+      const lowerName = entry.name.toLowerCase();
+      if (!dbNameKeywords.some(k => lowerName.includes(k))) continue;
+      if (possibleDirs.includes(lowerName)) continue; // already checked above
+
+      const fullPath = path.join(baseDir, entry.name);
+      try {
+        const files = await fs.readdir(fullPath);
+        const dockerfileMatch = files.find(f => f.toLowerCase() === 'dockerfile' || f.toLowerCase().includes('dockerfile'));
+        if (dockerfileMatch) {
+          return path.join(entry.name, dockerfileMatch);
+        }
+        // Dockerfile may live one level deeper (e.g. docker-mongodb/docker/Dockerfile)
+        for (const sub of files) {
+          const subPath = path.join(fullPath, sub);
+          try {
+            const subStat = await fs.stat(subPath);
+            if (subStat.isDirectory()) {
+              const subFiles = await fs.readdir(subPath);
+              const subDockerfile = subFiles.find(f => f.toLowerCase() === 'dockerfile' || f.toLowerCase().includes('dockerfile'));
+              if (subDockerfile) return path.join(entry.name, sub, subDockerfile);
+            }
+          } catch (e) { logDebug(e); }
+        }
+      } catch (e) { logDebug(e); }
+    }
+  } catch (e) { logDebug(e); }
+
   return null;
 }
 
@@ -287,7 +358,8 @@ async function analyzeDatabase(baseDir, backendPath) {
     const creds = await extractDbCredentials(baseDir, backendPath);
     result.dbUser = creds.user;
     result.dbName = creds.name;
-    result.image = await getLatestDbImage(result.dbType);
+    const pinnedImage = await findPinnedDbImageTag(baseDir, result.dbType);
+    result.image = pinnedImage || await getLatestDbImage(result.dbType);
     
     const localDbDockerfile = await checkLocalDbDockerfile(baseDir);
     if (localDbDockerfile) {
@@ -343,7 +415,7 @@ async function analyzeBackendForDbKeys(backendPath) {
 
   const files = await walkDir(backendPath);
   
-  const envVarRegex = /(?:process\.env\.|os\.Getenv\(['"`]|getenv\(['"`]|System\.getenv\(['"`]|Environment\.GetEnvironmentVariable\(['"`]|\$ENV\[['"`]|\$_ENV\[['"`])([a-zA-Z0-9_]+)/g;
+  const envVarRegex = /(?:process\.env\.|process\.env\[['"`]|os\.Getenv\(['"`]|getenv\(['"`]|System\.getenv\(['"`]|Environment\.GetEnvironmentVariable\(['"`]|\$ENV\[['"`]|\$_ENV\[['"`])([a-zA-Z0-9_]+)/g;
   const destructureRegex = /(?:const|let|var)\s*\{([^}]+)\}\s*=\s*process\.env/g;
 
   for (const file of files) {

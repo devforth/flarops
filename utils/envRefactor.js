@@ -3,6 +3,9 @@ const path = require('path');
 const fsPromises = require('fs').promises;
 const { walkDir, logDebug } = require('./fsHelper');
 
+const TEST_FILE_PATTERN = /\.(test|spec)\.[a-z]+$/i;
+const isTestFile = filePath => TEST_FILE_PATTERN.test(path.basename(filePath));
+
 function injectVariableDeclaration(content, ext, envVarSyntax) {
   const declaration = `\nconst API_URL = ${envVarSyntax} || "";\n`;
   if (content.includes('const API_URL =')) return content;
@@ -137,6 +140,7 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
 
   for (const filePath of filesToScan) {
     if (!['.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte'].includes(path.extname(filePath))) continue;
+    if (isTestFile(filePath)) continue;
 
     let content = await fsPromises.readFile(filePath, 'utf8');
     let modified = false;
@@ -227,6 +231,7 @@ async function refactorBackendDbUrl(backendDir, doModify = false) {
 
   for (const filePath of filesToScan) {
     if (!['.js', '.ts'].includes(path.extname(filePath))) continue;
+    if (isTestFile(filePath)) continue;
 
     let content = await fsPromises.readFile(filePath, 'utf8');
     let modified = false;
@@ -322,6 +327,7 @@ async function refactorLowercaseEnvVars(backendDir, keysToUppercase, doModify = 
 
   for (const filePath of filesToScan) {
     if (!['.js', '.ts', '.go', '.py', '.java', '.php', '.cs'].includes(path.extname(filePath))) continue;
+    if (isTestFile(filePath)) continue;
 
     let content = await fsPromises.readFile(filePath, 'utf8');
     let modified = false;

@@ -20,9 +20,25 @@ module.exports = function deployYmlTemplate(config) {
           password: \${{ secrets.REGISTRY_PASSWORD }}
 `;
 
-  const setEnvs = config.envKeysToPass && config.envKeysToPass.length > 0
-    ? config.envKeysToPass.map(k => `            --set env.${k}=\${{ secrets.${k} }}`).join(' \\\n') + ' \\\n'
+  // Secrets are passed through a step-level `env:` block (GitHub Actions writes these
+  // directly into the runner's process environment - no shell interpolation happens)
+  // and then serialized into a Helm values file by Python's json encoder, which
+  // properly escapes quotes/backticks/newlines. This replaces the previous
+  // `--set env.K=${{ secrets.K }}` pattern, which placed secret values directly inside
+  // a `run:` shell string: a secret containing backticks or `$(...)` would execute
+  // arbitrary commands on the runner (which holds AWS keys, the SSH deploy key and
+  // kubeconfig at that point).
+  const secretEnvBlock = config.envKeysToPass && config.envKeysToPass.length > 0
+    ? config.envKeysToPass.map(k => `          SECRET_ENV_${k}: \${{ secrets.${k} }}`).join('\n') + '\n'
     : '';
+
+  const buildValuesScript = `python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"`;
+
+  // Only reference a DB password secret when this project actually has one -
+  // otherwise every project (with or without a database) ends up pointing CI at
+  // a repository secret ("DATABASE_PASSWORD") that was never asked for and
+  // doesn't exist.
+  const dbPasswordEnvLine = config.hasDbPassword ? `          SECRET_DB_PASSWORD: \${{ secrets.${config.dbPasswordKey} }}\n` : '';
 
   return `name: Flarops CI/CD Pipeline
 
@@ -31,6 +47,9 @@ on:
     branches:
       - main
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   AWS_REGION: us-west-2
@@ -82,22 +101,22 @@ jobs:
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: \${{ secrets.SSH_PRIVATE_KEY }}
-          
+
       - name: Fetch Kubeconfig from EC2
         working-directory: deploy/terraform
         run: |
           export EC2_IP=$(terraform output -raw public_ip)
-          
+
           echo "Waiting for K3s to be ready on $EC2_IP..."
           until ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo test -f /etc/rancher/k3s/k3s.yaml"; do
             echo "Waiting for k3s.yaml..."
             sleep 10
           done
-          
+
           mkdir -p ~/.kube
           ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
           chmod 600 ~/.kube/config
-          
+
           sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
 
       - name: Setup Werf
@@ -108,12 +127,14 @@ ${loginStep}
           kubectl get nodes
 
       - name: Deploy application with Werf
-        run: |
+${(secretEnvBlock || dbPasswordEnvLine) ? '        env:\n' + secretEnvBlock + dbPasswordEnvLine : ''}        run: |
+          umask 077
+          ${buildValuesScript}
           werf converge \\
             --parallel-tasks-limit=3 \\
             --repo ${repoString} \\
             --env production \\
-${setEnvs}            --set database.password=\${{ secrets.${config.dbPasswordKey} }}${loginRegistryHost === 'docker.io' ? '' : `
+            --values deploy/helm/flarops-ci-values.json${loginRegistryHost === 'docker.io' ? '' : `
 
       - name: Cleanup old images
         run: |

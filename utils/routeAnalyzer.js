@@ -156,20 +156,26 @@ async function analyzeBackendExposedRoutes(backendDir) {
   // Detect FastAPI: @app.get("/api")
   const listenRouteRegex = /(?:app|router|r|server|http|mux)\.(?:use|get|post|put|delete|patch|all|Group|HandleFunc|Handle)\s*\(\s*['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
   const pythonRouteRegex = /@(?:app|router|server)\.(?:route|get|post|put|delete|patch)\s*\(\s*['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
-  
+  // Detect Spring (Java/Kotlin): @RequestMapping("/x"), @GetMapping(value = "/x"),
+  // at either class or method level.
+  const springRouteRegex = /@(?:RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*\(\s*(?:value\s*=\s*)?\{?\s*['"`](\/[a-zA-Z0-9_\-\/{}]+)/gm;
+
   for (const filePath of filesToScan) {
     if (filePath.includes('node_modules') || filePath.includes('.git') || filePath.includes('dist')) continue;
     try {
       const ext = path.extname(filePath);
-      if (!['.js', '.ts', '.go', '.py', '.java', '.php', '.rb'].includes(ext)) continue;
-      
+      if (!['.js', '.ts', '.go', '.py', '.java', '.kt', '.php', '.rb'].includes(ext)) continue;
+
       const fileContent = await fs.readFile(filePath, 'utf8');
-      
+
       let match;
       while ((match = listenRouteRegex.exec(fileContent)) !== null) {
         addRoute(match[1], 1);
       }
       while ((match = pythonRouteRegex.exec(fileContent)) !== null) {
+        addRoute(match[1], 1);
+      }
+      while ((match = springRouteRegex.exec(fileContent)) !== null) {
         addRoute(match[1], 1);
       }
     } catch (e) {}

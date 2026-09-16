@@ -1,3 +1,17 @@
+// Postgres 18 changed the docker image's on-disk layout to be
+// pg_ctlcluster-style, namespaced per major version (e.g.
+// /var/lib/postgresql/18/docker) - see
+// https://github.com/docker-library/postgres/pull/1259. Mounting a volume
+// straight at the old /var/lib/postgresql/data path now makes the entrypoint
+// see "data in an unused mount" and refuse to start. From 18 onward the
+// volume has to be mounted one level up, at /var/lib/postgresql, so the image
+// can manage its own version-specific subdirectory underneath it.
+function getPostgresMajorVersion(image) {
+  const tag = (image || '').split(':')[1] || '';
+  const match = tag.match(/^(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
 module.exports = (config) => {
   let envBlock = '';
   let volumeMountPath = '/var/lib/data';
@@ -13,7 +27,8 @@ module.exports = (config) => {
                   key: ${config.dbPasswordKey}
             - name: POSTGRES_DB
               value: {{ .Values.database.name | quote }}`;
-    volumeMountPath = '/var/lib/postgresql/data';
+    const pgMajorVersion = getPostgresMajorVersion(config.images && config.images.db);
+    volumeMountPath = (pgMajorVersion && pgMajorVersion >= 18) ? '/var/lib/postgresql' : '/var/lib/postgresql/data';
   } else if (config.dbType === 'mysql' || config.dbType === 'mariadb') {
     const prefix = config.dbType === 'mariadb' ? 'MARIADB' : 'MYSQL';
     envBlock = `
@@ -81,8 +96,8 @@ spec:
       initContainers:
         - name: db-clone
           image: curlimages/curl:latest
-          command: ["/bin/sh", "-c"]
-          args: ["curl -s -L -o /docker-entrypoint-initdb.d/dump.sql {{ .Values.dbCloneSource }}"]
+          command: ["curl"]
+          args: ["--fail", "--silent", "--show-error", "--location", "--proto", "=https", "-o", "/docker-entrypoint-initdb.d/dump.sql", "{{ .Values.dbCloneSource }}"]
           volumeMounts:
             - name: db-init
               mountPath: /docker-entrypoint-initdb.d
@@ -90,6 +105,12 @@ spec:
       containers:
         - name: db
           image: {{ if and .Values.werf .Values.werf.image.db }}{{ .Values.werf.image.db }}{{ else }}{{ .Values.images.db | default "db:latest" }}{{ end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
           env:${envBlock}
           resources:
             requests:

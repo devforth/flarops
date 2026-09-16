@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -121,8 +122,12 @@ func main() {
 	if err := initDB(dbPath); err != nil {
 		log.Fatal("Failed to initialize database: ", err)
 	}
-	
-	startPriceFetcher()
+	startSampleRetention()
+
+	// Fetch pricing data in the background instead of blocking startup on it -
+	// a hung or slow third-party endpoint (instances.vantage.sh) must not delay
+	// the k8s client, websocket hub, or HTTP server from coming up.
+	go startPriceFetcher()
 
 	k8sClient, err := NewK8sClient()
 	if err != nil {
@@ -132,21 +137,34 @@ func main() {
 	go hub.run()
 	go startCollector(k8sClient)
 
-	http.HandleFunc("/ws", serveWs)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", serveWs)
 
 	staticFS, err := fs.Sub(content, "static")
 	if err != nil {
 		log.Fatal(err)
 	}
-	http.Handle("/", http.FileServer(http.FS(staticFS)))
+	mux.Handle("/", http.FileServer(http.FS(staticFS)))
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
+	server := &http.Server{
+		Addr: ":" + port,
+		Handler: mux,
+		// gorilla/websocket hijacks the connection on upgrade, so once /ws is
+		// streaming these server-level timeouts no longer apply to it (net/http
+		// stops managing deadlines on a hijacked connection) - they only guard
+		// the plain static-file responses and the upgrade handshake itself.
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
 	fmt.Printf("Dashboard running on port %s\n", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}
 }

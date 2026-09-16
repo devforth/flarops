@@ -16,7 +16,7 @@ metadata:
   name: flarops-dashboard-role-{{ .Values.werf.env }}
 rules:
 - apiGroups: [""]
-  resources: ["nodes", "nodes/proxy", "pods", "namespaces", "configmaps", "persistentvolumeclaims"]
+  resources: ["nodes", "nodes/proxy", "pods", "namespaces", "persistentvolumeclaims"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["metrics.k8s.io"]
   resources: ["nodes", "pods"]
@@ -30,6 +30,34 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: flarops-dashboard-role-{{ .Values.werf.env }}
+subjects:
+- kind: ServiceAccount
+  name: flarops-dashboard
+  namespace: {{ .Release.Namespace }}
+---
+# configmaps are only ever read from the "default" namespace (see
+# dashboard/collector.go's GetConfigMaps("default") call) - scoped to a
+# namespaced Role instead of the cluster-wide ClusterRole above, so a
+# compromised dashboard pod can't enumerate configmaps in every namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: flarops-dashboard-configmaps-{{ .Values.werf.env }}
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: flarops-dashboard-configmaps-binding-{{ .Values.werf.env }}
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: flarops-dashboard-configmaps-{{ .Values.werf.env }}
 subjects:
 - kind: ServiceAccount
   name: flarops-dashboard
@@ -61,10 +89,21 @@ spec:
         app: flarops-dashboard
     spec:
       serviceAccountName: flarops-dashboard
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: dashboard
         image: {{ .Values.werf.image.dashboard }}
         imagePullPolicy: Always
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
         env:
         - name: DOMAIN
           value: {{ .Values.domain | quote }}
@@ -72,6 +111,13 @@ spec:
           value: "/data/flarops_metrics.db"
         ports:
         - containerPort: 8080
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
         volumeMounts:
         - name: data
           mountPath: /data
@@ -104,6 +150,7 @@ metadata:
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
     {{- end }}
 spec:
+  ingressClassName: traefik
   {{- if not ${config.hasCloudflare ? 'true' : 'false'} }}
   tls:
   - hosts:

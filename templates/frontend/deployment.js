@@ -18,9 +18,16 @@ spec:
         app: {{ .Values.projectName }}
         component: frontend
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: frontend
           image: {{ if .Values.werf }}{{ .Values.werf.image.frontend }}{{ else }}{{ .Values.images.frontend | default "frontend:latest" }}{{ end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
 {{- if or .Values.frontend.env .Values.frontend.secretKeys }}
           env:
 {{- if .Values.frontend.env }}

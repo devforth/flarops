@@ -28,10 +28,22 @@ context: ${config.dbContext === '.' ? '.' : config.dbContext}
   
   if (config.additionalServices && config.additionalServices.length > 0) {
     for (const s of config.additionalServices) {
+      // A Maven reactor module's pom.xml inherits <parent> from the repo-root
+      // pom.xml, which Maven resolves via the default "../pom.xml" relative
+      // lookup - so it can only be built with the repo root as Docker build
+      // context (the module's own directory alone never includes that parent
+      // pom), with the Dockerfile path adjusted to be relative to that root.
+      const context = s.isMavenReactorModule
+        ? '.'
+        : (s.relativePath && s.relativePath !== '.' ? s.relativePath : '.');
+      const dockerfilePath = s.isMavenReactorModule
+        ? `${s.relativePath}/${s.dockerfile || 'Dockerfile'}`
+        : (s.dockerfile || 'Dockerfile');
+
       yaml += `---
 image: ${s.name}
-dockerfile: ${s.dockerfile || 'Dockerfile'}
-context: ${s.relativePath === '.' ? '.' : s.relativePath}
+dockerfile: ${dockerfilePath}
+context: ${context}
 `;
     }
   }

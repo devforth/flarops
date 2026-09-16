@@ -1704,7 +1704,7 @@
       if (SPEND.breakdown) {
         breakdownHTML = "<h4>Run-rate Breakdown</h4><table><thead><tr><th>Service</th><th>Daily Cost</th></tr></thead><tbody>";
         for (const [service, cost] of Object.entries(SPEND.breakdown)) {
-          breakdownHTML += "<tr><td>" + service + "</td><td>" + usd(cost) + "</td></tr>";
+          breakdownHTML += "<tr><td>" + esc(service) + "</td><td>" + usd(cost) + "</td></tr>";
         }
         breakdownHTML += "</tbody></table>";
       }
@@ -1718,9 +1718,9 @@
     /* ------------------------------------------------------------------ render */
     function capsuleCard(c, h) {
       const tiles = c.ctr.map(x =>
-        '<div class="tile" style="--w:' + x.ram + '" title="' + x.n + " · " + esc(x.img) + " · " + szT(x.ram) +
+        '<div class="tile" style="--w:' + x.ram + '" title="' + esc(x.n) + " · " + esc(x.img) + " · " + szT(x.ram) +
         " · " + x.cpu + "% cpu — box width is proportional to memory\">" +
-        '<div class="t-n">' + x.n + '</div><div class="t-i">' + esc(x.img) +
+        '<div class="t-n">' + esc(x.n) + '</div><div class="t-i">' + esc(x.img) +
         '</div><div class="t-v">' + exact(sz(x.ram), szT(x.ram)) + " · " + x.cpu + "% cpu</div></div>").join("");
 
       const vols = c.vol.map(v => {
@@ -1770,8 +1770,8 @@
 
       const segs = h.capsules.map(c =>
         '<div class="seg' + (c.status === "running" ? "" : " work") + '" style="width:' + w(c.ram) +
-        '" title="' + c.id + " · " + szT(c.ram) + " · " + STATUS[c.status].label + " " + dur(c.statusSec) + '">' +
-        '<span class="sn">' + c.id + '</span><span class="sv">' +
+        '" title="' + esc(c.id) + " · " + szT(c.ram) + " · " + STATUS[c.status].label + " " + dur(c.statusSec) + '">' +
+        '<span class="sn">' + esc(c.id) + '</span><span class="sv">' +
         (c.status === "running" ? sz(c.ram) + " · " + pct(c.ram, h.ramTotal) + "%"
           : STATUS[c.status].label.split(" ")[0].toLowerCase() + " · " + dur(c.statusSec)) +
         "</span></div>").join("") +
@@ -1792,7 +1792,7 @@
     /** Names the capsule doing the paging, so the alarm points somewhere. */
     function worstSwapper(h) {
       const c = h.capsules.slice().sort((a, b) => b.swap - a.swap)[0];
-      return c && c.swap ? c.id + " is paging " + sz(c.swap) : "no single capsule accounts for it";
+      return c && c.swap ? esc(c.id) + " is paging " + sz(c.swap) : "no single capsule accounts for it";
     }
 
     /* A queued capsule has a spec but no measurements, so it gets its own compact row
@@ -1805,11 +1805,11 @@
         "<div>" + statusPill(c) + "</div>" +
         '<div class="qreq">requests <b>' + exact(sz(c.reqRam), szT(c.reqRam) + " requested") + "</b><br>" +
         (fits
-          ? '<span style="color:var(--ok)">fits ' + best.id + " · " + sz(freeOf(best)) + " free</span>"
+          ? '<span style="color:var(--ok)">fits ' + esc(best.id) + " · " + sz(freeOf(best)) + " free</span>"
           : '<span class="why"><svg class="ic"><use href="#i-warn"/></svg>largest free block is ' +
-          sz(freeOf(best)) + " on " + best.id + " — no host can take it</span>") + "</div>" +
+          sz(freeOf(best)) + " on " + esc(best.id) + " — no host can take it</span>") + "</div>" +
         '<div class="qspec">' +
-        c.ctr.map(x => '<span class="s">' + x.n + "</span>").join("") +
+        c.ctr.map(x => '<span class="s">' + esc(x.n) + "</span>").join("") +
         c.vol.map(v => '<span class="s v">' + esc(v.n) + "</span>").join("") +
         "</div></div>";
     }
@@ -1827,8 +1827,8 @@
     function hostCard(h) {
       const alarm = h.swapUsed / h.swapTotal >= 0.5;
       return '<div class="host' + (alarm ? " alarm" : "") + '">' +
-        '<div class="hhead"><div class="htop"><div class="hname"><h3>' + h.id + "</h3>" +
-        '<div class="sub">' + h.region + "</div></div>" +
+        '<div class="hhead"><div class="htop"><div class="hname"><h3>' + esc(h.id) + "</h3>" +
+        '<div class="sub">' + esc(h.region) + "</div></div>" +
         '<div class="gauges">' +
         arcGauge("RAM", hostRam(h),
           exact(szPair(h.ramUsed, h.ramTotal), szPairT(h.ramUsed, h.ramTotal, "used")), "used") +
@@ -1839,7 +1839,7 @@
         arcGauge("CPU", hostCpu(h), h.cpuUsed + "% / " + cpuCap(h) + "%",
           h.cores + " cores × " + h.threads + " = " + threadsOf(h) + " threads") +
         "</div></div>" +
-        '<div class="hchips"><span class="chip type">' + h.type + '</span><span class="chip">' + h.cores + " cores × " + h.threads +
+        '<div class="hchips"><span class="chip type">' + esc(h.type) + '</span><span class="chip">' + h.cores + " cores × " + h.threads +
         ' threads</span><span class="chip">' + usd(h.rate) + "/h</span></div></div>" +
         (alarm ? '<div class="alarmline"><svg class="ic"><use href="#i-warn"/></svg>Swap pressure ' +
           hostSwap(h) + "% — " + worstSwapper(h) + ". This host is over-committed, not busy.</div>" : "") +
