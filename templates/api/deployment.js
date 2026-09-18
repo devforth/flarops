@@ -95,6 +95,15 @@ ${dbPasswordBlock}${dbUrlEnvBlock}
   const apiMemoryRequestMi = Math.max(256, apiWorkers * 128);
   const apiMemoryLimitMi = Math.max(512, apiWorkers * 200);
 
+  // Some apps (notably Go binaries using the stdlib `flag` package) take
+  // essential runtime config exclusively via CLI arguments, invisible to
+  // every env-var-based mechanism above - docker-compose's own `command:`
+  // override for this service (already rewritten to point at real k8s
+  // Service names in init.js) is carried over here the same way.
+  const apiArgsBlock = (Array.isArray(config.apiCommand) && config.apiCommand.length > 0) ? `
+          args:
+${config.apiCommand.map(a => `            - ${JSON.stringify(String(a))}`).join('\n')}` : '';
+
   const prestartInitContainer = config.apiMigrationStep ? `
       initContainers:
         - name: api-prestart
@@ -132,7 +141,7 @@ spec:
 ${prestartInitContainer}
       containers:
         - name: api
-          image: {{ if .Values.werf }}{{ .Values.werf.image.api }}{{ else }}{{ .Values.images.api | default "api:latest" }}{{ end }}
+          image: {{ if .Values.werf }}{{ .Values.werf.image.api }}{{ else }}{{ .Values.images.api | default "api:latest" }}{{ end }}${apiArgsBlock}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

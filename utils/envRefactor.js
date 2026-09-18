@@ -78,6 +78,21 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
   } catch (e) { logDebug(e); }
 
   const allDeps = { ...(packageJson.dependencies || {}), ...(packageJson.devDependencies || {}) };
+
+  // Angular's esbuild-based builder (@angular-devkit/build-angular) has no
+  // built-in support for `process.env.*` or `import.meta.env.*` - it isn't a
+  // recognized global, so referencing it fails the TypeScript build outright
+  // (TS2591), unlike CRA/Vite/Vue-CLI where this is a real bundler feature.
+  // There's no equivalent build-time env var syntax for Angular to fall back
+  // to, so instead of injecting an env var reference, hardcoded backend URLs
+  // are rewritten straight to their relative path (dropping scheme/host/port
+  // entirely) - this is exactly what the env-var path degrades to anyway
+  // once deployed (see the .env.local/.gitignore handling below: the real
+  // host is only used for local dev and is never present in the committed,
+  // CI-built bundle), so going there directly keeps Angular working without
+  // ever emitting code its compiler rejects.
+  const isAngular = !!(allDeps['@angular/core'] || allDeps['@angular-devkit/build-angular']);
+
   let envVarSyntax = 'process.env.API_URL';
   let envVarKey = 'API_URL';
 
@@ -152,7 +167,7 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
       content = content.replace(regex, (match, quote, base, rest) => {
         modified = true;
         backendDetectedUrl = base; // Record what we found to use in .env.local
-        
+
         if (rest) {
           const baseRoute = rest.split(/[\\?\\$]/)[0];
           if (baseRoute.startsWith('/')) {
@@ -162,7 +177,11 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
             }
           }
         }
-        
+
+        if (isAngular) {
+          return rest ? (quote + rest + quote) : (quote + quote);
+        }
+
         if (!rest) {
           return 'API_URL';
         }
@@ -176,14 +195,16 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
     }
 
     if (modified) {
-      content = injectVariableDeclaration(content, path.extname(filePath), envVarSyntax);
+      if (!isAngular) {
+        content = injectVariableDeclaration(content, path.extname(filePath), envVarSyntax);
+      }
       await fsPromises.writeFile(filePath, content, 'utf8');
       refactoredFilesCount++;
     }
   }
 
   // 3. Create or update .env.local
-  if (refactoredFilesCount > 0 && backendDetectedUrl) {
+  if (!isAngular && refactoredFilesCount > 0 && backendDetectedUrl) {
     const envLocalPath = path.join(frontendDir, '.env.local');
     const envEntry = `${envVarKey}=${backendDetectedUrl}\n`;
     

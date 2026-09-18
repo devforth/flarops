@@ -78,6 +78,20 @@ function writeFileIfNotExists(filePath, content, logMessage, logIfExistsMessage)
 const sensitiveRegex = SENSITIVE_REGEX;
 const dbPasswordRegex = DB_PASSWORD_REGEX;
 
+// sensitiveRegex matches on a bare substring anywhere in the key (by design -
+// see its own history), which is exactly right for AUTH_TOKEN or API_KEY but
+// also fires on any key that merely NAMES an auth-related endpoint rather
+// than holding a credential itself: KEYCLOAK_TOKEN_URI, SERVICES_AUTH_
+// SERVICE_URI, SPRING_SECURITY_OAUTH2_..._ISSUER_URI are all just addresses
+// (matching "KEY" inside "KEYCLOAK", "TOKEN", and "AUTH" inside "OAUTH2"
+// respectively) - routing them into the secrets pipeline demands a GitHub
+// secret for something that was never a secret, and leaks nothing worse than
+// an internal hostname if left in values.yaml. The variable's suffix - what
+// KIND of thing it holds - is a much more reliable signal here than whatever
+// service or protocol name happens to appear earlier in it, so a clearly
+// location-shaped suffix wins over an incidental sensitive-looking substring.
+const NON_SENSITIVE_SUFFIX_REGEX = /_(URI|URL|ENDPOINT|HOST|HOSTNAME|PATH|ADDRESS)$/i;
+
 const crypto = require('crypto');
 const generatedVarsCache = {};
 
@@ -145,7 +159,7 @@ function processEnvVariable(key, rawVal, isBackend, isFrontend, foundDbUrls, api
   const selfRef = parseSelfReferentialPlaceholder(key, rawVal);
   const val = selfRef !== undefined ? (selfRef || '') : sanitizeEnvValue(rawVal);
 
-  if (sensitiveRegex.test(key)) {
+  if (sensitiveRegex.test(key) && !NON_SENSITIVE_SUFFIX_REGEX.test(key)) {
     // Dedup by KEY alone, not the full "KEY=VALUE" line - the same secret is
     // routinely declared in more than one place with a different literal
     // value each time (e.g. a placeholder in .env vs. a "${KEY:?...}"
@@ -648,8 +662,8 @@ variable "domain" {
     return fileList;
   }
 
-  const { analyzeBackend, analyzeFrontend, analyzeAdditionalServices, extractUsedEnvVars, detectApiMigrationStep, detectApiWorkerCount } = require('../../utils/analyzer');
-  const { analyzeDatabase, analyzeBackendForDbPasswordKey, analyzeBackendForDbKeys } = require('../../utils/dbAnalyzer');
+  const { analyzeBackend, analyzeFrontend, analyzeAdditionalServices, extractUsedEnvVars, detectApiMigrationStep, detectApiWorkerCount, findRoutePortMapFromGatewayConfig } = require('../../utils/analyzer');
+  const { analyzeDatabase, analyzeBackendForDbPasswordKey, analyzeBackendForDbKeys, detectSpringDatasourceConfig } = require('../../utils/dbAnalyzer');
   const { analyzeFrontendRoutes } = require('../../utils/routeAnalyzer');
   const { refactorFrontendEnv, refactorBackendDbUrl, refactorNginxConf, refactorLowercaseEnvVars } = require('../../utils/envRefactor');
 
@@ -744,6 +758,8 @@ variable "domain" {
 
   let apiEnv = {};
   let frontendEnv = {};
+  let apiCommand = null;
+  let frontendCommand = null;
   let sensitiveEnvContent = '';
 
   for (const file of envFiles) {
@@ -860,8 +876,63 @@ variable "domain" {
       if (isBackend) composeNameToK8s[services[i].name] = 'api';
       else if (isFrontend) composeNameToK8s[services[i].name] = 'frontend';
       else if (matchedAdditionalServices.length > 0) composeNameToK8s[services[i].name] = matchedAdditionalServices[0].name;
+      else {
+        // Not an app service at all - but if its own image is a known
+        // database engine (e.g. compose's "db: image: mongo:4.2.23"), it's
+        // the project's primary database, generated as the "database"
+        // StatefulSet/Service - hostnames pointing at it (e.g. a CLI flag or
+        // env value hardcoding "mongodb://db:27017/") need the same rewrite
+        // as any other cross-service reference below.
+        const imageMatch = block.match(/^\s*image:\s*["']?([^\s"'#]+)["']?/m);
+        const img = imageMatch ? imageMatch[1].toLowerCase() : '';
+        if (dbInfo.hasDb && /postgres|mysql|mariadb|mongo/.test(img)) {
+          composeNameToK8s[services[i].name] = 'database';
+        }
+      }
 
       if (!isBackend && !isFrontend && matchedAdditionalServices.length === 0) continue;
+
+      // A service's docker-compose `command:` override supplies CLI
+      // arguments its image's ENTRYPOINT needs to actually work (e.g.
+      // `-mongoURI mongodb://db:27017/`) - some apps (particularly Go
+      // binaries using the stdlib `flag` package) take ALL of their runtime
+      // config this way instead of environment variables, invisible to every
+      // env-var-based mechanism elsewhere in this generator. Extract it here
+      // so it can be rewritten (compose hostnames -> real k8s Service names,
+      // same as env values below) and carried into the Deployment as
+      // `args:`.
+      {
+        const commandLines = block.split('\n');
+        let inCommand = false;
+        let commandIndent = 0;
+        const commandArgs = [];
+        for (const line of commandLines) {
+          if (!inCommand) {
+            const m = line.match(/^([ \t]+)command:\s*$/);
+            if (m) {
+              inCommand = true;
+              commandIndent = m[1].length;
+            }
+            continue;
+          }
+          if (line.trim() === '') continue;
+          const indentMatch = line.match(/^([ \t]*)/);
+          const lineIndent = indentMatch ? indentMatch[1].length : 0;
+          if (lineIndent <= commandIndent) break; // exit command block
+          const itemMatch = line.match(/^\s*-\s*(.+)$/);
+          if (itemMatch) {
+            const cleaned = itemMatch[1].trim().replace(/\s+#.*$/, '').trim();
+            commandArgs.push(cleaned.replace(/^["']|["']$/g, ''));
+          }
+        }
+        if (commandArgs.length > 0) {
+          if (isBackend && !apiCommand) apiCommand = commandArgs;
+          if (isFrontend && !frontendCommand) frontendCommand = commandArgs;
+          for (const s of matchedAdditionalServices) {
+            if (!s.command) s.command = commandArgs;
+          }
+        }
+      }
 
       const lines = block.split('\n');
       let inEnv = false;
@@ -918,6 +989,33 @@ variable "domain" {
               foundDbUrls[key] = { key, query };
             }
 
+            // Each additional service can declare its OWN DB connection
+            // string (e.g. several peer microservices sharing one database
+            // server but each using a differently-named database on it) -
+            // the global foundDbUrls dedup above only ever remembers the
+            // FIRST service's URL for a given key name, so every other
+            // service with the same key (very common - they all tend to call
+            // it DATABASE_URL) would otherwise get no connection info at all.
+            // Track each service's own database name independently of that
+            // dedup so its URL can be rebuilt correctly against whichever
+            // Service actually hosts it (see the "shared database" wiring
+            // loop later in this function).
+            if (dbUrlKeyRegex.test(key) && typeof matchedAdditionalServices !== 'undefined' && matchedAdditionalServices.length > 0) {
+              const cleanedVal = val.replace(/^["']|["']$/g, '').trim();
+              let ownDbName = null;
+              try {
+                const tempVal = cleanedVal.replace(/\$\{([^}]+)\}/g, 'BASH_VAR_$1');
+                const urlObj = new URL(tempVal);
+                ownDbName = urlObj.pathname ? urlObj.pathname.replace(/^\//, '') : null;
+              } catch (e) { }
+              for (const s of matchedAdditionalServices) {
+                s.dbUrlVars = s.dbUrlVars || [];
+                if (!s.dbUrlVars.some(v => v.key === key)) {
+                  s.dbUrlVars.push({ key, dbName: ownDbName });
+                }
+              }
+            }
+
             let sensitiveContext = { content: sensitiveEnvContent };
             processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext, typeof matchedAdditionalServices !== 'undefined' ? matchedAdditionalServices : []);
             sensitiveEnvContent = sensitiveContext.content;
@@ -956,6 +1054,29 @@ variable "domain" {
       rewriteComposeNames(apiEnv);
       rewriteComposeNames(frontendEnv);
       for (const s of additionalServices) rewriteComposeNames(s.env);
+
+      // Same rewrite, applied to a command's individual CLI arguments instead
+      // of an env map's values - a docker-compose `command:` override often
+      // embeds another service's compose name the exact same way an env
+      // value would (e.g. "-mongoURI", "mongodb://db:27017/").
+      const rewriteComposeNamesInList = (list) => {
+        if (!Array.isArray(list)) return list;
+        return list.map(item => {
+          let val = String(item);
+          for (const composeName of composeNamesFound) {
+            const k8sName = composeNameToK8s[composeName];
+            if (composeName === k8sName) continue;
+            const re = new RegExp('\\b' + composeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
+            val = val.replace(re, k8sName);
+          }
+          return val;
+        });
+      };
+      if (apiCommand) apiCommand = rewriteComposeNamesInList(apiCommand);
+      if (frontendCommand) frontendCommand = rewriteComposeNamesInList(frontendCommand);
+      for (const s of additionalServices) {
+        if (s.command) s.command = rewriteComposeNamesInList(s.command);
+      }
     }
   }
 
@@ -1182,7 +1303,37 @@ DOMAIN=${domain}
       console.log(`Discovered API Routes in frontend: ${apiRoutes.join(', ')}`);
     }
   }
-  
+
+  // A route prefix the frontend calls (e.g. "/webapi") can belong to a
+  // completely different backend service than the primary "api" - there's no
+  // lexical relationship between an arbitrary prefix and whichever service
+  // actually owns it, so nothing above can tell them apart. An nginx
+  // api-gateway config sitting in front of these services (a common shape in
+  // multi-backend projects) states that mapping directly via its
+  // location -> proxy_pass port. When one exists, use it to move any
+  // misattributed route off apiRoutes and onto the additionalService that
+  // actually listens on that port - otherwise the Ingress generated here
+  // would send that traffic to the wrong backend entirely.
+  if (additionalServices.length > 0 && apiRoutes.length > 0) {
+    const gatewayRoutePorts = await findRoutePortMapFromGatewayConfig(currentDir);
+    if (gatewayRoutePorts.size > 0) {
+      const stillApiRoutes = [];
+      for (const route of apiRoutes) {
+        const ownerPort = gatewayRoutePorts.get(route);
+        const ownerService = ownerPort ? additionalServices.find(s => s.ports.includes(ownerPort)) : null;
+        if (ownerService) {
+          if (!ownerService.exposedRoutes.includes(route)) {
+            ownerService.exposedRoutes.push(route);
+          }
+          console.log(`Reassigned route ${route} to ${ownerService.name} (per gateway config, port ${ownerPort})`);
+        } else {
+          stillApiRoutes.push(route);
+        }
+      }
+      apiRoutes = stillApiRoutes;
+    }
+  }
+
 
   const rawRelativeBackendPath = backendInfo.backendPath ? path.relative(currentDir, backendInfo.backendPath) || '.' : null;
   const rawRelativeFrontendPath = frontendInfo.frontendPath ? path.relative(currentDir, frontendInfo.frontendPath) || '.' : null;
@@ -1310,6 +1461,135 @@ DOMAIN=${domain}
     s.dbPasswordKey = (dbInfo.hasDb && finalDbPasswordKey && s.usedEnvVars && s.usedEnvVars.includes(finalDbPasswordKey)) ? finalDbPasswordKey : null;
   }
 
+  // A project can have more than one backend, each with its own database
+  // (e.g. a Java service on MySQL alongside a Node service on MongoDB) -
+  // analyzeDatabase() only ever resolves ONE database for the whole project
+  // (the one tied to the primary backend above), so any additional service
+  // whose database is genuinely different was left with nothing: no
+  // StatefulSet, no password, no connection info - it would crash trying to
+  // reach a database that was never provisioned.
+  for (const s of additionalServices) {
+    const serviceDb = await analyzeDatabase(currentDir, s.path);
+    const isDistinctDb = serviceDb.hasDb && (!dbInfo.hasDb || serviceDb.dbType !== dbInfo.dbType || serviceDb.image !== dbInfo.image);
+    if (!isDistinctDb) continue;
+
+    const serviceUpper = s.name.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+    let passwordKeyBase = 'DATABASE_PASSWORD';
+    let defaultUser = 'postgres';
+    if (serviceDb.dbType === 'postgres' || serviceDb.dbType === 'postgresql') { passwordKeyBase = 'POSTGRES_PASSWORD'; defaultUser = 'postgres'; }
+    else if (serviceDb.dbType === 'mysql') { passwordKeyBase = 'MYSQL_ROOT_PASSWORD'; defaultUser = 'root'; }
+    else if (serviceDb.dbType === 'mariadb') { passwordKeyBase = 'MARIADB_ROOT_PASSWORD'; defaultUser = 'root'; }
+    else if (serviceDb.dbType === 'mongodb') { passwordKeyBase = 'MONGO_INITDB_ROOT_PASSWORD'; defaultUser = 'root'; }
+    const passwordKey = `${serviceUpper}_${passwordKeyBase}`;
+    const password = crypto.randomBytes(16).toString('hex');
+
+    const existingEnvContent = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
+    if (!new RegExp('^' + passwordKey + '=', 'm').test(existingEnvContent)) {
+      fs.appendFileSync(envFile, `\n${passwordKey}="${password}"\n`);
+      console.log(`\x1b[34mINFO: Generated a database for additional service "${s.name}" (${serviceDb.dbType}) - password stored under ${passwordKey} in deploy/.env\x1b[0m`);
+    }
+    if (!envKeysToPass.includes(passwordKey)) envKeysToPass.push(passwordKey);
+    if (!s.secretKeys.includes(passwordKey)) s.secretKeys.push(passwordKey);
+
+    s.db = {
+      type: serviceDb.dbType,
+      image: serviceDb.image,
+      port: serviceDb.port,
+      user: serviceDb.dbUser || defaultUser,
+      name: serviceDb.dbName || `${s.name}db`,
+      passwordKey
+    };
+
+    const isSpring = await detectSpringDatasourceConfig(s.path);
+    if (isSpring) {
+      // Spring Boot's relaxed env-var binding picks these up automatically -
+      // no source code change needed, unlike every other framework Flarops
+      // supports.
+      const jdbcScheme = serviceDb.dbType === 'mysql' ? 'mysql' : (serviceDb.dbType === 'mariadb' ? 'mariadb' : 'postgresql');
+      s.env['SPRING_DATASOURCE_URL'] = `jdbc:${jdbcScheme}://${s.name}-db:${serviceDb.port}/${s.db.name}`;
+      s.env['SPRING_DATASOURCE_USERNAME'] = s.db.user;
+      s.springDatasourcePasswordSecretKey = passwordKey;
+    } else {
+      // Generic fallback for JS/TS services: rewrite a hardcoded connection
+      // string in the service's own source to read from an env var, the same
+      // mechanism already used for the primary backend.
+      const dbUrlRefactorResult = await refactorBackendDbUrl(s.path, true);
+      if (dbUrlRefactorResult && dbUrlRefactorResult.discoveredVars.length > 0) {
+        s.dbUrlVars = s.dbUrlVars || [];
+        for (const key of dbUrlRefactorResult.discoveredVars) {
+          if (!s.dbUrlVars.some(v => v.key === key)) s.dbUrlVars.push({ key });
+        }
+      }
+    }
+  }
+
+  // Several peer services can share ONE physical database server while each
+  // using its own differently-named database on it (e.g. three microservices
+  // all pointing DATABASE_URL at the same Mongo instance, each with its own
+  // db name) - the compose scan above already recorded each such service's
+  // own db name in s.dbUrlVars. Those services never went through the
+  // "distinct database" loop above (their db image matches the project's
+  // shared primary database), so they still need to be wired against that
+  // shared database - otherwise, same as an unwired distinct database, they'd
+  // have a DATABASE_URL-shaped variable name but no value, and fail to
+  // connect entirely.
+  if (dbInfo.hasDb) {
+    for (const s of additionalServices) {
+      if (s.db || !Array.isArray(s.dbUrlVars) || s.dbUrlVars.length === 0) continue;
+
+      s.db = {
+        type: dbInfo.dbType,
+        image: dbInfo.image,
+        port: dbInfo.port,
+        user: dbInfo.dbUser || (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql' ? 'postgres' : 'root'),
+        name: null, // each dbUrlVars entry below carries its own db name
+        passwordKey: finalDbPasswordKey,
+        shared: true
+      };
+      if (finalDbPasswordKey && !s.secretKeys.includes(finalDbPasswordKey)) {
+        s.secretKeys.push(finalDbPasswordKey);
+      }
+    }
+  }
+
+  // A service can also read its database connection as separate HOST/USER/
+  // PASSWORD/NAME env vars instead of one combined URL (e.g. process.env.
+  // DB_HOST, .DB_PASS, ...) - analyzeBackendForDbKeys already detects this
+  // exact shape for the primary backend above, but never got checked for any
+  // other service. A peer microservice sharing the project's database needs
+  // its host rewritten to the real k8s Service name and its password wired
+  // just as much as the primary backend does - skip only services that got
+  // their own dedicated database above, which are wired through their own
+  // mechanism instead.
+  if (dbInfo.hasDb) {
+    const isUpper = (k) => !!k && k === k.toUpperCase();
+    for (const s of additionalServices) {
+      if (s.db && !s.db.shared) continue;
+
+      const svcKeys = await analyzeBackendForDbKeys(s.path);
+      if (isUpper(svcKeys.hostKey) && !s.env[svcKeys.hostKey]) {
+        s.env[svcKeys.hostKey] = 'database';
+      }
+      if (isUpper(svcKeys.userKey) && !s.env[svcKeys.userKey]) {
+        s.env[svcKeys.userKey] = dbInfo.dbUser || (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql' ? 'postgres' : 'root');
+      }
+      if (isUpper(svcKeys.passwordKey) && finalDbPasswordKey) {
+        if (svcKeys.passwordKey === finalDbPasswordKey) {
+          if (!s.secretKeys.includes(finalDbPasswordKey)) s.secretKeys.push(finalDbPasswordKey);
+        } else {
+          // The app's own password env var name doesn't match the shared
+          // secret's key name - map one to the other directly instead of
+          // renaming either (a secretKeyRef's container-side name and its
+          // key in the Secret are independent).
+          s.extraSecretEnvMappings = s.extraSecretEnvMappings || [];
+          if (!s.extraSecretEnvMappings.some(m => m.envName === svcKeys.passwordKey)) {
+            s.extraSecretEnvMappings.push({ envName: svcKeys.passwordKey, secretKey: finalDbPasswordKey });
+          }
+        }
+      }
+    }
+  }
+
   // A container's env list is assembled from several independent sources
   // (the plain env map, the secretKeys list, and - for api - a dedicated
   // dbPasswordKey/dbUrlVars block), each populated by its own detection path
@@ -1359,6 +1639,8 @@ DOMAIN=${domain}
     apiWorkers,
     apiDockerfile: apiDockerfilePath,
     frontendDockerfile: frontendDockerfilePath,
+    apiCommand,
+    frontendCommand,
 
     additionalServices,
     apiSecretKeys,
@@ -1449,6 +1731,15 @@ appVersion: "1.0.0"
     for (const s of config.additionalServices) {
       s.exposedRoutes = (s.exposedRoutes || []).filter(r => !routeOwners[r] || routeOwners[r].length === 1);
     }
+    // The warning below says a conflicting path was dropped for every listed
+    // owner, including "api" when it's one of them - but api's routes are
+    // never filtered above (apiRoutes isn't an additionalServices entry), so
+    // api would otherwise silently keep serving that path while the message
+    // claims it doesn't. Strip it from apiRoutes too so the message is true
+    // and the ambiguity is actually resolved, not just half-resolved.
+    if (config.hasBackend) {
+      config.apiRoutes = config.apiRoutes.filter(r => !routeOwners[r] || routeOwners[r].length === 1);
+    }
     console.warn(`\x1b[33mWARNING: Multiple services expose the same Ingress path prefix, which would route ambiguously: ${conflictingRoutes.map(([r, owners]) => `${r} (${owners.join(', ')})`).join('; ')}. These paths were NOT added to the Ingress for the conflicting services - add explicit routing manually if you need them exposed.\x1b[0m`);
   }
 
@@ -1468,7 +1759,13 @@ ${s.secretKeys.map(k => '      - ' + k).join('\n')}
 ${s.ports.map(p => '      - ' + p).join('\n')}
     healthRoute: ${s.healthRoute ? '"' + s.healthRoute + '"' : 'null'}
     exposedRoutes: ${s.exposedRoutes && s.exposedRoutes.length > 0 ? '[' + s.exposedRoutes.map(r => '"' + r + '"').join(', ') + ']' : '[]'}
-`;
+${s.command ? `    command:\n${s.command.map(a => '      - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}${(s.db && !s.db.shared) ? `    db:
+      type: "${s.db.type}"
+      image: "${s.db.image}"
+      port: ${s.db.port}
+      user: "${s.db.user}"
+      name: "${s.db.name}"
+` : ''}`;
     }
   }
 
@@ -1496,14 +1793,14 @@ ${config.hasBackend ? `api:
 ${config.apiSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
 ${apiEnvString}
-apiPorts:
+${config.apiCommand ? `  command:\n${config.apiCommand.map(a => '    - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}apiPorts:
 ${config.apiPorts.map(p => '  - ' + p).join('\n')}` : ''}
 ${config.hasFrontend ? `frontend:
   secretKeys:
 ${config.frontendSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
 ${frontendEnvString}
-frontendPorts:
+${config.frontendCommand ? `  command:\n${config.frontendCommand.map(a => '    - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}frontendPorts:
 ${config.frontendPorts.map(p => '  - ' + p).join('\n')}` : ''}
 ${additionalServicesYaml}
 apiRoutes:
@@ -1533,7 +1830,8 @@ ${config.apiRoutes.map(p => '  - "' + p + '"').join('\n')}
   
   const genericDeploymentTemplate = require('../../templates/generic/deployment.js');
   const genericServiceTemplate = require('../../templates/generic/service.js');
-  
+  const genericDatabaseTemplate = require('../../templates/generic/database.js');
+
   const templatesToGenerate = [
     { file: path.join(helmTemplatesDir, '01-ingress.yaml'), content: ingressTemplate(config) },
     { file: path.join(helmTemplatesDir, 'secret.yaml'), content: secretTemplate() },
@@ -1551,6 +1849,9 @@ ${config.apiRoutes.map(p => '  - "' + p + '"').join('\n')}
     for (const s of config.additionalServices) {
        let serviceContent = genericServiceTemplate(s) + '\n---\n' + genericDeploymentTemplate(s);
        templatesToGenerate.push({ file: path.join(helmTemplatesDir, `${s.name}.yaml`), content: serviceContent });
+       if (s.db && !s.db.shared) {
+         templatesToGenerate.push({ file: path.join(helmTemplatesDir, `${s.name}-db.yaml`), content: genericDatabaseTemplate(s) });
+       }
     }
   }
 

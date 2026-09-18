@@ -189,7 +189,7 @@ async function checkRequirementsTxt(backendPath) {
   return null;
 }
 
-async function extractDbCredentials(baseDir, backendPath) {
+async function extractDbCredentials(baseDir, backendPath, dbType) {
   const filesToScan = [
     path.join(baseDir, '.env'),
     path.join(baseDir, '.env.example'),
@@ -204,18 +204,51 @@ async function extractDbCredentials(baseDir, backendPath) {
   let dbUser = null;
   let dbName = null;
 
-  const userRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_USER|DATABASE_USERNAME|DB_USER|DB_USERNAME|POSTGRES_USER|MYSQL_USER|MARIADB_USER|MONGO_INITDB_ROOT_USERNAME)\s*[:=]\s*["']?([^"'\s#]+|[^"']+)["']?/im;
-  const nameRegex = /^(?!\s*(?:#|\/\/))\s*(?:-\s*)?(?:DATABASE_DB|DB_NAME|DATABASE_NAME|POSTGRES_DB|MYSQL_DATABASE|MARIADB_DATABASE|MONGO_INITDB_DATABASE)\s*[:=]\s*["']?([^"'\s#]+|[^"']+)["']?/im;
+  // When the caller already knows which engine it's asking about, only match
+  // that engine's own env var names/URL scheme. A project can genuinely
+  // contain more than one database (a different one per service) - matching
+  // every engine's keys unconditionally means whichever one happens to
+  // appear first in a shared file (e.g. docker-compose.yml) wins the
+  // credentials for a completely unrelated database.
+  const perTypeUserKeys = {
+    postgres: 'POSTGRES_USER', postgresql: 'POSTGRES_USER',
+    mysql: 'MYSQL_USER', mariadb: 'MARIADB_USER',
+    mongodb: 'MONGO_INITDB_ROOT_USERNAME'
+  };
+  const perTypeNameKeys = {
+    postgres: 'POSTGRES_DB', postgresql: 'POSTGRES_DB',
+    mysql: 'MYSQL_DATABASE', mariadb: 'MARIADB_DATABASE',
+    mongodb: 'MONGO_INITDB_DATABASE'
+  };
+  const userKeys = dbType && perTypeUserKeys[dbType]
+    ? `DATABASE_USER|DATABASE_USERNAME|DB_USER|DB_USERNAME|${perTypeUserKeys[dbType]}`
+    : 'DATABASE_USER|DATABASE_USERNAME|DB_USER|DB_USERNAME|POSTGRES_USER|MYSQL_USER|MARIADB_USER|MONGO_INITDB_ROOT_USERNAME';
+  const nameKeys = dbType && perTypeNameKeys[dbType]
+    ? `DATABASE_DB|DB_NAME|DATABASE_NAME|${perTypeNameKeys[dbType]}`
+    : 'DATABASE_DB|DB_NAME|DATABASE_NAME|POSTGRES_DB|MYSQL_DATABASE|MARIADB_DATABASE|MONGO_INITDB_DATABASE';
+
+  const userRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${userKeys})\\s*[:=]\\s*["']?([^"'\\s#]+|[^"']+)["']?`, 'im');
+  const nameRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${nameKeys})\\s*[:=]\\s*["']?([^"'\\s#]+|[^"']+)["']?`, 'im');
+
+  const schemeRegexes = {
+    postgres: /postgres(?:ql)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i,
+    postgresql: /postgres(?:ql)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i,
+    mysql: /mysql:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i,
+    mariadb: /mariadb:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i,
+    mongodb: /mongodb(?:\+srv)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i
+  };
 
   for (const file of filesToScan) {
     try {
       const content = await fs.readFile(file, 'utf8');
-      
-      const urlMatch = content.match(/postgres(?:ql)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i) ||
-                       content.match(/mysql:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i) ||
-                       content.match(/mariadb:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i) ||
-                       content.match(/mongodb(?:\+srv)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i);
-      
+
+      const urlMatch = dbType && schemeRegexes[dbType]
+        ? content.match(schemeRegexes[dbType])
+        : content.match(schemeRegexes.postgres) ||
+          content.match(schemeRegexes.mysql) ||
+          content.match(schemeRegexes.mariadb) ||
+          content.match(schemeRegexes.mongodb);
+
       if (urlMatch && !dbUser && !dbName) {
         if (!/\$\{?/.test(urlMatch[1])) dbUser = urlMatch[1];
         if (!/\$\{?/.test(urlMatch[2])) dbName = urlMatch[2];
@@ -315,6 +348,112 @@ async function checkLocalDbDockerfile(baseDir) {
   return null;
 }
 
+// Parses every top-level service block under `services:` in a compose file
+// into { name, image, context, dependsOn }. This is a plain, general
+// structural parse (not tied to any particular service name), so it can
+// answer "what does service X depend on" for any service in the project -
+// which the existing name-specific helpers above (findPortsInCompose etc.)
+// can't do.
+async function parseComposeServices(baseDir) {
+  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  for (const file of composeFiles) {
+    let content;
+    try {
+      content = await fs.readFile(path.join(baseDir, file), 'utf8');
+    } catch (e) { continue; }
+
+    const servicesMatch = content.match(/^services:\s*$/m);
+    if (!servicesMatch) continue;
+    const afterServices = content.slice(servicesMatch.index + servicesMatch[0].length);
+
+    const firstServiceMatch = afterServices.match(/^([ \t]+)([a-zA-Z0-9_-]+):\s*$/m);
+    if (!firstServiceMatch) continue;
+    const indent = firstServiceMatch[1];
+
+    const serviceBlockRegex = new RegExp('^' + indent + '([a-zA-Z0-9_-]+):\\s*$([\\s\\S]*?)(?=^' + indent + '[a-zA-Z0-9_-]+:\\s*$|(?![\\s\\S]))', 'gm');
+    const services = {};
+    let m;
+    while ((m = serviceBlockRegex.exec(afterServices)) !== null) {
+      const name = m[1];
+      const block = m[2];
+      const imageMatch = block.match(/^\s*image:\s*["']?([^\s"'#]+)["']?/m);
+      const contextMatch = block.match(/context:\s*["']?([^\s"'#]+)["']?/) ||
+        block.match(/build:\s*["']?(\.[^\s"'#{][^\s"'#]*)["']?\s*$/m);
+      const dependsOn = [];
+      const dependsOnMatch = block.match(/depends_on:\s*\n((?:[ \t]*-[ \t]*[a-zA-Z0-9_-]+\s*\n?)+)/);
+      if (dependsOnMatch) {
+        const depRegex = /-\s*([a-zA-Z0-9_-]+)/g;
+        let dm;
+        while ((dm = depRegex.exec(dependsOnMatch[1])) !== null) dependsOn.push(dm[1]);
+      }
+      services[name] = {
+        name,
+        image: imageMatch ? imageMatch[1] : null,
+        context: contextMatch ? path.join(baseDir, contextMatch[1]) : null,
+        dependsOn
+      };
+    }
+    return services;
+  }
+  return {};
+}
+
+// A service's docker-compose `depends_on:` list is a direct, explicit
+// statement of which other container it needs at runtime - when one of
+// those dependencies is itself a known database image, that's a much
+// stronger and more precise signal for "this specific service's database"
+// than any generic env-var/compose-wide scan (which can only ever name ONE
+// database for the whole project, no matter how many services and databases
+// it actually contains).
+async function analyzeServiceDatabaseFromCompose(baseDir, servicePath) {
+  const services = await parseComposeServices(baseDir);
+  const resolvedServicePath = path.resolve(servicePath);
+  const owning = Object.values(services).find(s => s.context && path.resolve(s.context) === resolvedServicePath);
+  if (!owning) return null;
+
+  for (const depName of owning.dependsOn) {
+    const dep = services[depName];
+    if (!dep || !dep.image) continue;
+    const img = dep.image.toLowerCase();
+    if (img.includes('postgres')) return { hasDb: true, dbType: 'postgres', port: DB_PORTS.postgres, image: dep.image };
+    if (img.includes('mysql')) return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql, image: dep.image };
+    if (img.includes('mariadb')) return { hasDb: true, dbType: 'mariadb', port: DB_PORTS.mariadb, image: dep.image };
+    if (img.includes('mongo')) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb, image: dep.image };
+  }
+  return null;
+}
+
+// Spring Boot binds `spring.datasource.url`/`.username`/`.password` from the
+// env vars SPRING_DATASOURCE_URL/_USERNAME/_PASSWORD automatically (its
+// "relaxed binding" convention) - no source code change is needed to make it
+// pick up a different database than whatever application.properties
+// hardcodes. Detecting this lets Flarops wire a Spring service's own database
+// purely through env vars, the same way it already relies on Django's/
+// FastAPI's own conventions elsewhere.
+async function detectSpringDatasourceConfig(servicePath) {
+  if (!servicePath) return false;
+  try {
+    await fs.access(path.join(servicePath, 'pom.xml'));
+  } catch (e) {
+    try {
+      await fs.access(path.join(servicePath, 'build.gradle'));
+    } catch (e2) {
+      return false;
+    }
+  }
+
+  const files = await walkDir(servicePath);
+  for (const file of files) {
+    const base = path.basename(file);
+    if (!/^application(-\w+)?\.(properties|ya?ml)$/.test(base)) continue;
+    try {
+      const content = await fs.readFile(file, 'utf8');
+      if (/spring\.datasource\.url/.test(content)) return true;
+    } catch (e) { logDebug(e); }
+  }
+  return false;
+}
+
 async function analyzeDatabase(baseDir, backendPath) {
   let result = null;
 
@@ -333,6 +472,15 @@ async function analyzeDatabase(baseDir, backendPath) {
     if (!result) {
       const reqResult = await checkRequirementsTxt(backendPath);
       if (reqResult) result = reqResult;
+    }
+
+    // Priority 2.6: docker-compose depends_on (see
+    // analyzeServiceDatabaseFromCompose) - a precise, per-service signal,
+    // checked before the generic/project-wide fallbacks below so it doesn't
+    // get shadowed by whichever database happens to match first in those.
+    if (!result) {
+      const composeDepResult = await analyzeServiceDatabaseFromCompose(baseDir, backendPath);
+      if (composeDepResult) result = composeDepResult;
     }
   }
 
@@ -355,7 +503,7 @@ async function analyzeDatabase(baseDir, backendPath) {
   }
 
   if (result) {
-    const creds = await extractDbCredentials(baseDir, backendPath);
+    const creds = await extractDbCredentials(baseDir, backendPath, result.dbType);
     result.dbUser = creds.user;
     result.dbName = creds.name;
     const pinnedImage = await findPinnedDbImageTag(baseDir, result.dbType);
@@ -460,4 +608,4 @@ async function analyzeBackendForDbKeys(backendPath) {
   };
 }
 
-module.exports = { analyzeDatabase, analyzeBackendForDbPasswordKey, analyzeBackendForDbKeys };
+module.exports = { analyzeDatabase, analyzeBackendForDbPasswordKey, analyzeBackendForDbKeys, analyzeServiceDatabaseFromCompose, detectSpringDatasourceConfig };

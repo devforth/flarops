@@ -108,6 +108,69 @@ async function findPortsInCompose(baseDir, possibleServiceNames) {
 
 
 
+// Resolves the build context directory for a compose service matched by
+// exact name (e.g. "api"), not by substring against directory names. A repo
+// can easily contain several directories that all happen to contain "api" as
+// a substring (e.g. "javaapi" and "nodeapi") with no reliable way to rank them
+// by name alone - but the project's own docker-compose.yml already states,
+// unambiguously, which one IS "the api" service. That's a stronger signal
+// than any directory-name heuristic and should be checked first.
+async function findServiceContextFromCompose(baseDir, serviceNames) {
+  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  for (const file of composeFiles) {
+    let content;
+    try {
+      content = await fs.readFile(path.join(baseDir, file), 'utf8');
+    } catch (e) { continue; }
+
+    for (const serviceName of serviceNames) {
+      const serviceRegex = new RegExp('^([ \\t]+)' + serviceName + ':\\s*$([\\s\\S]*?)(?=^\\1[a-zA-Z0-9_-]+:\\s*$|^\\S|(?![\\s\\S]))', 'gm');
+      const match = serviceRegex.exec(content);
+      if (!match) continue;
+
+      const block = match[2];
+      const contextMatch = block.match(/context:\s*["']?([^\s"'#]+)["']?/) ||
+        block.match(/build:\s*["']?(\.[^\s"'#{][^\s"'#]*)["']?\s*$/m);
+      if (!contextMatch) continue;
+
+      const contextPath = path.join(baseDir, contextMatch[1]);
+      try {
+        const stat = await fs.stat(contextPath);
+        if (stat.isDirectory()) return contextPath;
+      } catch (e) { /* referenced context doesn't exist on disk */ }
+    }
+  }
+  return null;
+}
+
+// Reverse-proxy configs (e.g. an nginx "api gateway" container that fronts
+// several backend services) often state, unambiguously, which URL prefix
+// belongs to which backend port - `location /webapi { proxy_pass
+// http://webapi:9000; }`. That's a stronger, more direct signal for "who owns
+// this route prefix" than trying to infer it from what the frontend calls,
+// which has no way to know that two visually unrelated prefixes (e.g. "/api"
+// and "/webapi") actually belong to two entirely different backend
+// processes. Returns a Map of route prefix -> port.
+async function findRoutePortMapFromGatewayConfig(baseDir) {
+  const routePortMap = new Map();
+  try {
+    const allFiles = await walkDir(baseDir);
+    const confFiles = allFiles.filter(f => path.extname(f) === '.conf');
+    const locationRegex = /location\s+(\/[a-zA-Z0-9_\-\/]+)\/?\s*\{[^}]*?proxy_pass\s+https?:\/\/[^:\/\s]+:(\d+)/gi;
+
+    for (const filePath of confFiles) {
+      try {
+        const content = await fs.readFile(filePath, 'utf8');
+        let match;
+        while ((match = locationRegex.exec(content)) !== null) {
+          routePortMap.set(match[1], parseInt(match[2], 10));
+        }
+      } catch (e) { logDebug(e); }
+    }
+  } catch (e) { logDebug(e); }
+  return routePortMap;
+}
+
 async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort, excludeDirNames = []) {
   const regexList = [
     new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)(?:${portNamesPattern})\\s*[:=]\\s*["']?(\\d+)["']?`, 'gim'),
@@ -234,19 +297,33 @@ async function analyzeBackend(baseDir) {
   const partialDirs = ['api', 'backend', 'server', 'app'];
   let backendPath = null;
 
+  // 0. A docker-compose service literally named "api"/"backend"/"server" is
+  // ground truth for which directory the project itself considers "the"
+  // backend - check it before any directory-name guessing. Without this, two
+  // sibling directories that both happen to contain "api" as a substring
+  // (e.g. "javaapi" and "nodeapi") are indistinguishable to steps 1-2 below,
+  // which then pick whichever one readdir() happens to list first - with no
+  // relation to which one the project's own compose file calls "api".
+  const composeContext = await findServiceContextFromCompose(baseDir, exactDirs);
+  if (composeContext && await findDockerfile(composeContext)) {
+    backendPath = composeContext;
+  }
+
   // 1. Try exact match first - only accept a candidate that actually has its
   // own Dockerfile. Otherwise Flarops would generate a werf.yaml image block
   // pointing at a Dockerfile that doesn't exist (e.g. a directory literally
   // named "api" that's built by some other, non-per-service mechanism).
-  for (const dir of exactDirs) {
-    const fullPath = path.join(baseDir, dir);
-    try {
-      const stat = await fs.stat(fullPath);
-      if (stat.isDirectory() && await findDockerfile(fullPath)) {
-        backendPath = fullPath;
-        break;
-      }
-    } catch (err) { }
+  if (!backendPath) {
+    for (const dir of exactDirs) {
+      const fullPath = path.join(baseDir, dir);
+      try {
+        const stat = await fs.stat(fullPath);
+        if (stat.isDirectory() && await findDockerfile(fullPath)) {
+          backendPath = fullPath;
+          break;
+        }
+      } catch (err) { }
+    }
   }
 
   // 2. Fallback to partial match (e.g., 'kanban-app', 'my-api')
@@ -347,7 +424,14 @@ async function inferFrontendPortFromPackage(frontendPath) {
       } catch (e) { logDebug(e); }
     }
   } catch (e) { }
-  return 80;
+  // No package.json, or none of its dependencies matched a known frontend
+  // framework (e.g. a non-JS app, like a Go binary serving its own static
+  // UI) - there's no real signal here at all, so don't invent one. Returning
+  // 80 unconditionally used to make this look exactly like a confident
+  // "static frontend on nginx" detection to every caller, letting it
+  // silently outrank an actually-detected port (e.g. from docker-compose)
+  // wherever the two were merged.
+  return null;
 }
 
 async function analyzeDockerfile(frontendPath) {
@@ -475,21 +559,35 @@ async function analyzeFrontend(baseDir, backendPath = null) {
 
   const inferredPort = await inferFrontendPortFromPackage(frontendPath);
   const dockerfilePort = await analyzeDockerfile(frontendPath);
-  
+
+  // dockerfilePort/inferredPort are real, specific signals (an EXPOSE line, a
+  // recognized frontend framework's own dev-server port convention) - a
+  // fixed 80 fallback used to masquerade as one of these even when neither
+  // fired, silently outranking an actually-detected compose/env port below.
+  // Only fall back to 80 once every other signal, including the ones found
+  // further down, comes up empty.
   const primaryPort = dockerfilePort !== null ? dockerfilePort : inferredPort;
 
   const portNamesPattern = ['PORT', 'FRONTEND_PORT', 'VITE_PORT', 'REACT_APP_PORT', 'NUXT_PORT'].join('|');
-  const dirPorts = await findPortsInDir(baseDir, frontendPath, portNamesPattern, primaryPort);
+  // Passing a hardcoded 80 here as "the" default reintroduces the exact
+  // problem above one level down: findPortsInDir returns it verbatim as a
+  // "found" port whenever its own regex scan comes up empty, indistinguishable
+  // from a real detection - so it would still end up ranked ahead of a
+  // genuinely-detected compose port. Pass null instead so an empty scan stays
+  // empty; the actual fallback to 80 only happens once, below, if nothing at
+  // all was found anywhere.
+  const dirPorts = (await findPortsInDir(baseDir, frontendPath, portNamesPattern, primaryPort)).filter(p => p !== null);
   const composePorts = await findPortsInCompose(baseDir, [...exactDirs, path.basename(frontendPath)]);
 
   const dockerfile = await findDockerfile(frontendPath);
   const needsRootContext = dockerfile ? await dockerfileNeedsRootContext(baseDir, frontendPath, dockerfile) : false;
 
-  if (dirPorts.length === 1 && dirPorts[0] === primaryPort && composePorts.length > 0) {
+  if (primaryPort !== null && dirPorts.length === 1 && dirPorts[0] === primaryPort && composePorts.length > 0) {
     return { hasFrontend: true, frontendPath, ports: Array.from(new Set([primaryPort, ...composePorts])), dockerfile, needsRootContext };
   }
 
-  const ports = Array.from(new Set([primaryPort, ...dirPorts, ...composePorts]));
+  const knownPorts = [primaryPort, ...dirPorts, ...composePorts].filter(p => p !== null);
+  const ports = knownPorts.length > 0 ? Array.from(new Set(knownPorts)) : [80];
   return { hasFrontend: true, frontendPath, ports, dockerfile, needsRootContext };
 }
 
@@ -657,4 +755,4 @@ async function analyzeAdditionalServices(baseDir, knownPaths) {
   return services;
 }
 
-module.exports = { analyzeAdditionalServices, extractUsedEnvVars,  analyzeBackend, analyzeFrontend, detectApiMigrationStep, detectApiWorkerCount };
+module.exports = { analyzeAdditionalServices, extractUsedEnvVars,  analyzeBackend, analyzeFrontend, detectApiMigrationStep, detectApiWorkerCount, findRoutePortMapFromGatewayConfig };

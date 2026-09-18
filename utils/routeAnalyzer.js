@@ -143,6 +143,7 @@ async function analyzeBackendExposedRoutes(backendDir) {
   if (!backendDir) return [];
   const filesToScan = await walkDir(backendDir);
   const routeScores = {};
+  const mountScores = {};
 
   const addRoute = (route, score) => {
     const root = getRootSegment(route);
@@ -151,14 +152,42 @@ async function analyzeBackendExposedRoutes(backendDir) {
     }
   };
 
-  // Detect express: app.use('/api', ...), router.get('/users', ...)
-  // Detect Gin: r.Group("/api")
-  // Detect FastAPI: @app.get("/api")
-  const listenRouteRegex = /(?:app|router|r|server|http|mux)\.(?:use|get|post|put|delete|patch|all|Group|HandleFunc|Handle)\s*\(\s*['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
+  // A mount call (app.use('/api/interactions', router), Spring's class-level
+  // @RequestMapping) states its FULL prefix directly - unlike a method-level
+  // route handler, there's no missing information to fall back to a root
+  // segment for. Truncating it the same way addRoute does for method-level
+  // routes throws away the one thing that distinguishes it from another,
+  // unrelated service mounted under the same generic first segment (e.g.
+  // "/api/interactions" and "/api/users" both collapsing to "/api") - which
+  // then falsely looks like two services claiming the identical Ingress path,
+  // and the conflict resolution in init.js drops the "conflict" from both,
+  // leaving neither with a working route at all. Tracked separately from
+  // routeScores: once we know the real mount prefix, the method-level routes
+  // found inside whatever gets mounted there (e.g. router.get('/read', ...)
+  // inside the router mounted at /api/interactions) are almost certainly
+  // nested under it, not siblings of it - a plain "/read" Ingress rule would
+  // be actively wrong (the app only ever sees /api/interactions/read).
+  const addMountRoute = (route, score) => {
+    if (route && route !== '/') {
+      mountScores[route] = (mountScores[route] || 0) + score;
+    }
+  };
+
+  // Detect express: router.get('/users', ...); Gin: r.Group("/api");
+  // FastAPI: @app.get("/api") - a method-level (or Gin group) declaration,
+  // not a full mount path, so it still goes through the root-segment
+  // truncation above.
+  const listenRouteRegex = /(?:app|router|r|server|http|mux)\.(?:get|post|put|delete|patch|all|Group|HandleFunc|Handle)\s*\(\s*['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
+  // Express/Koa-style mounting: app.use('/api/x', subRouter) - the full path
+  // IS the mount point, not a fragment of one.
+  const mountRegex = /(?:app|router|server)\.use\s*\(\s*['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
   const pythonRouteRegex = /@(?:app|router|server)\.(?:route|get|post|put|delete|patch)\s*\(\s*['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
-  // Detect Spring (Java/Kotlin): @RequestMapping("/x"), @GetMapping(value = "/x"),
-  // at either class or method level.
-  const springRouteRegex = /@(?:RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*\(\s*(?:value\s*=\s*)?\{?\s*['"`](\/[a-zA-Z0-9_\-\/{}]+)/gm;
+  // Detect Spring (Java/Kotlin) method-level routes: @GetMapping(value = "/x"),
+  // @PostMapping("/x"), etc.
+  const springMethodRouteRegex = /@(?:GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*\(\s*(?:value\s*=\s*)?\{?\s*['"`](\/[a-zA-Z0-9_\-\/{}]+)/gm;
+  // Spring's class-level @RequestMapping("/x") is a full mount prefix, same
+  // reasoning as Express's app.use above.
+  const springMountRegex = /@RequestMapping\s*\(\s*(?:value\s*=\s*)?\{?\s*['"`](\/[a-zA-Z0-9_\-\/{}]+)/gm;
 
   for (const filePath of filesToScan) {
     if (filePath.includes('node_modules') || filePath.includes('.git') || filePath.includes('dist')) continue;
@@ -172,15 +201,25 @@ async function analyzeBackendExposedRoutes(backendDir) {
       while ((match = listenRouteRegex.exec(fileContent)) !== null) {
         addRoute(match[1], 1);
       }
+      while ((match = mountRegex.exec(fileContent)) !== null) {
+        addMountRoute(match[1], 1);
+      }
       while ((match = pythonRouteRegex.exec(fileContent)) !== null) {
         addRoute(match[1], 1);
       }
-      while ((match = springRouteRegex.exec(fileContent)) !== null) {
+      while ((match = springMethodRouteRegex.exec(fileContent)) !== null) {
         addRoute(match[1], 1);
+      }
+      while ((match = springMountRegex.exec(fileContent)) !== null) {
+        addMountRoute(match[1], 1);
       }
     } catch (e) {}
   }
-  
+
+  if (Object.keys(mountScores).length > 0) {
+    return Object.entries(mountScores).sort((a, b) => b[1] - a[1]).map(r => r[0]);
+  }
+
   const sortedRoutes = Object.entries(routeScores).sort((a, b) => b[1] - a[1]);
   return sortedRoutes.map(r => r[0]);
 }

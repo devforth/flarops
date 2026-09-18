@@ -22,6 +22,12 @@ spec:
       containers:
         - name: frontend
           image: {{ if .Values.werf }}{{ .Values.werf.image.frontend }}{{ else }}{{ .Values.images.frontend | default "frontend:latest" }}{{ end }}
+{{- if .Values.frontend.command }}
+          args:
+{{- range $arg := .Values.frontend.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
