@@ -67,6 +67,16 @@ module.exports = (service) => {
     }
   }
 
+  // The keys above are rendered straight into the manifest (their container-
+  // side names differ from the Secret keys), so they are invisible to the
+  // secretKeys list the checksum otherwise reads - name them explicitly or a
+  // rotation of one of them would not roll this pod.
+  const extraKeyList = [
+    ...(service.extraSecretEnvMappings || []).map(m => m.secretKey),
+    service.dbPasswordKey,
+    service.springDatasourcePasswordSecretKey,
+  ].filter(Boolean).map(k => JSON.stringify(k)).join(' ');
+
   return `
 apiVersion: apps/v1
 kind: Deployment
@@ -76,7 +86,7 @@ metadata:
     app: {{ .Values.projectName }}
     component: ${service.name}
 spec:
-  replicas: 1
+  replicas: {{ include "flarops.replicas" (index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}" | int)).replicas }}
   selector:
     matchLabels:
       app: {{ .Values.projectName }}
@@ -86,8 +96,14 @@ spec:
       labels:
         app: {{ .Values.projectName }}
         component: ${service.name}
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat ((index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}" | int)).secretKeys | default list) (list ${extraKeyList})) "password" ((.Values.database | default dict).password | default "")) }}
     spec:
       automountServiceAccountToken: false
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
 {{- $serviceObj := index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}" | int) }}
       containers:
         - name: ${service.name}
@@ -130,18 +146,35 @@ spec:
               memory: "512Mi"
               cpu: "1000m"
 {{- if $serviceObj.healthRoute }}
+          # A startup probe covers the (often long) boot of a JVM/runtime
+          # without forcing the liveness probe to be slack for the whole life
+          # of the pod: liveness only begins once startup has succeeded, so a
+          # slow start no longer reads as a crash, and a real hang is still
+          # caught quickly afterwards.
+          startupProbe:
+            httpGet:
+              path: {{ $serviceObj.healthRoute }}
+              port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
+            periodSeconds: 10
+            # A JVM answering its first probes while still warming up regularly
+            # needs more than the 1s default, and a probe that times out counts
+            # as a failure exactly like a 404 would.
+            timeoutSeconds: 5
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: {{ $serviceObj.healthRoute }}
-              port: {{ index $serviceObj.ports 0 | default 80 }}
-            initialDelaySeconds: 15
+              port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: {{ $serviceObj.healthRoute }}
-              port: {{ index $serviceObj.ports 0 | default 80 }}
-            initialDelaySeconds: 5
+              port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
 {{- end }}
 `.trim();
 };

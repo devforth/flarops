@@ -1,0 +1,257 @@
+{{define "login.html"}}<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Flarops — Sign in</title>
+  <link rel="icon"
+    href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ctext%20y%3D%22.9em%22%20font-size%3D%2290%22%3E%F0%9F%93%A6%3C%2Ftext%3E%3C%2Fsvg%3E">
+  <style nonce="{{.Nonce}}">
+    /* Tokens mirror the dashboard's own palette so the gate doesn't feel
+       bolted on: cold slate neutrals, brass reserved for the single action. */
+    :root {
+      --bg: #EEF0F4;
+      --surface: #FFFFFF;
+      --inset: #DDE1E9;
+      --line: rgba(20, 28, 45, .12);
+      --line-2: rgba(20, 28, 45, .22);
+      --text: #12161D;
+      --text-2: #4B5464;
+      --text-3: #79818F;
+      --brass: #8A6A16;
+      --brass-2: #A8842A;
+      --hot: #AE2F2C;
+      --hot-tint: rgba(174, 47, 44, .10);
+      --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 8px 24px -12px rgba(16, 24, 40, .28);
+      --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0D1016;
+        --surface: #161A22;
+        --inset: #0A0D12;
+        --line: rgba(255, 255, 255, .09);
+        --line-2: rgba(255, 255, 255, .17);
+        --text: #E6EAF1;
+        --text-2: #A2AAB9;
+        --text-3: #6F7787;
+        --brass: #D9A94A;
+        --brass-2: #C79A46;
+        --hot: #F0685E;
+        --hot-tint: rgba(240, 104, 94, .12);
+        --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 28px -14px rgba(0, 0, 0, .7);
+      }
+    }
+
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      height: 100%;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 14px;
+      line-height: 1.5;
+      display: grid;
+      place-items: center;
+      padding: 24px 16px;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 380px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: var(--shadow);
+      padding: 28px 26px 24px;
+    }
+
+    .mark {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin-bottom: 22px;
+    }
+
+    .mark .glyph {
+      width: 26px;
+      height: 26px;
+      border-radius: 7px;
+      background: var(--brass);
+      display: grid;
+      place-items: center;
+      font-size: 14px;
+      line-height: 1;
+    }
+
+    .mark .wordmark {
+      font-weight: 640;
+      letter-spacing: -.01em;
+      font-size: 15px;
+    }
+
+    h1 {
+      margin: 0 0 4px;
+      font-size: 18px;
+      font-weight: 620;
+      letter-spacing: -.01em;
+    }
+
+    .sub {
+      margin: 0 0 20px;
+      color: var(--text-2);
+      font-size: 13px;
+    }
+
+    .field {
+      margin-bottom: 14px;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 560;
+      color: var(--text-2);
+      margin-bottom: 6px;
+      letter-spacing: .01em;
+    }
+
+    input[type=text],
+    input[type=password] {
+      width: 100%;
+      padding: 9px 11px;
+      font: inherit;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      color: var(--text);
+      background: var(--inset);
+      border: 1px solid var(--line-2);
+      border-radius: 8px;
+      outline: none;
+      transition: border-color .12s ease, box-shadow .12s ease;
+    }
+
+    input[type=text]:focus-visible,
+    input[type=password]:focus-visible {
+      border-color: var(--brass);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--brass) 22%, transparent);
+    }
+
+    button {
+      width: 100%;
+      margin-top: 6px;
+      padding: 10px 14px;
+      font: inherit;
+      font-weight: 600;
+      font-size: 13px;
+      color: #FFF;
+      background: var(--brass);
+      border: 1px solid var(--brass);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background .12s ease;
+    }
+
+    button:hover {
+      background: var(--brass-2);
+      border-color: var(--brass-2);
+    }
+
+    button:focus-visible {
+      outline: 2px solid var(--brass);
+      outline-offset: 2px;
+    }
+
+    .error {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      margin-bottom: 18px;
+      padding: 9px 11px;
+      font-size: 12.5px;
+      color: var(--hot);
+      background: var(--hot-tint);
+      border: 1px solid color-mix(in srgb, var(--hot) 28%, transparent);
+      border-radius: 8px;
+    }
+
+    .error svg {
+      flex: none;
+      margin-top: 1px;
+    }
+
+    .foot {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      font-size: 11.5px;
+      color: var(--text-3);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+
+      input,
+      button {
+        transition: none;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main class="card">
+    <div class="mark">
+      <span class="glyph" aria-hidden="true">📦</span>
+      <span class="wordmark">Flarops</span>
+    </div>
+
+    <h1>Sign in</h1>
+    <p class="sub">This dashboard exposes your cluster's fleet, capacity and spend.</p>
+
+    {{if .Error}}
+    <div class="error" role="alert">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+        <path
+          d="M8 1.5 15 14H1L8 1.5Zm0 4.2a.7.7 0 0 0-.7.7v3a.7.7 0 0 0 1.4 0v-3a.7.7 0 0 0-.7-.7Zm0 6.6a.85.85 0 1 0 0-1.7.85.85 0 0 0 0 1.7Z" />
+      </svg>
+      <span>{{.Error}}</span>
+    </div>
+    {{end}}
+
+    <form method="POST" action="/login" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none"
+          autocorrect="off" spellcheck="false" required autofocus>
+      </div>
+
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+
+      <button type="submit">Sign in</button>
+    </form>
+
+    <p class="foot">Credentials were printed once by <span style="font-family:var(--font-mono)">flarops init</span>.</p>
+  </main>
+</body>
+
+</html>
+{{end}}

@@ -32,7 +32,27 @@ module.exports = function deployYmlTemplate(config) {
     ? config.envKeysToPass.map(k => `          SECRET_ENV_${k}: \${{ secrets.${k} }}`).join('\n') + '\n'
     : '';
 
-  const buildValuesScript = `python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"`;
+  // Registry credentials travel the same way every other secret does: through
+  // the CI-written values file, never through anything committed to git. They
+  // become the chart's imagePullSecret so private images can actually be
+  // pulled by the cluster.
+  // The registry host as Docker itself keys it in config.json - Docker Hub
+  // uses this legacy URL rather than "docker.io".
+  const registryServerForPull = config.dockerRegistry ? config.dockerRegistry.split('/')[0] : 'https://index.docker.io/v1/';
+
+  // The instance shape is carried from Terraform's own outputs rather than
+  // duplicated in values.yaml, so variables.tf stays the one place an operator
+  // edits to change what the fleet runs on.
+  //
+  // A key is OMITTED rather than written as null when its value is unknown.
+  // Helm does not treat a null in an override file as "no opinion" - it
+  // DELETES the key, so writing "aws": null removed the chart's entire aws
+  // block and the dashboard's own "{{ .Values.aws.region }}" then aborted the
+  // rendering of every object in the chart. That is not a rare path: the
+  // Terraform outputs read above do not exist in a state file written before
+  // they were added, and the PR-capsule job does not necessarily run an apply
+  // at all, so the first deploy after an upgrade hit it every time.
+  const buildValuesScript = `python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"`;
 
   // Only reference a DB password secret when this project actually has one -
   // otherwise every project (with or without a database) ends up pointing CI at
@@ -51,8 +71,15 @@ on:
 permissions:
   contents: read
 
+# Terraform state has one lock, but nothing stopped two pushes to main from
+# racing for it and failing half-applied. Serialize instead of cancelling, so
+# an in-flight apply is always allowed to finish.
+concurrency:
+  group: flarops-deploy-${config.projectName}
+  cancel-in-progress: false
+
 env:
-  AWS_REGION: us-west-2
+  AWS_REGION: ${config.awsRegion || 'us-west-2'}
   PROJECT_NAME: ${config.projectName}
   REGISTRY_USER: ${config.registryUser}
   BASE_DOMAIN: ${config.domain}
@@ -93,7 +120,16 @@ jobs:
           TF_VAR_cloudflare_zone_id: \${{ secrets.CLOUDFLARE_ZONE_ID }}` : ''}
           TF_VAR_domain: \${{ env.BASE_DOMAIN }}
         run: |
-          CURRENT_WORKERS=$(terraform state list 2>/dev/null | grep 'aws_instance.worker\\[' | wc -l || echo "0")
+          # "terraform state list | wc -l" always exits 0 - wc succeeds even
+          # when the pipeline's first command failed - so a transient backend
+          # error used to yield worker_count=0 and apply would then DESTROY
+          # every worker node. Check the state read itself before trusting it.
+          set -o pipefail
+          if ! STATE_LIST=$(terraform state list 2>&1); then
+            echo "::error::Could not read Terraform state, refusing to apply: $STATE_LIST"
+            exit 1
+          fi
+          CURRENT_WORKERS=$(printf '%s\\n' "$STATE_LIST" | grep -c 'aws_instance.worker\\[' || true)
           echo "Preserving existing $CURRENT_WORKERS worker nodes."
           terraform apply -var="worker_count=$CURRENT_WORKERS" -auto-approve
 
@@ -127,8 +163,15 @@ ${loginStep}
           kubectl get nodes
 
       - name: Deploy application with Werf
-${(secretEnvBlock || dbPasswordEnvLine) ? '        env:\n' + secretEnvBlock + dbPasswordEnvLine : ''}        run: |
+        env:
+${secretEnvBlock}${dbPasswordEnvLine}          SECRET_REGISTRY_PASSWORD: \${{ secrets.REGISTRY_PASSWORD }}
+          REGISTRY_SERVER: ${registryServerForPull}
+        run: |
           umask 077
+          # Read the instance shape back out of Terraform - the single place
+          # it is declared (deploy/terraform/variables.tf).
+          export TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
+          export TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
           ${buildValuesScript}
           werf converge \\
             --parallel-tasks-limit=3 \\

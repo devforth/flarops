@@ -122,7 +122,31 @@ function sanitizeBucketName(name) {
   return sanitized;
 }
 
-function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion) {
+// A Terraform state bucket holds the k3s join token, the deploy public key and
+// the full shape of the infrastructure. Created bare it had no versioning (a
+// bad apply or a delete is unrecoverable), no encryption at rest, and no block
+// on public access. Applied only to buckets Flarops creates itself - a bucket
+// the operator chose to reuse is theirs, and silently changing its policies
+// could affect whatever else lives in it.
+function hardenStateBucket(awsCmd, bucket, env) {
+  const steps = [
+    ['versioning', ['s3api', 'put-bucket-versioning', '--bucket', bucket, '--versioning-configuration', 'Status=Enabled']],
+    ['encryption', ['s3api', 'put-bucket-encryption', '--bucket', bucket, '--server-side-encryption-configuration',
+      '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}']],
+    ['public access block', ['s3api', 'put-public-access-block', '--bucket', bucket, '--public-access-block-configuration',
+      'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true']],
+  ];
+
+  for (const [label, args] of steps) {
+    try {
+      execFileSync(awsCmd, args, { env, stdio: 'pipe' });
+    } catch (err) {
+      console.warn(`\x1b[33mWARNING: Could not enable ${label} on the Terraform state bucket "${bucket}". Enable it manually - the state file holds cluster credentials.\x1b[0m`);
+    }
+  }
+}
+
+function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = 'us-west-2') {
   const sanitized = sanitizeBucketName(bucketName);
 
   // Pass only what the AWS CLI actually needs, instead of the full parent
@@ -156,8 +180,15 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion) {
         } else if (stderr.includes('404') || stderr.includes('Not Found')) {
           // Doesn't exist, we can create it
           try {
-            console.log(`Creating S3 bucket: ${currentBucket} in us-west-2...`);
-            execFileSync(awsCmd, ['s3api', 'create-bucket', '--bucket', currentBucket, '--region', 'us-west-2', '--create-bucket-configuration', 'LocationConstraint=us-west-2'], { env, stdio: 'pipe' });
+            console.log(`Creating S3 bucket: ${currentBucket} in ${region}...`);
+            // us-east-1 is the one region that rejects an explicit
+            // LocationConstraint, so it must be created without one.
+            const createArgs = ['s3api', 'create-bucket', '--bucket', currentBucket, '--region', region];
+            if (region !== 'us-east-1') {
+              createArgs.push('--create-bucket-configuration', `LocationConstraint=${region}`);
+            }
+            execFileSync(awsCmd, createArgs, { env, stdio: 'pipe' });
+            hardenStateBucket(awsCmd, currentBucket, env);
             resolve({ bucket: currentBucket, warning: null });
             return;
           } catch (createErr) {

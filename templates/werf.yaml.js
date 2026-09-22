@@ -1,3 +1,15 @@
+// docker-compose's build.args are build-time inputs no Kubernetes manifest
+// can supply after the fact - werf has to pass them to the Docker build, or
+// the image silently compiles with its Dockerfile's ARG defaults.
+function renderBuildArgs(args) {
+  if (!args || Object.keys(args).length === 0) return '';
+  let out = 'args:\n';
+  for (const [key, value] of Object.entries(args)) {
+    out += `  ${key}: "${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"\n`;
+  }
+  return out;
+}
+
 module.exports = function werfYmlTemplate(config) {
   let yaml = `project: ${config.projectName}
 configVersion: 1
@@ -9,14 +21,14 @@ deploy:
 image: api
 dockerfile: ${config.apiDockerfile}
 context: ${config.backendPath === '.' ? '.' : config.backendPath}
-`;
+${renderBuildArgs(config.apiBuildArgs)}`;
   }
   if (config.frontendPath) {
     yaml += `---
 image: frontend
 dockerfile: ${config.frontendDockerfile}
 context: ${config.frontendPath}
-`;
+${renderBuildArgs(config.frontendBuildArgs)}`;
   }
   if (config.dbHasLocalDockerfile) {
     yaml += `---
@@ -44,7 +56,7 @@ context: ${config.dbContext === '.' ? '.' : config.dbContext}
 image: ${s.name}
 dockerfile: ${dockerfilePath}
 context: ${context}
-`;
+${renderBuildArgs(s.buildArgs)}`;
     }
   }
 

@@ -16,10 +16,12 @@ import (
 //go:embed static/*
 var content embed.FS
 
+// A WebSocket handshake is exempt from the same-origin policy, so accepting
+// every Origin meant any page an authenticated operator happened to visit
+// could open this socket with their cookies attached and stream the entire
+// cluster state back to its author. See originIsSameHost in auth.go.
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+	CheckOrigin: originIsSameHost,
 }
 
 type Client struct {
@@ -124,6 +126,20 @@ func main() {
 	}
 	startSampleRetention()
 
+	// Loaded before anything starts listening, and fatal on failure: a
+	// dashboard that cannot authenticate must not come up at all rather than
+	// come up open. See loadAuthConfig in auth.go.
+	authCfg, err := loadAuthConfig()
+	if err != nil {
+		log.Fatal("auth: ", err)
+	}
+	auth = authCfg
+	if err := initAuthSchema(); err != nil {
+		log.Fatal("auth: failed to initialize session store: ", err)
+	}
+	startSessionPurge()
+	startLimiterCleanup()
+
 	// Fetch pricing data in the background instead of blocking startup on it -
 	// a hung or slow third-party endpoint (instances.vantage.sh) must not delay
 	// the k8s client, websocket hub, or HTTP server from coming up.
@@ -137,14 +153,27 @@ func main() {
 	go hub.run()
 	go startCollector(k8sClient)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", serveWs)
-
 	staticFS, err := fs.Sub(content, "static")
 	if err != nil {
 		log.Fatal(err)
 	}
-	mux.Handle("/", http.FileServer(http.FS(staticFS)))
+
+	mux := http.NewServeMux()
+
+	// The only two routes reachable without a session. Both are rendered from
+	// templates with a per-response CSP nonce, so neither depends on
+	// 'unsafe-inline'.
+	mux.Handle("/login", securityHeaders(http.HandlerFunc(handleLogin), nil))
+	mux.Handle("/logout", securityHeaders(http.HandlerFunc(handleLogout), nil))
+
+	// Everything else - the dashboard itself and the live metrics socket -
+	// goes through requireAuth. Registering the guard on "/" rather than on
+	// individual assets means a route added later is authenticated by
+	// default instead of accidentally public.
+	app := http.NewServeMux()
+	app.HandleFunc("/ws", serveWs)
+	app.Handle("/", http.FileServer(http.FS(staticFS)))
+	mux.Handle("/", securityHeaders(requireAuth(app), appPageCSP))
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -152,15 +181,16 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr: ":" + port,
+		Addr:    ":" + port,
 		Handler: mux,
 		// gorilla/websocket hijacks the connection on upgrade, so once /ws is
 		// streaming these server-level timeouts no longer apply to it (net/http
 		// stops managing deadlines on a hijacked connection) - they only guard
 		// the plain static-file responses and the upgrade handshake itself.
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	fmt.Printf("Dashboard running on port %s\n", port)

@@ -19,8 +19,20 @@ function logDebug(err) {
  * @param {number} currentDepth - Current recursion depth.
  * @returns {Promise<Array<string>>}
  */
-async function walkDir(dir, fileList = [], maxDepth = 10, currentDepth = 0) {
-  if (currentDepth > maxDepth) return fileList;
+// The depth cap exists to bound pathological trees, but hitting it silently
+// meant part of a deep monorepo was simply never analyzed with nothing said
+// about it - the generated chart then looked complete while missing whatever
+// lived below the cut. Warn once per run instead of only under FLAROPS_DEBUG.
+let depthLimitWarned = false;
+
+async function walkDir(dir, fileList = [], maxDepth = 16, currentDepth = 0) {
+  if (currentDepth > maxDepth) {
+    if (!depthLimitWarned) {
+      depthLimitWarned = true;
+      console.warn(`\x1b[33mWARNING: Directory tree deeper than ${maxDepth} levels at "${dir}" - anything below that level was not analyzed.\x1b[0m`);
+    }
+    return fileList;
+  }
 
   try {
     const files = await fs.readdir(dir);

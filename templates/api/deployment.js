@@ -1,4 +1,32 @@
 module.exports = (config) => {
+  // A shared credential whose env var name on the primary backend doesn't
+  // match the canonical secret key it was generated under - the container-
+  // side name and the Secret's own key are independent, exactly like
+  // generic/deployment.js's extraSecretEnvMappings.
+  let extraSecretEnvBlock = '';
+  if (Array.isArray(config.apiExtraSecretEnvMappings)) {
+    for (const mapping of config.apiExtraSecretEnvMappings) {
+      extraSecretEnvBlock += `
+            - name: ${mapping.envName}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: ${mapping.secretKey}`;
+    }
+  }
+  const hasExtraSecretEnv = extraSecretEnvBlock.length > 0;
+  // The keys above are rendered straight into the manifest (their container-
+  // side names differ from the Secret keys), so they are invisible to the
+  // secretKeys list the checksum otherwise reads - name them explicitly or a
+  // rotation of one of them would not roll this pod.
+  const quoteKeys = (keys) => keys.filter(Boolean).map(k => JSON.stringify(k)).join(' ');
+  const apiExtraKeyList = quoteKeys([
+    ...(config.apiExtraSecretEnvMappings || []).map(m => m.secretKey),
+    config.dbPasswordKey,
+  ]);
+
+
+
   let dbUrlEnvBlock = '';
   if (config.dbUrlVars && config.dbUrlVars.length > 0 && config.dbType) {
     let scheme = 'postgres';
@@ -53,7 +81,7 @@ module.exports = (config) => {
                   key: {{ "${config.dbPasswordKey}" }}` : '';
 
   const envBlock = `
-{{- if or .Values.api.env .Values.api.secretKeys ${hasDbPassword ? 'true' : 'false'} ${hasCustomEnv ? 'true' : 'false'} }}
+{{- if or .Values.api.env .Values.api.secretKeys ${hasDbPassword ? 'true' : 'false'} ${hasCustomEnv ? 'true' : 'false'} ${hasExtraSecretEnv ? 'true' : 'false'} }}
           env:
 {{- if .Values.api.env }}
 {{- range $key, $value := .Values.api.env }}
@@ -70,7 +98,7 @@ module.exports = (config) => {
                   key: {{ $key }}
 {{- end }}
 {{- end }}
-${dbPasswordBlock}${dbUrlEnvBlock}
+${dbPasswordBlock}${dbUrlEnvBlock}${extraSecretEnvBlock}
 {{- end }}`;
 
   // A prestart/migration step (e.g. `alembic upgrade head` + seeding the
@@ -126,7 +154,7 @@ metadata:
     app: {{ .Values.projectName }}
     component: api
 spec:
-  replicas: 1
+  replicas: {{ include "flarops.replicas" .Values.api.replicas }}
   selector:
     matchLabels:
       app: {{ .Values.projectName }}
@@ -136,8 +164,14 @@ spec:
       labels:
         app: {{ .Values.projectName }}
         component: api
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.api.secretKeys | default list) (list ${apiExtraKeyList})) "password" ((.Values.database | default dict).password | default "")) }}
     spec:
       automountServiceAccountToken: false
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
 ${prestartInitContainer}
       containers:
         - name: api
@@ -157,18 +191,35 @@ ${envBlock}
               memory: "${apiMemoryLimitMi}Mi"
               cpu: "1000m"
 {{- if .Values.api.healthRoute }}
+          # A startup probe covers the (often long) boot of a JVM/runtime
+          # without forcing the liveness probe to be slack for the whole life
+          # of the pod: liveness only begins once startup has succeeded, so a
+          # slow start no longer reads as a crash, and a real hang is still
+          # caught quickly afterwards.
+          startupProbe:
+            httpGet:
+              path: {{ .Values.api.healthRoute }}
+              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+            periodSeconds: 10
+            # A JVM answering its first probes while still warming up regularly
+            # needs more than the 1s default, and a probe that times out counts
+            # as a failure exactly like a 404 would.
+            timeoutSeconds: 5
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: {{ .Values.api.healthRoute }}
-              port: {{ index .Values.apiPorts 0 | default 3000 }}
-            initialDelaySeconds: 15
+              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: {{ .Values.api.healthRoute }}
-              port: {{ index .Values.apiPorts 0 | default 3000 }}
-            initialDelaySeconds: 5
+              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
 {{- end }}
 `.trim();
 };

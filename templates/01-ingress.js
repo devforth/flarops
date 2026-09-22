@@ -31,6 +31,7 @@ spec:
 {{- if .Values.additionalServices }}
 {{- range $service := .Values.additionalServices }}
 {{- if $service.exposedRoutes }}
+{{- if $service.exposeDirectly }}
 {{- range $route := $service.exposedRoutes }}
           - path: {{ $route }}
             pathType: Prefix
@@ -39,6 +40,7 @@ spec:
                 name: {{ $service.name }}
                 port:
                   number: {{ index $service.ports 0 | default 80 }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

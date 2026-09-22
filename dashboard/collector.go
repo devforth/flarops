@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 	"sort"
-	
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,14 +65,38 @@ func startCollector(k8s *K8sClient) {
 }
 
 func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, error) {
+	// No hardcoded fallback: the chart always passes DOMAIN, and inventing
+	// someone else's domain here only produced capsule URLs that pointed at a
+	// completely unrelated deployment.
 	baseDomain := os.Getenv("DOMAIN")
-	if baseDomain == "" {
-		baseDomain = "devtracklify.com" // fallback
-	}
 
+	// Region, instance type and root volume size all come from the same values
+	// the infrastructure was actually provisioned with (see
+	// templates/dashboard.yaml.js) rather than from constants matching one
+	// particular project.
 	defaultRegion := os.Getenv("AWS_REGION")
 	if defaultRegion == "" {
-		defaultRegion = "eu-central-1"
+		defaultRegion = "us-west-2"
+	}
+
+	// Both of these describe the shape of the infrastructure, which is
+	// declared exactly once in deploy/terraform/variables.tf and handed to the
+	// chart from Terraform's own outputs at deploy time. Carrying a default
+	// here would be a third copy of that fact, and the one nobody thinks to
+	// update - so an empty value stays empty and the cost simply comes out
+	// without that component, rather than confidently priced against a machine
+	// nobody is running. It is only ever a fallback in the first place: a real
+	// node reports its own type through the instance-type label below.
+	defaultInstanceType := os.Getenv("FLAROPS_DEFAULT_INSTANCE_TYPE")
+
+	ebsGB := 0.0
+	if v := os.Getenv("FLAROPS_EBS_GB"); v != "" {
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed > 0 {
+			ebsGB = parsed
+		}
+	}
+	if defaultInstanceType == "" || ebsGB == 0 {
+		log.Println("collector: FLAROPS_DEFAULT_INSTANCE_TYPE/FLAROPS_EBS_GB not set - CI normally fills these from the Terraform outputs; fleet cost will be missing those components")
 	}
 
 	dashboardDomain := "dashboard." + baseDomain
@@ -157,7 +181,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 			}
 		}
 
-		instanceType := "t3a.medium"
+		instanceType := defaultInstanceType
 		if t, ok := n.Labels["flarops.com/instance-type"]; ok && t != "" {
 			instanceType = t
 		} else if t, ok := n.Labels["node.kubernetes.io/instance-type"]; ok && t != "k3s" {
@@ -168,7 +192,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 			region = r
 		}
 		ec2Rate := getEC2HourlyRate(instanceType, region)
-		ebsRate := (40.0 * 0.08) / 730.0
+		ebsRate := (ebsGB * 0.08) / 730.0
 		eipRate := 0.005 / float64(len(nodes))
 		hourlyRate := ec2Rate + ebsRate + eipRate
 
@@ -345,8 +369,8 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 
 	// Add other AWS costs (EIP and EBS)
 	eipCostPerHour := 0.005 // 1 EIP attached to server
-	// Assuming 40GB root volume for each host: (40GB * 0.08) / 730 hours
-	ebsCostPerHour := float64(len(data.Hosts)) * (40.0 * 0.08) / 730.0
+	// Root volume size per host comes from FLAROPS_EBS_GB: (GB * 0.08) / 730 hours
+	ebsCostPerHour := float64(len(data.Hosts)) * (ebsGB * 0.08) / 730.0
 	
 	// The runRate we accumulated from h.Rate ALREADY includes EC2 + EIP + EBS
 	// We calculate Breakdown by subtracting what we know.

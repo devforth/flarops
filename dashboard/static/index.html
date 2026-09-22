@@ -311,6 +311,33 @@
       padding-bottom: 10px;
     }
 
+    /* Sign out lives in the caption strip rather than the fleet bar: that bar
+       is rebuilt from scratch on every websocket frame, so a control placed
+       there would be torn down and recreated a few times a second. */
+    .signout {
+      color: var(--text-3);
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      transition: color .12s ease, border-color .12s ease;
+    }
+
+    .signout:hover {
+      color: var(--brass);
+      border-bottom-color: var(--brass);
+    }
+
+    .signout:focus-visible {
+      outline: 2px solid var(--brass);
+      outline-offset: 2px;
+      border-radius: 2px;
+    }
+
+    @media (prefers-reduced-motion:reduce) {
+      .signout {
+        transition: none;
+      }
+    }
+
     .board {
       display: grid;
       gap: 18px;
@@ -1499,7 +1526,7 @@
 
 
     <div class="board-cap"><span style="flex:1">Fleet dashboard</span><span
-        id="board-host-name">status.mydomain.com</span><span style="flex:1;text-align:right"> · live</span></div>
+        id="board-host-name">status.mydomain.com</span><span style="flex:1;text-align:right"> · live · <a class="signout" href="/logout">Sign out</a></span></div>
     <div class="board" data-render="board">
       <div class="loading-state">
         <img src="loader.gif" alt="Loading..." style="width: 84px; height: 84px; border-radius: 8px;">

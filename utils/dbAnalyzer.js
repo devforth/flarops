@@ -189,6 +189,136 @@ async function checkRequirementsTxt(backendPath) {
   return null;
 }
 
+// Dependency manifests for every ecosystem other than npm/pip. Without these,
+// a Java, Go, Ruby, PHP, .NET or modern-Python (pyproject.toml) service had no
+// first-party signal for its database at all and fell through to the
+// project-wide compose/env scan - which can only ever name ONE database for
+// the whole repo, no matter how many services and engines it actually has.
+const DEPENDENCY_MANIFEST_MARKERS = [
+  { file: 'pyproject.toml', rules: [
+    [/psycopg|asyncpg|sqlalchemy/i, 'postgres'],
+    [/pymysql|mysqlclient|aiomysql/i, 'mysql'],
+    [/pymongo|motor|mongoengine|beanie/i, 'mongodb'],
+  ]},
+  { file: 'pom.xml', rules: [
+    [/postgresql/i, 'postgres'],
+    [/mariadb-java-client/i, 'mariadb'],
+    [/mysql-connector|mysql:mysql/i, 'mysql'],
+    [/mongodb-driver|data-mongodb/i, 'mongodb'],
+  ]},
+  { file: 'build.gradle', rules: [
+    [/postgresql/i, 'postgres'],
+    [/mariadb-java-client/i, 'mariadb'],
+    [/mysql-connector|mysql:mysql/i, 'mysql'],
+    [/mongodb-driver|data-mongodb/i, 'mongodb'],
+  ]},
+  { file: 'build.gradle.kts', rules: [
+    [/postgresql/i, 'postgres'],
+    [/mysql-connector/i, 'mysql'],
+    [/mongodb-driver|data-mongodb/i, 'mongodb'],
+  ]},
+  { file: 'go.mod', rules: [
+    [/lib\/pq|jackc\/pgx/i, 'postgres'],
+    [/go-sql-driver\/mysql/i, 'mysql'],
+    [/mongo-driver|mgo\.v2/i, 'mongodb'],
+  ]},
+  { file: 'Gemfile', rules: [
+    [/^\s*gem\s+['"]pg['"]/im, 'postgres'],
+    [/^\s*gem\s+['"]mysql2['"]/im, 'mysql'],
+    [/^\s*gem\s+['"]mongoid['"]|^\s*gem\s+['"]mongo['"]/im, 'mongodb'],
+  ]},
+  { file: 'composer.json', rules: [
+    [/pdo_pgsql|ext-pgsql/i, 'postgres'],
+    [/pdo_mysql|ext-mysqli/i, 'mysql'],
+    [/mongodb\/mongodb|ext-mongodb/i, 'mongodb'],
+  ]},
+];
+
+async function checkDependencyManifests(backendPath) {
+  for (const manifest of DEPENDENCY_MANIFEST_MARKERS) {
+    let content;
+    try {
+      content = await fs.readFile(path.join(backendPath, manifest.file), 'utf8');
+    } catch (e) { continue; }
+    for (const [pattern, dbType] of manifest.rules) {
+      if (pattern.test(content)) {
+        return { hasDb: true, dbType, port: DB_PORTS[dbType] };
+      }
+    }
+  }
+
+  // .NET project files are named after the project, so they have to be
+  // discovered rather than looked up by a fixed name.
+  try {
+    const entries = await fs.readdir(backendPath);
+    for (const entry of entries) {
+      if (!entry.endsWith('.csproj') && !entry.endsWith('.fsproj')) continue;
+      const content = await fs.readFile(path.join(backendPath, entry), 'utf8');
+      if (/Npgsql/i.test(content)) return { hasDb: true, dbType: 'postgres', port: DB_PORTS.postgres };
+      if (/MySql\.Data|Pomelo\.EntityFrameworkCore\.MySql/i.test(content)) return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql };
+      if (/MongoDB\.Driver/i.test(content)) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
+    }
+  } catch (e) { logDebug(e); }
+
+  return null;
+}
+
+// Example/template files (and documentation comments) are full of stand-in
+// values - "<database>", "your-user", "changeme". Taking one as real config
+// produces a database the application can never reach, so treat these the
+// same as an unresolved ${...} reference: not a usable value.
+function isUsableValue(value) {
+  if (!value) return false;
+  const v = String(value).trim();
+  if (!v) return false;
+  if (/\$\{?/.test(v)) return false;                 // unresolved reference
+  if (/^<.*>$/.test(v)) return false;                // <database>, <user>
+  if (/^(changeme|change_me|todo|tbd|xxx+|\.\.\.)$/i.test(v)) return false;
+  if (/^(your|my|some|example|placeholder|replace)[-_]/i.test(v)) return false;
+  return true;
+}
+
+// Credentials for ONE specific compose database service, read from that
+// service's own block.
+//
+// extractDbCredentials below scans docker-compose.yml as a flat blob and
+// takes the first match in the file. In a project running several databases
+// that is simply whichever service was listed first: a microservice's own
+// Postgres was created with POSTGRES_DB set to an unrelated component's
+// database name, so the StatefulSet initialised a database the application
+// never connects to and the pod failed on startup against a schema that did
+// not exist. When the caller knows exactly which compose service backs this
+// database - which it does whenever depends_on named it - read the block
+// that actually describes it.
+async function extractCredentialsFromComposeService(baseDir, composeServiceName, dbType) {
+  if (!composeServiceName) return { user: null, name: null };
+  const services = await parseComposeServices(baseDir);
+  const svc = services[composeServiceName];
+  if (!svc || !svc.block) return { user: null, name: null };
+
+  const perTypeUserKeys = {
+    postgres: 'POSTGRES_USER', postgresql: 'POSTGRES_USER',
+    mysql: 'MYSQL_USER', mariadb: 'MARIADB_USER',
+    mongodb: 'MONGO_INITDB_ROOT_USERNAME'
+  };
+  const perTypeNameKeys = {
+    postgres: 'POSTGRES_DB', postgresql: 'POSTGRES_DB',
+    mysql: 'MYSQL_DATABASE', mariadb: 'MARIADB_DATABASE',
+    mongodb: 'MONGO_INITDB_DATABASE'
+  };
+
+  const read = (keyName) => {
+    if (!keyName) return null;
+    const m = svc.block.match(new RegExp(`^(?!\\s*#)\\s*(?:-\\s*)?${keyName}\\s*[:=]\\s*["']?([^"'\\s#]+)["']?`, 'im'));
+    return m && isUsableValue(m[1]) ? m[1] : null;
+  };
+
+  return {
+    user: read(perTypeUserKeys[dbType]) || read('DB_USER') || read('DATABASE_USER'),
+    name: read(perTypeNameKeys[dbType]) || read('DB_NAME') || read('DATABASE_NAME'),
+  };
+}
+
 async function extractDbCredentials(baseDir, backendPath, dbType) {
   const filesToScan = [
     path.join(baseDir, '.env'),
@@ -230,17 +360,32 @@ async function extractDbCredentials(baseDir, backendPath, dbType) {
   const userRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${userKeys})\\s*[:=]\\s*["']?([^"'\\s#]+|[^"']+)["']?`, 'im');
   const nameRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${nameKeys})\\s*[:=]\\s*["']?([^"'\\s#]+|[^"']+)["']?`, 'im');
 
+  // Every character class here excludes whitespace on purpose. With "[^@]*"
+  // the match could run past the end of its own line hunting for an "@"
+  // somewhere else in the file, so a credential-less URL like
+  // "jdbc:postgresql://keycloak-postgres:5432/keycloak" paired its HOST with
+  // an unrelated "@" further down and reported the host as the database user.
   const schemeRegexes = {
-    postgres: /postgres(?:ql)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i,
-    postgresql: /postgres(?:ql)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i,
-    mysql: /mysql:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i,
-    mariadb: /mariadb:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i,
-    mongodb: /mongodb(?:\+srv)?:\/\/([^:]+):[^@]*@[^\/]+\/([^?\s]+)/i
+    postgres: /postgres(?:ql)?:\/\/([^:\/\s@]+):[^@\s]*@[^\/\s]+\/([^?\s]+)/i,
+    postgresql: /postgres(?:ql)?:\/\/([^:\/\s@]+):[^@\s]*@[^\/\s]+\/([^?\s]+)/i,
+    mysql: /mysql:\/\/([^:\/\s@]+):[^@\s]*@[^\/\s]+\/([^?\s]+)/i,
+    mariadb: /mariadb:\/\/([^:\/\s@]+):[^@\s]*@[^\/\s]+\/([^?\s]+)/i,
+    mongodb: /mongodb(?:\+srv)?:\/\/([^:\/\s@]+):[^@\s]*@[^\/\s]+\/([^?\s]+)/i
   };
 
   for (const file of filesToScan) {
     try {
-      const content = await fs.readFile(file, 'utf8');
+      const rawContent = await fs.readFile(file, 'utf8');
+
+      // The userRegex/nameRegex below already refuse commented-out lines, but
+      // the URL match did not - so a documentation comment like
+      // "# mongodb://<user>:<password>@<host>:<port>/<database>" was read as
+      // real credentials and "<database>" became the database name. Strip
+      // whole-line comments before matching anything.
+      const content = rawContent
+        .split('\n')
+        .filter(line => !/^\s*(?:#|\/\/)/.test(line))
+        .join('\n');
 
       const urlMatch = dbType && schemeRegexes[dbType]
         ? content.match(schemeRegexes[dbType])
@@ -250,19 +395,19 @@ async function extractDbCredentials(baseDir, backendPath, dbType) {
           content.match(schemeRegexes.mongodb);
 
       if (urlMatch && !dbUser && !dbName) {
-        if (!/\$\{?/.test(urlMatch[1])) dbUser = urlMatch[1];
-        if (!/\$\{?/.test(urlMatch[2])) dbName = urlMatch[2];
+        if (isUsableValue(urlMatch[1])) dbUser = urlMatch[1];
+        if (isUsableValue(urlMatch[2])) dbName = urlMatch[2];
         if (dbUser && dbName) return { user: dbUser, name: dbName };
       }
 
       if (!dbUser) {
         const userMatch = content.match(userRegex);
-        if (userMatch && !/\$\{?/.test(userMatch[1])) dbUser = userMatch[1].trim();
+        if (userMatch && isUsableValue(userMatch[1])) dbUser = userMatch[1].trim();
       }
 
       if (!dbName) {
         const nameMatch = content.match(nameRegex);
-        if (nameMatch && !/\$\{?/.test(nameMatch[1])) dbName = nameMatch[1].trim();
+        if (nameMatch && isUsableValue(nameMatch[1])) dbName = nameMatch[1].trim();
       }
 
       if (dbUser && dbName) {
@@ -272,6 +417,66 @@ async function extractDbCredentials(baseDir, backendPath, dbType) {
   }
 
   return { user: dbUser, name: dbName };
+}
+
+// Maps a docker-compose image reference to the database engine it runs, or
+// null when it isn't a database at all.
+function composeImageDbType(image) {
+  if (!image) return null;
+  const img = String(image).toLowerCase();
+  if (/postgres/.test(img)) return 'postgres';
+  if (/mariadb/.test(img)) return 'mariadb';
+  if (/mysql/.test(img)) return 'mysql';
+  if (/mongo/.test(img)) return 'mongodb';
+  return null;
+}
+
+// Which compose database service, if any, may serve as the PROJECT'S primary
+// database - the one Flarops generates as the shared "database" StatefulSet.
+//
+// The old project-wide fallback simply took the first database image anywhere
+// in docker-compose.yml, which in any multi-service repo is a coin flip: a
+// microservice stack routinely runs several databases, and the first one
+// listed is as likely to be an infrastructure component's private store
+// (Keycloak's own schema, SonarQube's, a metrics backend's) as it is to be
+// the application's. Picking that one produces a primary database named after
+// somebody else's internals, and every service that really does share a
+// database then gets pointed at it.
+//
+// depends_on states ownership explicitly: a database another service declares
+// a dependency on is THAT service's database, not the project's - unless the
+// service declaring it is the backend itself. A database nothing depends on
+// has no stated owner and stays a valid project-wide candidate.
+async function findComposeDatabaseCandidates(baseDir, backendPath) {
+  const services = await parseComposeServices(baseDir);
+  const names = Object.keys(services);
+  if (names.length === 0) return null;
+
+  const dbServices = names.filter(n => composeImageDbType(services[n].image));
+  if (dbServices.length === 0) return null;
+
+  const ownersOf = {};
+  for (const n of names) {
+    for (const dep of services[n].dependsOn || []) {
+      if (dbServices.includes(dep)) {
+        if (!ownersOf[dep]) ownersOf[dep] = [];
+        ownersOf[dep].push(n);
+      }
+    }
+  }
+
+  const resolvedBackend = backendPath ? path.resolve(backendPath) : null;
+  const backendService = resolvedBackend
+    ? names.find(n => services[n].context && path.resolve(services[n].context) === resolvedBackend)
+    : null;
+
+  // Prefer a database the backend itself depends on; otherwise accept only
+  // databases with no stated owner at all.
+  const backendOwned = dbServices.filter(d => backendService && (ownersOf[d] || []).includes(backendService));
+  const unowned = dbServices.filter(d => (ownersOf[d] || []).length === 0);
+  const available = backendOwned.length > 0 ? backendOwned : unowned;
+
+  return { services, dbServices, available, backendService, ownersOf };
 }
 
 async function checkDockerCompose(baseDir) {
@@ -354,6 +559,47 @@ async function checkLocalDbDockerfile(baseDir) {
 // answer "what does service X depend on" for any service in the project -
 // which the existing name-specific helpers above (findPortsInCompose etc.)
 // can't do.
+// Pulls the service names out of a compose service's depends_on block,
+// accepting both the short list form ("- name") and the long map form
+// ("name:" followed by an indented "condition:"). The block ends at the first
+// line indented no deeper than depends_on itself.
+function extractDependsOn(block) {
+  const lines = block.split('\n');
+  const deps = [];
+  let blockIndent = null;
+
+  for (const line of lines) {
+    if (blockIndent === null) {
+      const start = line.match(/^(\s*)depends_on:\s*(.*)$/);
+      if (!start) continue;
+      blockIndent = start[1].length;
+      // Inline flow sequence: depends_on: [a, b]
+      const inline = start[2].trim();
+      if (inline.startsWith('[')) {
+        for (const part of inline.replace(/^\[|\]$/g, '').split(',')) {
+          const name = part.trim().replace(/^["']|["']$/g, '');
+          if (/^[a-zA-Z0-9_.-]+$/.test(name)) deps.push(name);
+        }
+        break;
+      }
+      continue;
+    }
+
+    if (line.trim() === '' || /^\s*#/.test(line)) continue;
+    const indent = line.match(/^(\s*)/)[1].length;
+    if (indent <= blockIndent) break; // dedented out of the depends_on block
+
+    const listItem = line.match(/^\s*-\s*["']?([a-zA-Z0-9_.-]+)["']?\s*$/);
+    if (listItem) { deps.push(listItem[1]); continue; }
+
+    // Map form: only the direct children of depends_on are service names -
+    // anything deeper is that entry's own "condition:"/"restart:" settings.
+    const mapKey = line.match(/^(\s*)["']?([a-zA-Z0-9_.-]+)["']?:\s*$/);
+    if (mapKey && mapKey[1].length === blockIndent + 2) deps.push(mapKey[2]);
+  }
+  return deps;
+}
+
 async function parseComposeServices(baseDir) {
   const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
   for (const file of composeFiles) {
@@ -379,18 +625,23 @@ async function parseComposeServices(baseDir) {
       const imageMatch = block.match(/^\s*image:\s*["']?([^\s"'#]+)["']?/m);
       const contextMatch = block.match(/context:\s*["']?([^\s"'#]+)["']?/) ||
         block.match(/build:\s*["']?(\.[^\s"'#{][^\s"'#]*)["']?\s*$/m);
-      const dependsOn = [];
-      const dependsOnMatch = block.match(/depends_on:\s*\n((?:[ \t]*-[ \t]*[a-zA-Z0-9_-]+\s*\n?)+)/);
-      if (dependsOnMatch) {
-        const depRegex = /-\s*([a-zA-Z0-9_-]+)/g;
-        let dm;
-        while ((dm = depRegex.exec(dependsOnMatch[1])) !== null) dependsOn.push(dm[1]);
-      }
+      // depends_on has two spellings and only the short one was handled. The
+      // long form -
+      //   depends_on:
+      //     order-postgres:
+      //       condition: service_healthy
+      // - is what any compose file using healthchecks writes, and it was
+      // parsed as no dependencies at all. Everything keyed off depends_on
+      // (which service owns which database, above all) silently saw an empty
+      // graph for exactly the projects that describe themselves most
+      // carefully. Read the block by indentation and accept both spellings.
+      const dependsOn = extractDependsOn(block);
       services[name] = {
         name,
         image: imageMatch ? imageMatch[1] : null,
         context: contextMatch ? path.join(baseDir, contextMatch[1]) : null,
-        dependsOn
+        dependsOn,
+        block
       };
     }
     return services;
@@ -414,11 +665,11 @@ async function analyzeServiceDatabaseFromCompose(baseDir, servicePath) {
   for (const depName of owning.dependsOn) {
     const dep = services[depName];
     if (!dep || !dep.image) continue;
-    const img = dep.image.toLowerCase();
-    if (img.includes('postgres')) return { hasDb: true, dbType: 'postgres', port: DB_PORTS.postgres, image: dep.image };
-    if (img.includes('mysql')) return { hasDb: true, dbType: 'mysql', port: DB_PORTS.mysql, image: dep.image };
-    if (img.includes('mariadb')) return { hasDb: true, dbType: 'mariadb', port: DB_PORTS.mariadb, image: dep.image };
-    if (img.includes('mongo')) return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb, image: dep.image };
+    // composeServiceName lets the caller rewrite hostnames that point at this
+    // exact compose service (e.g. "order-postgres") to the dedicated
+    // StatefulSet generated for it, instead of to the shared "database".
+    const dbType = composeImageDbType(dep.image);
+    if (dbType) return { hasDb: true, dbType, port: DB_PORTS[dbType], image: dep.image, composeServiceName: depName };
   }
   return null;
 }
@@ -430,6 +681,28 @@ async function analyzeServiceDatabaseFromCompose(baseDir, servicePath) {
 // hardcodes. Detecting this lets Flarops wire a Spring service's own database
 // purely through env vars, the same way it already relies on Django's/
 // FastAPI's own conventions elsewhere.
+// Does this YAML declare the given key path? Written by indentation rather
+// than with a parser, because these files routinely contain "${VAR}"
+// placeholders and profile separators a strict parser rejects. A dotted key
+// ("spring.datasource.url: ...") carries its own path and is handled too.
+function yamlHasKeyPath(content, wanted) {
+  const stack = [];
+  for (const rawLine of content.split('\n')) {
+    if (rawLine.trim() === '' || /^\s*#/.test(rawLine)) continue;
+    const m = rawLine.match(/^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)\s*:\s*(.*)$/);
+    if (!m) continue;
+    const indent = m[1].length;
+    while (stack.length > 0 && stack[stack.length - 1].indent >= indent) stack.pop();
+    const parts = [...stack.map(e => e.key), ...m[2].split('.')];
+    if (parts.length >= wanted.length &&
+        wanted.every((seg, i) => parts[parts.length - wanted.length + i].toLowerCase() === seg)) {
+      return true;
+    }
+    if (m[3].trim() === '') stack.push({ indent, key: m[2] });
+  }
+  return false;
+}
+
 async function detectSpringDatasourceConfig(servicePath) {
   if (!servicePath) return false;
   try {
@@ -448,7 +721,52 @@ async function detectSpringDatasourceConfig(servicePath) {
     if (!/^application(-\w+)?\.(properties|ya?ml)$/.test(base)) continue;
     try {
       const content = await fs.readFile(file, 'utf8');
+      // Both spellings count. Only the flat one was recognised, so any Spring
+      // service writing the ordinary nested YAML -
+      //   spring:
+      //     datasource:
+      //       url: ...
+      // - was treated as "not a Spring datasource service" and never had its
+      // URL, username and password wired to the database Flarops generated
+      // for it. The StatefulSet came up with a generated password while the
+      // application went on authenticating with whatever the unresolved
+      // placeholder held.
       if (/spring\.datasource\.url/.test(content)) return true;
+      if (yamlHasKeyPath(content, ['spring', 'datasource', 'url'])) return true;
+    } catch (e) { logDebug(e); }
+  }
+  return false;
+}
+
+// The Mongo counterpart of detectSpringDatasourceConfig. Spring Boot binds
+// SPRING_DATA_MONGODB_URI from the environment by the same relaxed-binding
+// convention, so a Mongo-backed service can be pointed at the database
+// Flarops generated for it purely through env - but nothing looked for it,
+// so those services kept whatever connection string docker-compose held:
+// a container that no longer exists, with credentials that were never the
+// ones the generated StatefulSet was initialised with.
+async function detectSpringDataMongoConfig(servicePath) {
+  if (!servicePath) return false;
+  let isJava = true;
+  try {
+    await fs.access(path.join(servicePath, 'pom.xml'));
+  } catch (e) {
+    try {
+      await fs.access(path.join(servicePath, 'build.gradle'));
+    } catch (e2) {
+      isJava = false;
+    }
+  }
+  if (!isJava) return false;
+
+  const files = await walkDir(servicePath);
+  for (const file of files) {
+    const base = path.basename(file);
+    if (!/^application(-\w+)?\.(properties|ya?ml)$/.test(base)) continue;
+    try {
+      const content = await fs.readFile(file, 'utf8');
+      if (/spring\.data\.mongodb\.(uri|host|database)/.test(content)) return true;
+      if (yamlHasKeyPath(content, ['spring', 'data', 'mongodb'])) return true;
     } catch (e) { logDebug(e); }
   }
   return false;
@@ -474,6 +792,13 @@ async function analyzeDatabase(baseDir, backendPath) {
       if (reqResult) result = reqResult;
     }
 
+    // Priority 2.55: every other ecosystem's dependency manifest (pyproject,
+    // pom.xml, build.gradle, go.mod, Gemfile, composer.json, *.csproj).
+    if (!result) {
+      const manifestResult = await checkDependencyManifests(backendPath);
+      if (manifestResult) result = manifestResult;
+    }
+
     // Priority 2.6: docker-compose depends_on (see
     // analyzeServiceDatabaseFromCompose) - a precise, per-service signal,
     // checked before the generic/project-wide fallbacks below so it doesn't
@@ -496,16 +821,57 @@ async function analyzeDatabase(baseDir, backendPath) {
     if (envExampleResult) result = envExampleResult;
   }
 
-  // Priority 5: docker-compose.yml
+  // Priority 5: docker-compose.yml. Constrained by depends_on ownership (see
+  // findComposeDatabaseCandidates): when every database in the compose file
+  // already belongs to some other service, the project has no shared primary
+  // database and inventing one from a stranger's store is worse than
+  // reporting none - the services that own those databases each get their own
+  // through analyzeServiceDatabaseFromCompose instead.
+  let composeCandidates = null;
   if (!result) {
-    const composeResult = await checkDockerCompose(baseDir);
-    if (composeResult) result = composeResult;
+    composeCandidates = await findComposeDatabaseCandidates(baseDir, backendPath);
+    if (composeCandidates && composeCandidates.dbServices.length > 0 && composeCandidates.available.length === 0) {
+      return { hasDb: false };
+    }
+    if (composeCandidates && composeCandidates.available.length > 0) {
+      const chosen = composeCandidates.available[0];
+      const dbType = composeImageDbType(composeCandidates.services[chosen].image);
+      result = {
+        hasDb: true,
+        dbType,
+        port: DB_PORTS[dbType],
+        image: composeCandidates.services[chosen].image,
+        composeServiceName: chosen,
+      };
+    } else {
+      const composeResult = await checkDockerCompose(baseDir);
+      if (composeResult) result = composeResult;
+    }
   }
 
   if (result) {
+    // init.js needs to know WHICH compose service became the primary database,
+    // so it can rewrite hostnames pointing at that one service (and only that
+    // one) to the generated "database" Service.
+    if (!result.composeServiceName) {
+      const candidates = composeCandidates || await findComposeDatabaseCandidates(baseDir, backendPath);
+      if (candidates) {
+        const sameEngine = (candidates.available.length > 0 ? candidates.available : candidates.dbServices)
+          .filter(n => composeImageDbType(candidates.services[n].image) === result.dbType);
+        if (sameEngine.length === 1) result.composeServiceName = sameEngine[0];
+        else if (sameEngine.length > 1 && candidates.backendService) {
+          const owned = sameEngine.find(n => (candidates.ownersOf[n] || []).includes(candidates.backendService));
+          if (owned) result.composeServiceName = owned;
+        }
+      }
+    }
+
+    const ownCreds = await extractCredentialsFromComposeService(baseDir, result.composeServiceName, result.dbType);
     const creds = await extractDbCredentials(baseDir, backendPath, result.dbType);
-    result.dbUser = creds.user;
-    result.dbName = creds.name;
+    // The owning service's own block wins; the project-wide scan only fills
+    // in what that block did not state.
+    result.dbUser = ownCreds.user || creds.user;
+    result.dbName = ownCreds.name || creds.name;
     const pinnedImage = await findPinnedDbImageTag(baseDir, result.dbType);
     result.image = pinnedImage || await getLatestDbImage(result.dbType);
     
@@ -583,7 +949,26 @@ async function analyzeBackendForDbKeys(backendPath) {
       while ((match = envVarRegex.exec(content)) !== null) {
         processKey(match[1]);
       }
-      
+
+      // Spring (and anything else using the same placeholder syntax) reads its
+      // database connection straight out of a config FILE - there is no
+      // System.getenv call anywhere in the Java source for the scan above to
+      // find. Without this, a Spring backend reported no database keys at all,
+      // so nothing wired DB_HOST/DB_PORT/DB_NAME/DB_USER into its container:
+      // the pod came up with a password and no address to use it against.
+      //
+      // Restricted to SCREAMING_SNAKE names so Spring's own property
+      // references (${spring.datasource.url}) aren't mistaken for environment
+      // variables.
+      const base = path.basename(file);
+      if (/^(application|bootstrap)(-[\w.]+)?\.(ya?ml|properties)$/.test(base)) {
+        const springPlaceholderRegex = /\$\{\s*([A-Z][A-Z0-9_]*)\s*(?::[^}]*)?\}/g;
+        let springMatch;
+        while ((springMatch = springPlaceholderRegex.exec(content)) !== null) {
+          processKey(springMatch[1]);
+        }
+      }
+
       let destructureMatch;
       while ((destructureMatch = destructureRegex.exec(content)) !== null) {
         const keys = destructureMatch[1].split(',').map(k => k.split(':')[0].split('=')[0].trim()).filter(k => k);
@@ -608,4 +993,4 @@ async function analyzeBackendForDbKeys(backendPath) {
   };
 }
 
-module.exports = { analyzeDatabase, analyzeBackendForDbPasswordKey, analyzeBackendForDbKeys, analyzeServiceDatabaseFromCompose, detectSpringDatasourceConfig };
+module.exports = { analyzeDatabase, analyzeBackendForDbPasswordKey, analyzeBackendForDbKeys, analyzeServiceDatabaseFromCompose, detectSpringDatasourceConfig, detectSpringDataMongoConfig, findComposeDatabaseCandidates, composeImageDbType, parseComposeServices };

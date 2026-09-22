@@ -12,6 +12,8 @@ function getPostgresMajorVersion(image) {
 // MySQL alongside a Node service on MongoDB) - mirrors
 // templates/database/deployment.js, but named after and scoped to this one
 // service instead of being the project's single shared "database".
+const { renderProbes } = require('../database/deployment.js');
+
 module.exports = (service) => {
   const db = service.db;
   const resourceName = `${service.name}-db`;
@@ -76,6 +78,9 @@ metadata:
     app: {{ .Values.projectName }}
     component: ${resourceName}
 spec:
+  # A normal ClusterIP, for the reasons set out in templates/database/service.js:
+  # clusterIP is immutable, and a headless Service resolves to nothing at all
+  # while its pod is unready.
   selector:
     app: {{ .Values.projectName }}
     component: ${resourceName}
@@ -93,7 +98,7 @@ metadata:
     component: ${resourceName}
 spec:
   serviceName: ${resourceName}
-  replicas: 1
+  replicas: {{ include "flarops.replicas" $svcDb.replicas }}
   selector:
     matchLabels:
       app: {{ .Values.projectName }}
@@ -103,7 +108,13 @@ spec:
       labels:
         app: {{ .Values.projectName }}
         component: ${resourceName}
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "password" ((.Values.database | default dict).password | default "")) }}
     spec:
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
       containers:
         - name: db
           image: {{ $svcDb.image }}
@@ -113,7 +124,7 @@ spec:
               drop: ["NET_RAW"]
             seccompProfile:
               type: RuntimeDefault
-          env:${envBlock}
+          env:${envBlock}${renderProbes(db.type, db.image)}
           resources:
             requests:
               memory: "256Mi"
@@ -131,6 +142,6 @@ spec:
         accessModes: [ "ReadWriteOnce" ]
         resources:
           requests:
-            storage: 10Gi
+            storage: {{ $svcDb.storage | default "10Gi" }}
 `.trim();
 };
