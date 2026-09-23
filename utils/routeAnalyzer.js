@@ -38,6 +38,15 @@ async function analyzeFrontendRoutes(frontendDir) {
   // CRA simple string proxy
   const craProxyRegex = /"proxy"\s*:\s*"https?:\/\/[^\/]+(\/[a-zA-Z0-9_\-\/]+)/gim;
 
+  // RTK Query and the same shape in other data layers. Endpoints are declared
+  // as a "query"/"queryFn"/"url" that RETURNS the path rather than calling
+  // fetch with it, so none of the call-site patterns above ever see it - a
+  // createApi frontend looked like it talked to nothing at all. Covers both
+  // the arrow-returning-template form, "query: (id) => `/students/${id}`",
+  // and the object form, "query: () => ({ url: '/courses' })".
+  const rtkQueryRegex = /(?:query|queryFn)\s*:\s*(?:\([^)]*\)|[A-Za-z0-9_$]+)\s*=>\s*\(?\s*(?:\{[^}]*?url\s*:\s*)?['"`](\/[a-zA-Z0-9_\-\/]+)/gims;
+  const rtkUrlRegex = /\burl\s*:\s*['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
+
   // Variable assignment with URL concatenation
   const varConcatRegex = /[A-Z0-9_]*(?:URL|API)[A-Z0-9_]*\s*=\s*(?:[a-zA-Z0-9_.]+\s*\+\s*)?['"`](\/[a-zA-Z0-9_\-\/]+)/gim;
   
@@ -67,6 +76,12 @@ async function analyzeFrontendRoutes(frontendDir) {
         }
         while ((match = baseUrlRegex.exec(content)) !== null) {
           addRoute(match[1], 5); // Base URL config has high confidence
+        }
+        while ((match = rtkQueryRegex.exec(content)) !== null) {
+          addRoute(match[1], 5); // An endpoint declaration names a real path
+        }
+        while ((match = rtkUrlRegex.exec(content)) !== null) {
+          addRoute(match[1], 3);
         }
       }
 

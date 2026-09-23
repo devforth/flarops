@@ -115,6 +115,16 @@ spec:
       imagePullSecrets:
         - name: {{ .Values.projectName }}-registry
 {{- end }}
+{{- if .Values.dataNodeSelector }}
+      # Pinned because the volume is. k3s's default local-path StorageClass
+      # writes to one node's disk and its PersistentVolume carries node
+      # affinity, so a database pod that moves can never reach its data again.
+      # Only the stateful workloads carry this - everything else is left to the
+      # scheduler, so a capsule can use room spread across the fleet instead of
+      # demanding that one node hold all of it.
+      nodeSelector:
+{{ toYaml .Values.dataNodeSelector | indent 8 }}
+{{- end }}
       containers:
         - name: db
           image: {{ $svcDb.image }}
@@ -125,13 +135,13 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           env:${envBlock}${renderProbes(db.type, db.image)}
-          resources:
-            requests:
-              memory: "256Mi"
-              cpu: "200m"
-            limits:
-              memory: "1024Mi"
-              cpu: "500m"
+          # No resource requests or limits are set here on purpose. A generated
+          # figure is a guess about someone else's workload, and the two ways it
+          # can be wrong are both bad: too low and the pod is OOM-killed or
+          # throttled under load, too high and the scheduler reserves capacity
+          # nothing uses, which is exactly the capacity the capsule placement
+          # maths is trying to account for. Set them per service in
+          # deploy/helm/values.yaml when the real numbers are known.
           volumeMounts:
             - name: data
               mountPath: ${volumeMountPath}

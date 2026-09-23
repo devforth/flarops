@@ -227,13 +227,10 @@ ${hasVolumes ? `  strategy:
             - containerPort: {{ $port }}
 {{- end }}
 {{- end }}
-          resources:
-            requests:
-              memory: "128Mi"
-              cpu: "50m"
-            limits:
-              memory: {{ $svc.memoryLimit | default "1Gi" | quote }}
-              cpu: "1000m"${(volumeMounts || configVolumeMounts) ? `
+          # No resource requests or limits are set here on purpose - see the
+          # note in templates/api/deployment.js. A third-party image's real
+          # appetite is even less knowable than a first-party service's.
+${(volumeMounts || configVolumeMounts) ? `
           volumeMounts:${volumeMounts}${configVolumeMounts}` : ''}${(volumes || configVolumes) ? `
       volumes:${volumes}${configVolumes}` : ''}
 `.trim();

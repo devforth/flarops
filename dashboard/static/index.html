@@ -699,6 +699,15 @@
       color: var(--text-3)
     }
 
+    /* The kubelet's reserve: present on the bar but visibly not available,
+       so the gap between installed and usable memory is legible rather than
+       being mistaken for free space. */
+    .seg.reserved {
+      background: repeating-linear-gradient(135deg,
+          var(--stroke) 0 6px, transparent 6px 12px);
+      opacity: .75;
+    }
+
     .seg.free {
       background: transparent;
       box-shadow: inset 0 0 0 1px var(--line-2);
@@ -1608,6 +1617,27 @@
     /* CPU ceiling = hyperthreads × 100 (developer note 3) */
     const cpuCap = h => h.cores * h.threads * 100;
     const threadsOf = h => h.cores * h.threads;
+    /* Memory the kubelet holds back and will never give to a pod:
+       system-reserved + kube-reserved + the eviction threshold. It is a floor
+       that must stay free, not a budget that gets spent. */
+    const reservedOf = h => Math.max(0, (h.ramTotal || 0) - (h.ramAllocatable || 0));
+
+    /* What a NEW capsule can actually take here. The smaller of what is
+       physically unused once the reserve is kept back, and what the kubelet
+       still has left to hand out. Counting raw free memory offered that floor
+       out as usable, which is how a node got filled past the point where
+       eviction starts. Mirrors FreeForSchedulingMiB in dashboard/capacity.go -
+       the page and the capacity oracle must not disagree about what fits. */
+    const freeForScheduling = h => {
+      if (!h.ramTotal || !h.ramAllocatable) return 0;
+      const podsUsed = (h.capsules || []).reduce((s, c) => s + c.ram, 0);
+      const physical = (h.ramTotal - h.ramUsed) - reservedOf(h);
+      const schedulable = h.ramAllocatable - podsUsed;
+      return Math.max(0, Math.min(physical, schedulable));
+    };
+
+    /* Used as a share of what is actually available to pods, not of the
+       machine's raw size - the reserve is never going to be free. */
     const hostRam = h => pct(h.ramUsed, h.ramTotal);
     const hostCpu = h => pct(h.cpuUsed, cpuCap(h));
     const hostSwap = h => pct(h.swapUsed, h.swapTotal);
@@ -1630,11 +1660,23 @@
 
     const freeOf = h => h.ramTotal - h.ramUsed;
     const roomiest = () => HOSTS.length > 0 ? HOSTS.reduce((best, h) => freeOf(h) > freeOf(best) ? h : best, HOSTS[0]) : { ramTotal: 0, ramUsed: 0 };
-    const placeable = req => req <= freeOf(roomiest());
+
+    /* A capsule's footprint is not the figure it currently reports. It grows
+       after start, the kubelet keeps its own reserves, and page cache is
+       charged to the pod - so planning against the raw number packs hosts to
+       the point where the next capsule cannot actually land. Every placement
+       decision below is made against the size a capsule really occupies:
+       what it uses, plus this margin. */
+    const CAPSULE_HEADROOM = 0.15;
+    /* Never returns 0: it is a divisor, and a fleet reporting no memory at all
+       would otherwise make "fits" infinite. */
+    const effectiveSize = ram => Math.max(1, Math.ceil(ram * (1 + CAPSULE_HEADROOM)));
+
+    const placeable = req => effectiveSize(req) <= freeOf(roomiest());
 
     /* ------------------------------------------------------------------ fragments */
     function urlLink(c) {
-      return '<a href="https://' + c.host + '" target="_blank" rel="noopener">' +
+      return '<a href="https://' + esc(c.host) + '" target="_blank" rel="noopener">' +
         esc(c.host) + '<svg class="ic"><use href="#i-ext"/></svg></a>';
     }
     function ageChip(c) {
@@ -1791,8 +1833,18 @@
 
     function allocBar(h) {
       const sys = h.ramUsed - h.capsules.reduce((s, c) => s + c.ram, 0);
-      const free = h.ramTotal - h.ramUsed;
-      const fits = Math.floor(free / BIGGEST_CAP);
+      const reserved = reservedOf(h);
+      /* Shown as its own segment so the gap between "3.8G total" and what can
+         actually be used is visible, instead of appearing as memory that
+         mysteriously refuses to be allocated. */
+      const free = freeForScheduling(h);
+      /* Whatever the three segments do not account for - the reserve already
+         covered by real system usage. Keeps the bar summing to ramTotal. */
+      const unlabelled = Math.max(0, h.ramTotal - h.capsules.reduce((s, c) => s + c.ram, 0) - Math.max(0, sys) - reserved - free);
+      /* How many MORE capsules the size of the largest one running would fit,
+         each counted at its true footprint rather than its reported size. */
+      const slotSize = effectiveSize(BIGGEST_CAP);
+      const fits = Math.floor(free / slotSize);
       const w = mib => (mib / h.ramTotal * 100).toFixed(2) + "%";
 
       const segs = h.capsules.map(c =>
@@ -1805,14 +1857,21 @@
         '<div class="seg sys" style="width:' + w(sys) + '" title="system + page cache · ' + szT(sys) + '">' +
         /* below ~5% there is no room for a legible label; the tooltip carries it */
         (sys / h.ramTotal >= 0.05 ? '<span class="sv">system usage</span>' : "") + "</div>" +
+        (unlabelled > 0 ? '<div class="seg sys" style="width:' + w(unlabelled) + '" title="unallocated · ' + szT(unlabelled) + '"></div>' : "") +
+        (reserved > 0
+          ? '<div class="seg reserved" style="width:' + w(reserved) + '" title="reserved for the kubelet and OS · ' + szT(reserved) +
+            " · never available to a capsule" + '">' +
+            (reserved / h.ramTotal >= 0.05 ? '<span class="sv">reserved</span>' : "") + "</div>"
+          : "") +
         '<div class="seg free" style="width:' + w(free) + '" title="' + szT(free) +
-        " free · largest running capsule is " + sz(BIGGEST_CAP) + '">' +
+        " schedulable · largest running capsule is " + sz(BIGGEST_CAP) + ", planned at " + sz(slotSize) +
+        " with " + Math.round(CAPSULE_HEADROOM * 100) + "% headroom" + '">' +
         '<span class="sn">' + sz(free) + ' free</span><span class="sv">' +
         (fits > 0 ? "fits " + fits + " more" : "no room for another") + "</span></div>";
 
       return '<div class="alloc"><div class="alloc-l"><span>Memory allocation · ' +
         exact(sz(h.ramTotal) + " total", szT(h.ramTotal) + " installed") + "</span><span>" +
-        hostRam(h) + "% used · " + exact(sz(free) + " free", szT(free) + " free") +
+        hostRam(h) + "% used · " + exact(sz(free) + " free", szT(free) + " schedulable, after " + szT(reserved) + " reserved") +
         '</span></div><div class="stack">' + segs + "</div></div>";
     }
 
@@ -1881,7 +1940,7 @@
       root.innerHTML =
         '<div class="fleetbar"><h2>Fleet</h2>' +
         '<span class="live"><span class="dot"></span>live</span>' +
-        '<a class="host" href="https://' + FLEET.domain + '">' + FLEET.domain + "</a>" +
+        '<a class="host" href="https://' + esc(FLEET.domain) + '">' + esc(FLEET.domain) + "</a>" +
         '<span class="sep"></span>' +
         '<span class="lbl">' + FLEET.slotsUsed + " active hosts</span>" +
         '<span class="sep"></span>' +

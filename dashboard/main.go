@@ -153,6 +153,11 @@ func main() {
 	go hub.run()
 	go startCollector(k8sClient)
 
+	// Loopback only, and never behind the Ingress: reachable solely from
+	// inside this pod, which is what "kubectl exec" gives the CI job. See
+	// capacity.go.
+	startCapacityServer()
+
 	staticFS, err := fs.Sub(content, "static")
 	if err != nil {
 		log.Fatal(err)

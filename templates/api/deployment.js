@@ -114,15 +114,6 @@ ${dbPasswordBlock}${dbUrlEnvBlock}${extraSecretEnvBlock}
   // exists first and skips instead of hard-failing - a wrong guess should
   // behave like this feature was never detected, not permanently block the
   // whole deployment from ever starting.
-  // Each extra worker is a full copy of the process - scale memory with the
-  // count so multi-worker images (uvicorn/gunicorn `--workers N`) don't get
-  // OOMKilled against a limit sized for a single process. workers=1 keeps the
-  // original hardcoded 256Mi/512Mi exactly, so single-process images are
-  // unaffected.
-  const apiWorkers = Math.max(1, config.apiWorkers || 1);
-  const apiMemoryRequestMi = Math.max(256, apiWorkers * 128);
-  const apiMemoryLimitMi = Math.max(512, apiWorkers * 200);
-
   // Some apps (notably Go binaries using the stdlib `flag` package) take
   // essential runtime config exclusively via CLI arguments, invisible to
   // every env-var-based mechanism above - docker-compose's own `command:`
@@ -183,13 +174,13 @@ ${prestartInitContainer}
             seccompProfile:
               type: RuntimeDefault
 ${envBlock}
-          resources:
-            requests:
-              memory: "${apiMemoryRequestMi}Mi"
-              cpu: "300m"
-            limits:
-              memory: "${apiMemoryLimitMi}Mi"
-              cpu: "1000m"
+          # No resource requests or limits are set here on purpose. A generated
+          # figure is a guess about someone else's workload, and the two ways it
+          # can be wrong are both bad: too low and the pod is OOM-killed or
+          # throttled under load, too high and the scheduler reserves capacity
+          # nothing uses, which is exactly the capacity the capsule placement
+          # maths is trying to account for. Set them per service in
+          # deploy/helm/values.yaml when the real numbers are known.
 {{- if .Values.api.healthRoute }}
           # A startup probe covers the (often long) boot of a JVM/runtime
           # without forcing the liveness probe to be slack for the whole life

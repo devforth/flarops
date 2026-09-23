@@ -30,20 +30,37 @@ type CapsuleState struct {
 }
 
 type HostState struct {
-	ID        string         `json:"id"`
-	Region    string         `json:"region"`
-	Type      string         `json:"type"`
-	Cores     int            `json:"cores"`
-	Threads   int            `json:"threads"`
-	RamTotal  int            `json:"ramTotal"`
-	RamUsed   int            `json:"ramUsed"`
-	SwapTotal int            `json:"swapTotal"`
-	SwapUsed  int            `json:"swapUsed"`
-	DiskTotal int            `json:"diskTotal"`
-	DiskUsed  int            `json:"diskUsed"`
-	CpuUsed   int            `json:"cpuUsed"`
-	Rate      float64        `json:"rate"`
-	Capsules  []CapsuleState `json:"capsules"`
+	ID string `json:"id"`
+	// Whether this node can actually take a new pod right now. A node that is
+	// cordoned, NotReady, or tainted NoSchedule still reports its full
+	// capacity, and once drained it reports almost no usage - which made it
+	// look like the EMPTIEST node in the fleet and therefore the best target.
+	Schedulable bool `json:"schedulable"`
+	// False when metrics-server has no entry for this node. Usage then reads
+	// as zero, which is indistinguishable from an idle node and equally
+	// attractive to the placement logic - so it has to be tracked, not
+	// guessed.
+	MetricsKnown bool   `json:"metricsKnown"`
+	Region       string `json:"region"`
+	Type         string `json:"type"`
+	Cores        int    `json:"cores"`
+	Threads      int    `json:"threads"`
+	RamTotal     int    `json:"ramTotal"`
+	// What the kubelet will actually hand to pods: capacity minus
+	// system-reserved, kube-reserved and the eviction threshold. On the nodes
+	// Flarops provisions that is ~612Mi below capacity (256Mi + 256Mi set in
+	// user_data, plus the default 100Mi hard eviction threshold). Planning
+	// against capacity promised memory the scheduler will never give, and a
+	// capsule placed into that gap pushes the node into eviction.
+	RamAllocatable int            `json:"ramAllocatable"`
+	RamUsed        int            `json:"ramUsed"`
+	SwapTotal      int            `json:"swapTotal"`
+	SwapUsed       int            `json:"swapUsed"`
+	DiskTotal      int            `json:"diskTotal"`
+	DiskUsed       int            `json:"diskUsed"`
+	CpuUsed        int            `json:"cpuUsed"`
+	Rate           float64        `json:"rate"`
+	Capsules       []CapsuleState `json:"capsules"`
 }
 
 type FleetState struct {
@@ -53,22 +70,22 @@ type FleetState struct {
 }
 
 type SpendState struct {
-	Mtd        float64   `json:"mtd"`
-	PrevSame   float64   `json:"prevSame"`
-	RunRate    float64   `json:"runRate"`
-	Projected  float64   `json:"projected"`
-	MonthLabel string    `json:"monthLabel"`
-	PrevLabel  string    `json:"prevLabel"`
-	Days       []int     `json:"days"`
-	Cur        []float64 `json:"cur"`
-	Prev       []float64 `json:"prev"`
+	Mtd        float64            `json:"mtd"`
+	PrevSame   float64            `json:"prevSame"`
+	RunRate    float64            `json:"runRate"`
+	Projected  float64            `json:"projected"`
+	MonthLabel string             `json:"monthLabel"`
+	PrevLabel  string             `json:"prevLabel"`
+	Days       []int              `json:"days"`
+	Cur        []float64          `json:"cur"`
+	Prev       []float64          `json:"prev"`
 	DeltaPct   float64            `json:"deltaPct"`
 	Breakdown  map[string]float64 `json:"breakdown"`
 }
 
 type DashboardData struct {
-	Fleet FleetState    `json:"FLEET"`
-	Hosts []HostState   `json:"HOSTS"`
-	Queue []CapsuleState`json:"QUEUE"`
-	Spend SpendState    `json:"SPEND"`
+	Fleet FleetState     `json:"FLEET"`
+	Hosts []HostState    `json:"HOSTS"`
+	Queue []CapsuleState `json:"QUEUE"`
+	Spend SpendState     `json:"SPEND"`
 }

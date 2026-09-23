@@ -51,6 +51,9 @@ func startCollector(k8s *K8sClient) {
 				hub.broadcast <- lastData
 			}
 		} else {
+			// The capacity oracle reports this exact view rather than querying
+			// Kubernetes again, so it and the dashboard can never disagree.
+			publishSnapshot(data)
 			b, marshalErr := json.Marshal(data)
 			if marshalErr != nil {
 				log.Println("error marshaling data:", marshalErr)
@@ -147,7 +150,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 				Cpu int
 				Ram int
 			}{
-				Cpu: int(cm.Usage.Cpu().MilliValue() / 10), // approximate percentage of a core * 10? wait. 1 core = 1000m. CPU is in %. 1 core = 100%. So millicores / 10 = %.
+				Cpu: int(cm.Usage.Cpu().MilliValue() / 10),          // approximate percentage of a core * 10? wait. 1 core = 1000m. CPU is in %. 1 core = 100%. So millicores / 10 = %.
 				Ram: int(cm.Usage.Memory().Value() / (1024 * 1024)), // MiB
 			}
 		}
@@ -170,14 +173,36 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	hostMap := make(map[string]*HostState)
 	for _, n := range nodes {
 		ramTotal := int(n.Status.Capacity.Memory().Value() / (1024 * 1024))
+		ramAllocatable := int(n.Status.Allocatable.Memory().Value() / (1024 * 1024))
 		cpuCores := int(n.Status.Capacity.Cpu().Value())
 
 		ramUsed := 0
 		cpuUsed := 0
+		metricsKnown := false
 		for _, nm := range nodeMetrics {
 			if nm.Name == n.Name {
 				ramUsed = int(nm.Usage.Memory().Value() / (1024 * 1024))
 				cpuUsed = int(nm.Usage.Cpu().MilliValue() / 10)
+				metricsKnown = true
+			}
+		}
+
+		// Ready, uncordoned, and carrying no NoSchedule taint. All three are
+		// invisible in capacity figures alone: a node being drained by the
+		// PR-capsule scale-down job reports its full memory and almost no
+		// usage right up until it is deleted.
+		ready := false
+		for _, cond := range n.Status.Conditions {
+			if cond.Type == corev1.NodeReady {
+				ready = cond.Status == corev1.ConditionTrue
+				break
+			}
+		}
+		schedulable := ready && !n.Spec.Unschedulable
+		for _, taint := range n.Spec.Taints {
+			if taint.Effect == corev1.TaintEffectNoSchedule || taint.Effect == corev1.TaintEffectNoExecute {
+				schedulable = false
+				break
 			}
 		}
 
@@ -208,20 +233,23 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		}
 
 		h := &HostState{
-			ID:        n.Name,
-			Region:    region,
-			Type:      instanceType,
-			Cores:     cpuCores,
-			Threads:   1, // K8s reports vCPUs as cores.
-			RamTotal:  ramTotal,
-			RamUsed:   ramUsed,
-			SwapTotal: 0,
-			SwapUsed:  0,
-			DiskTotal: diskTotal,
-			DiskUsed:  diskUsed,
-			CpuUsed:   cpuUsed,
-			Rate:      hourlyRate,
-			Capsules:  []CapsuleState{},
+			ID:             n.Name,
+			Schedulable:    schedulable,
+			MetricsKnown:   metricsKnown,
+			Region:         region,
+			Type:           instanceType,
+			Cores:          cpuCores,
+			Threads:        1, // K8s reports vCPUs as cores.
+			RamTotal:       ramTotal,
+			RamAllocatable: ramAllocatable,
+			RamUsed:        ramUsed,
+			SwapTotal:      0,
+			SwapUsed:       0,
+			DiskTotal:      diskTotal,
+			DiskUsed:       diskUsed,
+			CpuUsed:        cpuUsed,
+			Rate:           hourlyRate,
+			Capsules:       []CapsuleState{},
 		}
 		hostMap[n.Name] = h
 	}
@@ -371,7 +399,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	eipCostPerHour := 0.005 // 1 EIP attached to server
 	// Root volume size per host comes from FLAROPS_EBS_GB: (GB * 0.08) / 730 hours
 	ebsCostPerHour := float64(len(data.Hosts)) * (ebsGB * 0.08) / 730.0
-	
+
 	// The runRate we accumulated from h.Rate ALREADY includes EC2 + EIP + EBS
 	// We calculate Breakdown by subtracting what we know.
 	eipRunRate := eipCostPerHour * 24.0
@@ -386,10 +414,10 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	}
 
 	data.Spend.RunRate = runRate * 24.0
-	
+
 	data.Spend.Breakdown = map[string]float64{
-		"AWS Elastic IP":    eipRunRate,
-		"AWS EBS Volumes":   ebsRunRate,
+		"AWS Elastic IP":  eipRunRate,
+		"AWS EBS Volumes": ebsRunRate,
 	}
 
 	instancesEipRunRate := (eipRunRate / float64(len(data.Hosts)))
@@ -397,7 +425,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 
 	for k, v := range ec2CostPerType {
 		count := float64(ec2CountPerType[k])
-		data.Spend.Breakdown[k] = v - count*(instancesEipRunRate + instancesEbsRunRate)
+		data.Spend.Breakdown[k] = v - count*(instancesEipRunRate+instancesEbsRunRate)
 	}
 
 	if shouldSnapshot {
@@ -421,26 +449,25 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		}
 	}
 
-
 	return data, nil
 }
 
 func getCapsuleDomain(ns, baseDomain string) string {
-        idx := strings.Index(ns, "-pr-")
-        if idx != -1 {
-                prSuffix := ns[idx+1:]
-                domainParts := strings.Split(baseDomain, ".")
-                if len(domainParts) > 2 {
-                        subdomain := domainParts[0]
-                        rootDomain := strings.Join(domainParts[1:], ".")
-                        return subdomain + "-" + prSuffix + "." + rootDomain
-                }
-                return prSuffix + "." + baseDomain
-        }
-        // fallback for main branch or unknown formats
-        idx = strings.Index(ns, "-production")
-        if idx != -1 {
-                return baseDomain
-        }
-        return ns + "." + baseDomain
+	idx := strings.Index(ns, "-pr-")
+	if idx != -1 {
+		prSuffix := ns[idx+1:]
+		domainParts := strings.Split(baseDomain, ".")
+		if len(domainParts) > 2 {
+			subdomain := domainParts[0]
+			rootDomain := strings.Join(domainParts[1:], ".")
+			return subdomain + "-" + prSuffix + "." + rootDomain
+		}
+		return prSuffix + "." + baseDomain
+	}
+	// fallback for main branch or unknown formats
+	idx = strings.Index(ns, "-production")
+	if idx != -1 {
+		return baseDomain
+	}
+	return ns + "." + baseDomain
 }

@@ -32,7 +32,12 @@ function buildProbeCommand(dbType, image) {
   }
   if (dbType === 'mysql' || dbType === 'mariadb') {
     const passVar = dbType === 'mariadb' ? 'MARIADB_ROOT_PASSWORD' : 'MYSQL_ROOT_PASSWORD';
-    return ['sh', '-c', `mysqladmin ping -h 127.0.0.1 -u root -p"$${passVar}" --silent`];
+    // MariaDB renamed its client binaries: 11.x ships "mariadb-admin" and has
+    // NO "mysqladmin" at all, while 10.x ships both and MySQL ships only
+    // "mysqladmin". Probing with a fixed name meant a MariaDB 11 database
+    // failed every probe and never became Ready, so nothing that depended on
+    // it could deploy. Resolve at runtime instead of guessing from the tag.
+    return ['sh', '-c', `$(command -v mariadb-admin || command -v mysqladmin) ping -h 127.0.0.1 -u root -p"$${passVar}" --silent`];
   }
   if (dbType === 'mongodb') {
     // The shell binary was renamed in MongoDB 6: "mongo" before, "mongosh"
@@ -48,10 +53,20 @@ function renderProbes(dbType, image, indent = '          ') {
   if (!cmd) return '';
   const asYaml = cmd.map(part => JSON.stringify(part)).join(', ');
   return `
+${indent}# Bootstrap scripts (see the initdb ConfigMap) run on first boot with the
+${indent}# engine listening on its socket only, so a TCP probe fails for as long as
+${indent}# they take. A startup probe holds liveness back until the engine is
+${indent}# genuinely up, instead of killing the pod part-way through creating the
+${indent}# schema and leaving a half-initialised volume behind.
+${indent}startupProbe:
+${indent}  exec:
+${indent}    command: [${asYaml}]
+${indent}  periodSeconds: 10
+${indent}  timeoutSeconds: 5
+${indent}  failureThreshold: 60
 ${indent}livenessProbe:
 ${indent}  exec:
 ${indent}    command: [${asYaml}]
-${indent}  initialDelaySeconds: 30
 ${indent}  periodSeconds: 20
 ${indent}  timeoutSeconds: 5
 ${indent}  failureThreshold: 6
@@ -91,7 +106,7 @@ module.exports = (config) => {
                 secretKeyRef:
                   name: {{ .Values.projectName }}-secrets
                   key: ${config.dbPasswordKey}
-{{- if ne .Values.database.user "root" }}
+{{- if and .Values.database.user (ne .Values.database.user "root") }}
             - name: ${prefix}_USER
               value: {{ .Values.database.user | quote }}
             - name: ${prefix}_PASSWORD
@@ -122,6 +137,38 @@ module.exports = (config) => {
               value: {{ $value | quote }}
 {{- end }}
 {{- end }}`;
+
+  // The repository's own bootstrap scripts, carried out of the docker-compose
+  // bind mount on /docker-entrypoint-initdb.d (see init.js). dbCloneSource, if
+  // set, populates that same directory from a live dump and takes precedence -
+  // the two cannot both own the mount.
+  // Emitted whenever the repository HAS bootstrap scripts. Which of the two
+  // populates /docker-entrypoint-initdb.d is decided in the template by
+  // .Values.dbCloneSource, because that is a values field an operator can set
+  // at deploy time - deciding it here instead produced a pod spec with two
+  // "volumes:" keys and three mounts on the same path the moment it was set.
+  const initFiles = (config.dbInitFiles && Object.keys(config.dbInitFiles).length > 0)
+    ? config.dbInitFiles : null;
+  const initConfigMapName = 'database-initdb';
+  let initConfigMap = '';
+  if (initFiles) {
+    initConfigMap = `
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${initConfigMapName}
+  labels:
+    app: {{ .Values.projectName }}
+    component: database
+data:
+`;
+    for (const [key, content] of Object.entries(initFiles)) {
+      const body = String(content).replace(/\r\n/g, '\n').replace(/\n$/, '')
+        .split('\n').map(l => (l === '' ? '' : '    ' + l)).join('\n');
+      initConfigMap += `  ${key}: |\n${body}\n`;
+    }
+  }
 
   return `
 apiVersion: apps/v1
@@ -154,6 +201,16 @@ spec:
       imagePullSecrets:
         - name: {{ .Values.projectName }}-registry
 {{- end }}
+{{- if .Values.dataNodeSelector }}
+      # Pinned because the volume is. k3s's default local-path StorageClass
+      # writes to one node's disk and its PersistentVolume carries node
+      # affinity, so a database pod that moves can never reach its data again.
+      # Only the stateful workloads carry this - everything else is left to the
+      # scheduler, so a capsule can use room spread across the fleet instead of
+      # demanding that one node hold all of it.
+      nodeSelector:
+{{ toYaml .Values.dataNodeSelector | indent 8 }}
+{{- end }}
 {{- if .Values.dbCloneSource }}
       initContainers:
         - name: db-clone
@@ -174,16 +231,33 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           env:${envBlock}${renderProbes(config.dbType, config.images && config.images.db)}
-          resources:
-            requests:
-              memory: "256Mi"
-              cpu: "200m"
-            limits:
-              memory: "1024Mi"
-              cpu: "500m"
+          # No resource requests or limits are set here on purpose. A generated
+          # figure is a guess about someone else's workload, and the two ways it
+          # can be wrong are both bad: too low and the pod is OOM-killed or
+          # throttled under load, too high and the scheduler reserves capacity
+          # nothing uses, which is exactly the capacity the capsule placement
+          # maths is trying to account for. Set them per service in
+          # deploy/helm/values.yaml when the real numbers are known.
           volumeMounts:
             - name: data
-              mountPath: ${volumeMountPath}
+              mountPath: ${volumeMountPath}${initFiles ? `
+{{- if .Values.dbCloneSource }}
+            - name: db-init
+              mountPath: /docker-entrypoint-initdb.d
+{{- else }}
+            - name: db-initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+{{- end }}
+      volumes:
+{{- if .Values.dbCloneSource }}
+        - name: db-init
+          emptyDir: {}
+{{- else }}
+        - name: db-initdb
+          configMap:
+            name: ${initConfigMapName}
+{{- end }}` : `
 {{- if .Values.dbCloneSource }}
             - name: db-init
               mountPath: /docker-entrypoint-initdb.d
@@ -192,7 +266,7 @@ spec:
       volumes:
         - name: db-init
           emptyDir: {}
-{{- end }}
+{{- end }}`}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -201,7 +275,7 @@ spec:
         resources:
           requests:
             storage: {{ .Values.database.storage | default "10Gi" }}
-`.trim();
+${initConfigMap}`.trim();
 };
 
 // Shared with templates/generic/database.js so a per-service database gets

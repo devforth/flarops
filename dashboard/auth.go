@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -826,7 +827,12 @@ func strictPageCSP(nonce string) string {
 // The dashboard page itself carries a large inline <style>/<script> pair that
 // predates this work, so it still needs 'unsafe-inline'. Everything else is
 // locked down, and the page is now reachable only with a session.
-func appPageCSP() string {
+// Only the characters a host (with optional port, including a bracketed IPv6
+// literal) can legally contain. r.Host arrives from the client, and it is
+// about to be written into a response header.
+var safeHostRegexp = regexp.MustCompile(`^[A-Za-z0-9.\-:\[\]]{1,255}$`)
+
+func appPageCSP(r *http.Request) string {
 	return strings.Join([]string{
 		"default-src 'self'",
 		"style-src 'self' 'unsafe-inline'",
@@ -837,18 +843,39 @@ func appPageCSP() string {
 		// that left an injected script free to stream whatever it read to a
 		// socket anywhere on the internet. 'self' already covers a same-origin
 		// ws:// or wss:// connection, which is the only one this page opens.
-		"connect-src 'self'",
+		// The WebSocket origin is named EXPLICITLY rather than left to 'self'.
+		// CSP Level 3 says 'self' matches a same-host wss:// URL, and the
+		// earlier version of this line relied on that - but Firefox does not
+		// implement it, and it reports the resulting block as
+		// NS_ERROR_UNKNOWN_HOST rather than as a CSP violation, so the live
+		// dashboard simply never received an update and nothing said why.
+		// Naming the host keeps the policy exactly as tight (no scheme
+		// wildcard, no third-party host) while actually working.
+		"connect-src 'self'" + socketSource(r),
 		"form-action 'self'",
 		"frame-ancestors 'none'",
 		"base-uri 'none'",
 	}, "; ")
 }
 
-func securityHeaders(next http.Handler, csp func() string) http.Handler {
+// The one socket this page opens: same host, same port, and wss only when the
+// page itself was served over TLS. An unparseable Host contributes nothing, so
+// a malformed request cannot widen the policy.
+func socketSource(r *http.Request) string {
+	if r == nil || !safeHostRegexp.MatchString(r.Host) {
+		return ""
+	}
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		return " wss://" + r.Host
+	}
+	return " ws://" + r.Host + " wss://" + r.Host
+}
+
+func securityHeaders(next http.Handler, csp func(*http.Request) string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		if csp != nil {
-			h.Set("Content-Security-Policy", csp())
+			h.Set("Content-Security-Policy", csp(r))
 		}
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")

@@ -13,7 +13,7 @@ module.exports = function deployYmlTemplate(config) {
 
   const loginStep = `
       - name: Login to Docker Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${loginRegistryHost}
           username: \${{ env.REGISTRY_USER }}
@@ -87,23 +87,27 @@ ${registryEnv ? '  ' + registryEnv : ''}
 
 jobs:
   infrastructure:
-    name: Provision Infrastructure (Terraform)
+    name: Provision Infrastructure & Deploy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          # Without this the job's GITHUB_TOKEN is left in .git/config, where
+          # every later step - and every third-party action among them - can
+          # read it. Nothing here pushes back to the repository.
+          persist-credentials: false
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           aws-access-key-id: \${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: \${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: \${{ env.AWS_REGION }}
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -120,21 +124,31 @@ jobs:
           TF_VAR_cloudflare_zone_id: \${{ secrets.CLOUDFLARE_ZONE_ID }}` : ''}
           TF_VAR_domain: \${{ env.BASE_DOMAIN }}
         run: |
-          # "terraform state list | wc -l" always exits 0 - wc succeeds even
-          # when the pipeline's first command failed - so a transient backend
-          # error used to yield worker_count=0 and apply would then DESTROY
-          # every worker node. Check the state read itself before trusting it.
+          # Workers must survive this apply untouched: they are added and
+          # removed by the PR-capsule workflow, and this one only owns the
+          # server. Read the slots Terraform itself reports rather than
+          # grepping its state listing - a transient backend error there used
+          # to read as "zero workers", and the apply would then DESTROY every
+          # worker node.
+          #
+          # Read ALL outputs in one go rather than asking for worker_slots by
+          # name. On a cold deploy nothing has been applied yet, so that output
+          # does not exist and "terraform output -json worker_slots" exits 1 -
+          # which this guard then treated as a broken backend and refused to
+          # create the infrastructure at all. Asking for every output returns
+          # "{}" and exit 0 on an empty state, so a real read failure stays
+          # distinguishable from simply having nothing yet.
           set -o pipefail
-          if ! STATE_LIST=$(terraform state list 2>&1); then
-            echo "::error::Could not read Terraform state, refusing to apply: $STATE_LIST"
+          if ! ALL_OUTPUTS=$(terraform output -json 2>&1); then
+            echo "::error::Could not read Terraform outputs, refusing to apply: $ALL_OUTPUTS"
             exit 1
           fi
-          CURRENT_WORKERS=$(printf '%s\\n' "$STATE_LIST" | grep -c 'aws_instance.worker\\[' || true)
-          echo "Preserving existing $CURRENT_WORKERS worker nodes."
-          terraform apply -var="worker_count=$CURRENT_WORKERS" -auto-approve
+          CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
+          echo "Preserving existing worker slots: $CURRENT_SLOTS"
+          terraform apply -var="worker_slots=$CURRENT_SLOTS" -auto-approve
 
       - name: Setup SSH
-        uses: webfactory/ssh-agent@v0.9.0
+        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387 # v0.9.0
         with:
           ssh-private-key: \${{ secrets.SSH_PRIVATE_KEY }}
 
@@ -156,7 +170,7 @@ jobs:
           sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
 
       - name: Setup Werf
-        uses: werf/actions/install@v2
+        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d # branch v2 @ 2026-05-21
 ${loginStep}
       - name: Verify Kubeconfig
         run: |

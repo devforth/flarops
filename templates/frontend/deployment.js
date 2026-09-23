@@ -85,13 +85,13 @@ spec:
 {{- end }}
 {{- end }}${extraSecretEnvBlock}
 {{- end }}
-          resources:
-            requests:
-              memory: "128Mi"
-              cpu: "10m"
-            limits:
-              memory: "256Mi"
-              cpu: "500m"
+          # No resource requests or limits are set here on purpose. A generated
+          # figure is a guess about someone else's workload, and the two ways it
+          # can be wrong are both bad: too low and the pod is OOM-killed or
+          # throttled under load, too high and the scheduler reserves capacity
+          # nothing uses, which is exactly the capacity the capsule placement
+          # maths is trying to account for. Set them per service in
+          # deploy/helm/values.yaml when the real numbers are known.
           livenessProbe:
             httpGet:
               path: /

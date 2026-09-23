@@ -26,6 +26,18 @@ function isPathInside(dirPath, targetPath) {
   return rel === '' || (!rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel));
 }
 
+// Every choice prompt in init is "[Y/n]": pressing Enter accepts. The one
+// exception lives in utils/awsHelper.js - reusing a bucket that already exists
+// is not something to agree to by reflex, so it stays "[y/N]" and Enter
+// declines.
+//
+// Written once because the four call sites each parsed the answer themselves,
+// and a default that is only right in three of them is worse than none.
+function isYes(answer) {
+  const a = String(answer == null ? '' : answer).trim().toLowerCase();
+  return a === '' || a === 'y' || a === 'yes';
+}
+
 function askQuestion(query) {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -483,7 +495,7 @@ module.exports = async function init() {
 
 
 
-  const registryAnswer = await askQuestion('enter docker registry (default empty for Docker Hub): ');
+  const registryAnswer = await askQuestion('Enter docker registry (leave empty for Docker Hub): ');
   const dockerRegistry = registryAnswer.trim();
 
   let registryUser = '';
@@ -492,7 +504,7 @@ module.exports = async function init() {
   const loginRegistry = dockerRegistry || 'docker.io';
 
   while (true) {
-    registryUser = (await askQuestion(`enter username for ${loginRegistry}: `)).trim();
+    registryUser = (await askQuestion(`Enter username for ${loginRegistry}: `)).trim();
     if (!registryUser) {
       console.log('username is required');
       continue;
@@ -512,14 +524,14 @@ module.exports = async function init() {
     }
   }
 
-  const domainAnswer = await askQuestion('enter project domain (Press enter if you not using domain name): ');
+  const domainAnswer = await askQuestion('Enter project domain (press Enter to skip if you are not using one): ');
   const domain = domainAnswer.trim();
 
   let cloudflareApiToken = '';
   let cloudflareZoneId = '';
   if (domain) {
-    const useCloudflare = await askQuestion('Do you want to configure Cloudflare DNS for this domain automatically? (y/n): ');
-    if (useCloudflare.trim().toLowerCase() === 'y' || useCloudflare.trim().toLowerCase() === 'yes') {
+    const useCloudflare = await askQuestion('Do you want to configure Cloudflare DNS for this domain automatically? [Y/n]: ');
+    if (isYes(useCloudflare)) {
       cloudflareApiToken = (await askPassword('Enter Cloudflare API Token: ')).trim();
       cloudflareZoneId = (await askQuestion('Enter Cloudflare Zone ID: ')).trim();
     }
@@ -527,7 +539,7 @@ module.exports = async function init() {
   let projectName = path.basename(currentDir).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
   if (!projectName) projectName = 'flarops-project';
   let awsCredentials = { accessKey: '', secretKey: '' };
-  const accessKeyInput = await askQuestion('Enter Project AWS Access Key ID (Press enter to use your default credentials): ');
+  const accessKeyInput = await askQuestion('Enter project AWS Access Key ID (press Enter to use your default credentials): ');
 
   if (!accessKeyInput.trim()) {
     const defaultCreds = getDefaultAWSCredentials();
@@ -540,7 +552,7 @@ module.exports = async function init() {
     }
   } else {
     awsCredentials.accessKey = accessKeyInput.trim();
-    const secretKeyInput = await askPassword('Enter Project AWS Secret Access Key: ');
+    const secretKeyInput = await askPassword('Enter project AWS Secret Access Key: ');
     awsCredentials.secretKey = secretKeyInput.trim();
   }
 
@@ -550,7 +562,7 @@ module.exports = async function init() {
   // the infrastructure ran in a different region from its own state and from
   // whatever the CI session was configured for. Everything downstream reads
   // this one value.
-  const regionAnswer = await askQuestion('enter AWS region (press enter for us-west-2): ');
+  const regionAnswer = await askQuestion('Enter AWS region (press Enter for us-west-2): ');
   const awsRegion = regionAnswer.trim() || 'us-west-2';
 
   const awsCmd = ensureAwsCli();
@@ -743,7 +755,7 @@ resource "aws_instance" "server" {
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --token \${random_password.k3s_token.result} --tls-san \${aws_eip.eip.public_ip}" sh -
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="\${var.k3s_version}" INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --token \${random_password.k3s_token.result} --tls-san \${aws_eip.eip.public_ip}" sh -
   EOF
   )
 
@@ -774,7 +786,7 @@ resource "aws_eip_association" "eip_assoc" {
 }
 
 resource "aws_instance" "worker" {
-  count                  = var.worker_count
+  for_each               = toset([for slot in var.worker_slots : tostring(slot)])
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
@@ -802,7 +814,7 @@ resource "aws_instance" "worker" {
 
   user_data = sensitive(<<-EOF
     #!/bin/bash
-    HOSTNAME="\${var.instance_name}-worker-\${count.index + 1}"
+    HOSTNAME="\${var.instance_name}-worker-\${each.key}"
     hostnamectl set-hostname $HOSTNAME
 
     mkdir -p /home/ubuntu/.ssh
@@ -811,12 +823,12 @@ resource "aws_instance" "worker" {
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" K3S_URL=https://\${aws_instance.server.private_ip}:6443 K3S_TOKEN=\${random_password.k3s_token.result} sh -
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="\${var.k3s_version}" INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" K3S_URL=https://\${aws_instance.server.private_ip}:6443 K3S_TOKEN=\${random_password.k3s_token.result} sh -
   EOF
   )
 
   tags = {
-    Name = "\${var.instance_name}-worker-\${count.index + 1}"
+    Name = "\${var.instance_name}-worker-\${each.key}"
     Role = "worker"
   }
 
@@ -856,6 +868,29 @@ output "public_ip" {
 # what the dashboard prices the fleet against - so changing the instance type
 # means editing exactly one line in variables.tf, not three files that can
 # silently disagree about what is actually running.
+# The slots currently provisioned. CI reads this instead of counting lines in
+# "terraform state list", so scaling decisions are made against a real value
+# Terraform itself reports rather than a grep over its output.
+# Node names are derived from this, so CI must read it rather than rebuild it
+# from the project name - they are only equal until someone edits the variable.
+output "instance_name" {
+  value = var.instance_name
+}
+
+output "worker_slots" {
+  # Numbers, not strings. Terraform's sort() only takes a list of strings and
+  # gives strings back, so sorting the numbers directly emitted ["1","3"] -
+  # and the CI arithmetic that picks the next free slot then compared integers
+  # against strings, found every slot "free", and handed back a number that
+  # collided with a running worker.
+  value = [for s in sort([for x in var.worker_slots : tostring(x)]) : tonumber(s)]
+}
+
+output "worker_nodes" {
+  description = "Kubernetes node names of the workers, derived from the same values that set their hostnames."
+  value       = sort([for slot in var.worker_slots : "\${var.instance_name}-worker-\${slot}"])
+}
+
 output "instance_type" {
   value = var.instance_type
 }
@@ -894,16 +929,37 @@ variable "instance_name" {
   default     = "${projectName}-instance"
 }
 
-variable "worker_count" {
-  description = "Number of worker nodes for horizontal scaling"
-  type        = number
-  default     = 0
+# Workers are addressed by SLOT, not by position in a list.
+#
+# With "count", Terraform identifies an instance by its index, so removing a
+# node in the middle renumbers every node above it - and reducing the count
+# destroys the highest index, whichever node that happens to be. Reclaiming an
+# idle worker while a busier one sits above it was therefore impossible, and
+# the PR-capsule teardown could only ever peel nodes off the top.
+#
+# A set of slot numbers makes each worker independently addressable:
+# dropping 2 from [1,2,3] destroys exactly worker 2 and leaves 1 and 3 alone.
+variable "worker_slots" {
+  description = "Slot numbers of the worker nodes to run, e.g. [1,3]. Each slot is one instance, addressable independently of the others."
+  type        = set(number)
+  default     = []
 }
 
 variable "instance_type" {
   description = "Type of the instance"
   type        = string
   default     = "t3a.medium"
+}
+
+# Pinned on purpose. "curl https://get.k3s.io | sh" without a version installs
+# whatever is current the moment each node boots, so a fleet grown over weeks
+# ends up running different Kubernetes versions, and a compromise of the
+# install endpoint would land on every node that has yet to be created. Change
+# it here and nowhere else - both the server and the agents read this.
+variable "k3s_version" {
+  description = "k3s version installed on every node (see https://github.com/k3s-io/k3s/releases)"
+  type        = string
+  default     = "v1.36.4+k3s1"
 }
 
 variable "volume_size" {
@@ -977,7 +1033,15 @@ variable "domain" {
       if (ignoredDirs.has(file)) continue;
       const fullPath = path.join(dir, file);
       try {
-        const stat = fs.statSync(fullPath);
+        // lstat, and symlinks are skipped outright - matching walkDir in
+        // utils/fsHelper.js. statSync follows links, so a repository
+        // containing "ln -s /home/you/other-project shared" had THAT
+        // project's .env files read and their secrets written into
+        // deploy/.env, which the operator is then told to copy into GitHub
+        // Secrets. Nothing outside the repository being initialised is ever
+        // this tool's to collect.
+        const stat = fs.lstatSync(fullPath);
+        if (stat.isSymbolicLink()) continue;
         if (stat.isDirectory()) {
           findEnvFiles(fullPath, fileList);
         } else if (ENV_FILE_PRECEDENCE.includes(file)) {
@@ -1050,8 +1114,8 @@ variable "domain" {
   let refactoredEnvKey = null;
   let refactoredRoutes = [];
   if (frontendInfo.frontendPath && backendInfo.ports && backendInfo.ports.length > 0) {
-    const doRefactor = await askQuestion('\x1b[36m? \x1b[0mDo you want to automatically refactor hardcoded frontend API URLs to environment variables? (y/n) ');
-    if (doRefactor.toLowerCase() === 'y' || doRefactor.toLowerCase() === 'yes') {
+    const doRefactor = await askQuestion('\x1b[36m? \x1b[0mDo you want to automatically refactor hardcoded frontend API URLs to environment variables? [Y/n] ');
+    if (isYes(doRefactor)) {
       const refactorResult = await refactorFrontendEnv(frontendInfo.frontendPath, backendInfo.ports);
       const nginxRefactorCount = await refactorNginxConf(frontendInfo.frontendPath, backendInfo.ports);
       if (nginxRefactorCount > 0) {
@@ -1073,8 +1137,8 @@ variable "domain" {
     let dbRefactorResult = await refactorBackendDbUrl(backendInfo.backendPath, false);
 
     if (dbRefactorResult && dbRefactorResult.hasHardcoded) {
-      const doDbRefactor = await askQuestion('\x1b[36m? \x1b[0mDo you want to automatically refactor hardcoded database URLs in the backend to environment variables? (y/n) ');
-      if (doDbRefactor.toLowerCase() === 'y' || doDbRefactor.toLowerCase() === 'yes') {
+      const doDbRefactor = await askQuestion('\x1b[36m? \x1b[0mDo you want to automatically refactor hardcoded database URLs in the backend to environment variables? [Y/n] ');
+      if (isYes(doDbRefactor)) {
         dbRefactorResult = await refactorBackendDbUrl(backendInfo.backendPath, true);
         if (dbRefactorResult && dbRefactorResult.filesChanged > 0) {
           console.log(`\x1b[32mSuccessfully refactored ${dbRefactorResult.filesChanged} backend files to use ${dbRefactorResult.discoveredVars.join(', ')}.\x1b[0m`);
@@ -1767,8 +1831,8 @@ variable "domain" {
     });
 
     if (keysToUppercase.length > 0) {
-      const confirmAnswer = await askQuestion(`\x1b[36m? \x1b[0mFound lowercase environment variables in backend code (${keysToUppercase.join(', ')}). Standard convention is UPPERCASE. Do you want to automatically refactor them? (y/n) `);
-      const didUppercase = confirmAnswer.trim().toLowerCase() === 'y' || confirmAnswer.trim().toLowerCase() === 'yes';
+      const confirmAnswer = await askQuestion(`\x1b[36m? \x1b[0mFound lowercase environment variables in backend code (${keysToUppercase.join(', ')}). Standard convention is UPPERCASE. Do you want to automatically refactor them? [Y/n] `);
+      const didUppercase = isYes(confirmAnswer);
 
       if (didUppercase) {
         const { modifiedCount } = await refactorLowercaseEnvVars(backendInfo.backendPath, keysToUppercase, true);
@@ -1857,12 +1921,16 @@ variable "domain" {
   // Regenerated only when there isn't one already - a re-run must not silently
   // invalidate the password the operator wrote down after the first run.
   let dashboardPassword = null;
+  // Kept OUT of sensitiveEnvContent: that block is written under "Extracted
+  // sensitive variables from project .env files", and this hash was extracted
+  // from nothing - Flarops generates it. Filing it there told the operator
+  // their repository contained a credential it never had.
+  let dashboardEnvContent = '';
   {
     // envFile is declared further down, so resolve the path directly here.
     const deployEnvPath = path.join(deployDir, '.env');
     const existingEnvForDashboard = fs.existsSync(deployEnvPath) ? fs.readFileSync(deployEnvPath, 'utf8') : '';
-    const alreadyProvisioned = /^DASHBOARD_PASSWORD_HASH=/m.test(existingEnvForDashboard) ||
-      /^DASHBOARD_PASSWORD_HASH=/m.test(sensitiveEnvContent);
+    const alreadyProvisioned = /^DASHBOARD_PASSWORD_HASH=/m.test(existingEnvForDashboard);
     if (!alreadyProvisioned) {
       // 18 random bytes -> 24 base64url characters, ~144 bits of entropy.
       dashboardPassword = crypto.randomBytes(18).toString('base64url');
@@ -1872,7 +1940,7 @@ variable "domain" {
       const b64 = (buf) => buf.toString('base64').replace(/=+$/, '');
       // Single-quoted: the encoded hash contains "$" separators, which a shell
       // sourcing this file would otherwise try to expand.
-      sensitiveEnvContent += `DASHBOARD_PASSWORD_HASH='pbkdf2-sha256$i=${iterations}$${b64(salt)}$${b64(derived)}'\n`;
+      dashboardEnvContent = `DASHBOARD_PASSWORD_HASH='pbkdf2-sha256$i=${iterations}$${b64(salt)}$${b64(derived)}'\n`;
     }
   }
 
@@ -1905,6 +1973,13 @@ REGISTRY_PASSWORD="${registryPassword}"
 
   if (finalDbPassword && !new RegExp('^' + escapeRegex(finalDbPasswordKey) + '=', 'm').test(envContent)) {
     envContent += `${finalDbPasswordKey}="${finalDbPassword}"\n`;
+  }
+
+  // Last, so nothing written afterwards ends up filed under this heading -
+  // the database password did, which read as though Flarops had generated a
+  // dashboard credential for the application's database.
+  if (dashboardEnvContent) {
+    envContent += `\n# Generated by Flarops for the deployment dashboard - not taken from your project\n${dashboardEnvContent}`;
   }
 
   const envFile = path.join(deployDir, '.env');
@@ -1966,16 +2041,34 @@ AWS_REGION=${awsRegion}
   if (refactoredRoutes && refactoredRoutes.length > 0) {
     apiRoutes = refactoredRoutes;
     console.log(`Using API Routes discovered during refactoring: ${apiRoutes.join(', ')}`);
-  } else if (frontendInfo.frontendPath) {
-    // A frontend that talks to the backend in ways the heuristics below don't
-    // recognize yields an empty array here - previously that silently
-    // replaced the safe "/api" default with an empty list, leaving the API
-    // completely unrouted in the Ingress. Only override the default when the
-    // scan actually found something.
-    const discoveredRoutes = await analyzeFrontendRoutes(frontendInfo.frontendPath);
-    if (discoveredRoutes.length > 0) {
-      apiRoutes = discoveredRoutes;
-      console.log(`Discovered API Routes in frontend: ${apiRoutes.join(', ')}`);
+  } else {
+    // What the FRONTEND calls is the authority when it can be read: if it
+    // requests "/api/students" because a proxy rewrites it, the Ingress has to
+    // route "/api", whatever the backend happens to mount internally.
+    let discoveredRoutes = [];
+    if (frontendInfo.frontendPath) {
+      discoveredRoutes = await analyzeFrontendRoutes(frontendInfo.frontendPath);
+      if (discoveredRoutes.length > 0) {
+        apiRoutes = discoveredRoutes;
+        console.log(`Discovered API Routes in frontend: ${apiRoutes.join(', ')}`);
+      }
+    }
+
+    // Nothing readable in the frontend. Ask the BACKEND what it serves, which
+    // is the same question already asked of every additionalService (see
+    // analyzeBackendExposedRoutes) and was simply never asked of the primary
+    // one: apiRoutes came from the frontend scan or from the "/api" default,
+    // so a backend mounting "/students", "/courses", "/enrollments" - with no
+    // "/api" prefix anywhere - had all three dropped and the Ingress sent
+    // "/api" to it instead. Every real route then fell through to the
+    // frontend's catch-all and the API was unreachable.
+    if (discoveredRoutes.length === 0 && backendInfo.backendPath) {
+      const { analyzeBackendExposedRoutes } = require('../../utils/routeAnalyzer');
+      const backendRoutes = await analyzeBackendExposedRoutes(backendInfo.backendPath);
+      if (backendRoutes.length > 0) {
+        apiRoutes = backendRoutes;
+        console.log(`Discovered API Routes in backend source: ${apiRoutes.join(', ')}`);
+      }
     }
   }
 
@@ -2116,6 +2209,37 @@ AWS_REGION=${awsRegion}
   }
 
 
+  // docker-compose mounts the repository's schema into the database image's
+  // own bootstrap directory ("./db_init:/docker-entrypoint-initdb.d"). That is
+  // very often the ONLY definition of the schema in the repository - no
+  // migrations, no ORM sync - and it was dropped on the way to the cluster, so
+  // the database came up with the right name, the right user and no tables at
+  // all. Every query then failed and the API answered 500 to everything, with
+  // nothing in the generated output hinting why.
+  let dbInitFiles = null;
+  const dbInitWarnings = [];
+  if (dbInfo.hasDb && dbInfo.composeServiceName) {
+    try {
+      const { extractVolumes, materializeBindMounts } = require('../../utils/composeSupport.js');
+      const composeServices = await parseComposeServices(currentDir);
+      const dbBlock = composeServices[dbInfo.composeServiceName] && composeServices[dbInfo.composeServiceName].block;
+      if (dbBlock) {
+        const { bindMounts } = extractVolumes(dbBlock);
+        // Every engine Flarops supports - MySQL, MariaDB, Postgres, Mongo -
+        // uses this same directory, and runs whatever is in it exactly once,
+        // on a first boot against an empty data directory.
+        const initMounts = bindMounts.filter(m => /^\/docker-entrypoint-initdb\.d(\/|$)/.test(String(m.target || '')));
+        if (initMounts.length > 0) {
+          const carried = materializeBindMounts(fs, path, currentDir, initMounts);
+          if (carried.data) dbInitFiles = carried.data;
+          for (const u of carried.unresolved) {
+            dbInitWarnings.push(`${u.source} -> ${u.target} (${u.reason})`);
+          }
+        }
+      }
+    } catch (e) { /* no compose, or unreadable - nothing to carry */ }
+  }
+
   const rawRelativeBackendPath = backendInfo.backendPath ? path.relative(currentDir, backendInfo.backendPath) || '.' : null;
   const rawRelativeFrontendPath = frontendInfo.frontendPath ? path.relative(currentDir, frontendInfo.frontendPath) || '.' : null;
 
@@ -2143,12 +2267,23 @@ AWS_REGION=${awsRegion}
   // out of the build context entirely (via .dockerignore, which werf's own
   // build-context inspector also respects) sidesteps the whole class of
   // problem instead of allow-listing individual files as they turn up.
+  // An additionalService can be built from the repo root too - docker-compose
+  // declares "context: ." for a service that is neither the primary backend
+  // nor the frontend more often than it looks. Left out of this check, such a
+  // project got no .dockerignore at all.
   const anyServiceUsesRootContext = relativeBackendPath === '.' || relativeFrontendPath === '.' ||
-    additionalServices.some(s => s.isMavenReactorModule);
+    additionalServices.some(s => s.isMavenReactorModule || s.relativePath === '.' || s.relativePath === '');
 
   if (anyServiceUsesRootContext) {
     const dockerignoreFile = path.join(currentDir, '.dockerignore');
-    const dockerignoreLinesToAdd = ['deploy/'];
+    // deploy/ carries deploy/.env, but the repository's OWN .env and the
+    // deploy key in .keys/ sit at the root and were not excluded. A Dockerfile
+    // that does "COPY . ." - the overwhelmingly common shape - then baked the
+    // SSH private key for the production host and every application secret
+    // into an image layer, which is pushed to the registry and readable by
+    // anyone who can pull it. These are exactly the paths .gitignore already
+    // protects; the build context needs the same treatment.
+    const dockerignoreLinesToAdd = ['deploy/', '.env', '.env.*', '.keys/'];
 
     if (!fs.existsSync(dockerignoreFile)) {
       fs.writeFileSync(dockerignoreFile, '#autogenerated by flarops\n' + dockerignoreLinesToAdd.join('\n') + '\n');
@@ -2759,6 +2894,13 @@ AWS_REGION=${awsRegion}
     console.warn(`\x1b[33mWARNING: The following secret name(s) start with "GITHUB_", a prefix GitHub reserves for its own secrets - you will NOT be able to create a matching repository secret for: ${githubReservedKeys.join(', ')}. Rename this environment variable in your project.\x1b[0m`);
   }
 
+  if (dbInitFiles) {
+    console.log(`\x1b[34mINFO: Carried the database's docker-compose bootstrap scripts into the chart as a ConfigMap: ${Object.keys(dbInitFiles).join(', ')}. They run on the database's FIRST boot only - an existing volume is never re-initialised, so an already-deployed database needs its PVC removed (or the scripts applied by hand) before they take effect.\x1b[0m`);
+  }
+  if (dbInitWarnings.length > 0) {
+    console.warn(`\x1b[33mWARNING: The database mounts these files into /docker-entrypoint-initdb.d in docker-compose, but they could NOT be carried into the cluster: ${dbInitWarnings.join('; ')}. Without them the database will come up with no schema. Apply them yourself, or provide them as a ConfigMap/Secret volume.\x1b[0m`);
+  }
+
   if (supportConfigMapNotes.length > 0) {
     console.log(`\x1b[34mINFO: Carried the docker-compose bind mounts of these supporting services into the chart as ConfigMaps: ${supportConfigMapNotes.join(', ')}.\x1b[0m`);
   }
@@ -2823,6 +2965,7 @@ AWS_REGION=${awsRegion}
       frontend: 'frontend:latest'
     },
     dbCloneSource: '', // Can be updated or prompted in the future
+    dbInitFiles,
     hasDb: dbInfo.hasDb,
     apiPorts: backendInfo.ports || [3000],
     frontendPorts: frontendInfo.ports || [80],
@@ -3057,6 +3200,12 @@ dashboard:
 # buildValuesScript) so private images can be pulled. Left null here on
 # purpose - nothing secret belongs in a committed file.
 imagePullSecret: null
+# Set by the PR-capsule workflow to the node the dashboard's capacity oracle
+# picked. Only the STATEFUL workloads read it: their volumes come from k3s's
+# local-path provisioner and live on one node's disk, so a database pod that
+# moves can never reach its data again. Stateless workloads are deliberately
+# left to the scheduler, so a capsule can use room spread across the fleet.
+dataNodeSelector: {}
 `;
 
   if (config.additionalServices && config.additionalServices.length > 0) {

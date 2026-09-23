@@ -313,6 +313,31 @@ function configMapKeyFor(name, taken) {
   return candidate;
 }
 
+// A ConfigMap generated from a bind mount is written into the chart, which
+// FLAROPS.md tells the operator to commit, and lands in the cluster as a
+// plain ConfigMap readable by anything with configmap access in that
+// namespace. Carrying the gateway's nginx.conf that way is the point; doing
+// the same to a mounted private key or credentials file would take secret
+// material that was sitting in a gitignored directory and commit it.
+//
+// Name and content are both consulted, because neither alone is reliable: a
+// key file is routinely called "server.key" with no telltale header stripped,
+// and a "config.yml" can hold an API token.
+const SECRET_FILENAME_REGEX = /(^|[-_.])(id_rsa|id_dsa|id_ecdsa|id_ed25519)($|[-_.])|\.(key|pem|p12|pfx|jks|keystore|truststore|asc|gpg|kdbx|ppk)$|(^|[-_.])(secret|secrets|credential|credentials|password|passwords|token|tokens|htpasswd)($|[-_.])|^\.?env(\..*)?$/i;
+
+const SECRET_CONTENT_REGEX = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|-----BEGIN PGP PRIVATE|-----BEGIN OPENSSH PRIVATE KEY-----|PuTTY-User-Key-File/;
+
+// A key=value line whose key names a credential and whose value is neither
+// empty, a placeholder, nor an unresolved ${...} reference.
+const SECRET_ASSIGNMENT_REGEX = /^[ \t]*["']?[A-Za-z0-9_.-]*(PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL)[A-Za-z0-9_.-]*["']?[ \t]*[:=][ \t]*["']?(?!\s*$)(?!\$\{)(?!<)(?!changeme\b)(?!change_me\b)(?!your[-_])(?!example\b)(?!placeholder\b)(?!todo\b)(?!tbd\b)(?!""|'')\S/im;
+
+function secretMaterialReason(name, content) {
+  if (SECRET_FILENAME_REGEX.test(name)) return `"${name}" is named like key or credential material`;
+  if (SECRET_CONTENT_REGEX.test(content)) return `"${name}" contains a private key block`;
+  if (SECRET_ASSIGNMENT_REGEX.test(content)) return `"${name}" assigns a credential a real value`;
+  return null;
+}
+
 function isProbablyText(buf) {
   // A NUL byte never appears in the text formats these mounts carry, and
   // ConfigMap data is a UTF-8 string field, so anything binary has to be
@@ -339,6 +364,11 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
     let buf;
     try { buf = fsMod.readFileSync(absPath); } catch (e) { return { error: 'could not be read' }; }
     if (!isProbablyText(buf)) return { error: 'is a binary file' };
+    // Checked before anything is stored: a ConfigMap is committed and is not
+    // a Secret, so secret material must be left for the operator to place
+    // deliberately rather than copied into the chart.
+    const secretReason = secretMaterialReason(displayName, buf.toString('utf8'));
+    if (secretReason) return { error: secretReason, secret: true };
     const key = configMapKeyFor(displayName, taken);
     if (!key) return { error: 'has a name a ConfigMap key cannot represent' };
     data[key] = buf.toString('utf8');
@@ -370,6 +400,7 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
       continue;
     }
 
+
     if (stat.isDirectory()) {
       let entries = [];
       try { entries = fsMod.readdirSync(abs, { withFileTypes: true }); } catch (e) {
@@ -378,6 +409,24 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
       }
       // One level only: a ConfigMap has no notion of nested directories, and
       // "items" can only place each key at a flat path under the mount.
+      // A directory is scanned for secret material BEFORE anything from it is
+      // stored. One key file poisons the whole mount: carrying the rest would
+      // hand the service a half-populated configuration directory, which is a
+      // worse failure than carrying none of it and saying so.
+      let dirSecretReason = null;
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        let buf;
+        try { buf = fsMod.readFileSync(pathMod.join(abs, entry.name)); } catch (e) { continue; }
+        if (!isProbablyText(buf)) continue;
+        const reason = secretMaterialReason(entry.name, buf.toString('utf8'));
+        if (reason) { dirSecretReason = reason; break; }
+      }
+      if (dirSecretReason) {
+        unresolved.push({ ...mount, reason: dirSecretReason + ' - the whole directory was left for you to provide as a Secret' });
+        continue;
+      }
+
       const items = [];
       let failed = null;
       for (const entry of entries) {
@@ -399,4 +448,4 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
   return { data: carried ? data : null, fileMounts, dirMounts, unresolved };
 }
 
-module.exports = { parseSupportService, extractBuildArgs, looksLikeNodeAgent, materializeBindMounts, toK8sName, tokenizeShellWords, WELL_KNOWN_IMAGE_PORTS };
+module.exports = { parseSupportService, extractBuildArgs, extractVolumes, looksLikeNodeAgent, materializeBindMounts, secretMaterialReason, toK8sName, tokenizeShellWords, WELL_KNOWN_IMAGE_PORTS };
