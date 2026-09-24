@@ -1,0 +1,17 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: pw
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+  api:
+    build: ./backend
+    ports: ["4000:4000"]
+    environment:
+      PORT: 4000
+      DB_HOST: db
+    depends_on: [db]
+  frontend:
+    build: ./frontend
+    ports: ["80:80"]

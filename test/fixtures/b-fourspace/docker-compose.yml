@@ -1,0 +1,8 @@
+services:
+    backend:
+        build: ./backend
+        ports:
+            - "3000:3000"
+        environment:
+            SECRET_TOKEN: s3cr3t
+            APP_MODE: production

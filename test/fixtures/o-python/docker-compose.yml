@@ -1,0 +1,13 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: pypw
+      POSTGRES_DB: pyapp
+  api:
+    build: ./backend
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql://postgres:pypw@db:5432/pyapp
+      SECRET_KEY: devkey
+    depends_on: [db]

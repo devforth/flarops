@@ -152,10 +152,26 @@ func (k *K8sClient) GetPVCs() ([]*corev1.PersistentVolumeClaim, error) {
 	return res, nil
 }
 
-func (k *K8sClient) GetNodeStatsSummary(nodeName string) ([]byte, error) {
+// GetNodeAgentIPs maps node name -> node-agent pod IP.
+//
+// This replaces a GET on nodes/proxy, which reached the kubelet's
+// stats/summary but also authorized exec into every container on every node -
+// see nodeagent.go. Listing pods is a permission the dashboard already needs.
+func (k *K8sClient) GetNodeAgentIPs() (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return k.clientset.CoreV1().RESTClient().Get().
-		Resource("nodes").Name(nodeName).SubResource("proxy").Suffix("stats/summary").
-		DoRaw(ctx)
+	list, err := k.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		LabelSelector: "app=flarops-node-agent",
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for i := range list.Items {
+		p := &list.Items[i]
+		if p.Spec.NodeName != "" && p.Status.PodIP != "" && p.Status.Phase == corev1.PodRunning {
+			out[p.Spec.NodeName] = p.Status.PodIP
+		}
+	}
+	return out, nil
 }

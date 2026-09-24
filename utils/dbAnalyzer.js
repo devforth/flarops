@@ -357,8 +357,8 @@ async function extractDbCredentials(baseDir, backendPath, dbType) {
     ? `DATABASE_DB|DB_NAME|DATABASE_NAME|${perTypeNameKeys[dbType]}`
     : 'DATABASE_DB|DB_NAME|DATABASE_NAME|POSTGRES_DB|MYSQL_DATABASE|MARIADB_DATABASE|MONGO_INITDB_DATABASE';
 
-  const userRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${userKeys})\\s*[:=]\\s*["']?([^"'\\s#]+|[^"']+)["']?`, 'im');
-  const nameRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${nameKeys})\\s*[:=]\\s*["']?([^"'\\s#]+|[^"']+)["']?`, 'im');
+  const userRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${userKeys})[ \\t]*[:=][ \\t]*["']?([^"'\\s#]+|[^"'\\n]+)["']?`, 'im');
+  const nameRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${nameKeys})[ \\t]*[:=][ \\t]*["']?([^"'\\s#]+|[^"'\\n]+)["']?`, 'im');
 
   // Every character class here excludes whitespace on purpose. With "[^@]*"
   // the match could run past the end of its own line hunting for an "@"
@@ -936,13 +936,28 @@ async function analyzeBackendForDbKeys(backendPath) {
     try {
       const content = await fs.readFile(file, 'utf8');
       
+      // Names that belong to the SERVER this process runs, not to any database
+      // it connects to. A bare PORT was being classified as the database port,
+      // and init.js then overwrote it with 5432/3306/27017 - so the container
+      // listened on the database's port while the Service, the probe and the
+      // Ingress all pointed at the real one, and readiness never passed.
+      const LISTEN_PORT_KEYS = /^(port|server_port|app_port|http_port|https_port|listen_port|web_port|service_port)$/;
+
+      // The canonical per-engine names, which the generic patterns below miss
+      // entirely: POSTGRES_USER does not contain "db_user", and POSTGRES_DB
+      // does not match /^database$|^db$/. Both were silently unclassified, so
+      // the API container was wired with a host, a port and a password but no
+      // user and no database name.
+      const ENGINE_USER_KEYS = /^(postgres_user|pguser|mysql_user|mariadb_user|mongo_initdb_root_username)$/;
+      const ENGINE_NAME_KEYS = /^(postgres_db|pgdatabase|mysql_database|mariadb_database|mongo_initdb_database)$/;
+
       const processKey = (key) => {
         const lowerKey = key.toLowerCase();
         if (lowerKey.match(/host|hostname/)) hostCounts[key] = (hostCounts[key] || 0) + 1;
-        else if (lowerKey.match(/^user$|username|db_user|dbuser/)) userCounts[key] = (userCounts[key] || 0) + 1;
-        else if (lowerKey.match(/^database$|^db$|dbname|db_name|^name$/)) nameCounts[key] = (nameCounts[key] || 0) + 1;
+        else if (ENGINE_USER_KEYS.test(lowerKey) || lowerKey.match(/^user$|username|db_user|dbuser/)) userCounts[key] = (userCounts[key] || 0) + 1;
+        else if (ENGINE_NAME_KEYS.test(lowerKey) || lowerKey.match(/^database$|^db$|dbname|db_name|^name$/)) nameCounts[key] = (nameCounts[key] || 0) + 1;
         else if (lowerKey.match(/password|pass/)) passwordCounts[key] = (passwordCounts[key] || 0) + 1;
-        else if (lowerKey.match(/port/)) portCounts[key] = (portCounts[key] || 0) + 1;
+        else if (lowerKey.match(/port/) && !LISTEN_PORT_KEYS.test(lowerKey)) portCounts[key] = (portCounts[key] || 0) + 1;
       };
 
       let match;

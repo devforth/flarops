@@ -1,0 +1,1742 @@
+# files
+  .github/workflows/deploy.yml
+  .github/workflows/pr-capsule.yml
+  .gitignore
+  .keys/deploy_rsa
+  .keys/deploy_rsa.pub
+  FLAROPS.md
+  backend/Dockerfile
+  backend/index.js
+  backend/package.json
+  deploy/.env
+  deploy/.env.safety
+  deploy/dashboard/Dockerfile
+  deploy/dashboard/auth.go
+  deploy/dashboard/capacity.go
+  deploy/dashboard/collector.go
+  deploy/dashboard/db.go
+  deploy/dashboard/fetcher.go
+  deploy/dashboard/go.mod
+  deploy/dashboard/go.sum
+  deploy/dashboard/k8s.go
+  deploy/dashboard/login.html
+  deploy/dashboard/logout.html
+  deploy/dashboard/main.go
+  deploy/dashboard/nodeagent.go
+  deploy/dashboard/state.go
+  deploy/dashboard/static/index.html
+  deploy/dashboard/static/loader.gif
+  deploy/helm/Chart.yaml
+  deploy/helm/templates/01-ingress.yaml
+  deploy/helm/templates/_helpers.tpl
+  deploy/helm/templates/api.yaml
+  deploy/helm/templates/dashboard.yaml
+  deploy/helm/templates/registry-secret.yaml
+  deploy/helm/templates/secret.yaml
+  deploy/helm/values.yaml
+  deploy/terraform/main.tf
+  deploy/terraform/variables.tf
+  docker-compose.yml
+  werf-giterminism.yaml
+  werf.yaml
+
+# ===== .github/workflows/deploy.yml
+name: Flarops CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Terraform state has one lock, but nothing stopped two pushes to main from
+# racing for it and failing half-applied. Serialize instead of cancelling, so
+# an in-flight apply is always allowed to finish.
+concurrency:
+  group: flarops-deploy-b-fourspace
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  PROJECT_NAME: b-fourspace
+  REGISTRY_USER: testuser
+  BASE_DOMAIN: example.test
+
+
+jobs:
+  infrastructure:
+    name: Provision Infrastructure & Deploy
+    runs-on: ubuntu-latest
+    # Neither job has a natural bound - the k3s wait below and the werf
+    # converge can both stall indefinitely - and GitHub's own limit is six
+    # hours, during which the concurrency group keeps every later push queued.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          # Without this the job's GITHUB_TOKEN is left in .git/config, where
+          # every later step - and every third-party action among them - can
+          # read it. Nothing here pushes back to the repository.
+          persist-credentials: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: terraform init
+
+      - name: Terraform Workspace
+        working-directory: deploy/terraform
+        run: terraform workspace select -or-create main
+
+      - name: Terraform Apply
+        working-directory: deploy/terraform
+        env:
+          TF_VAR_domain: ${{ env.BASE_DOMAIN }}
+        run: |
+          # Workers must survive this apply untouched: they are added and
+          # removed by the PR-capsule workflow, and this one only owns the
+          # server. Read the slots Terraform itself reports rather than
+          # grepping its state listing - a transient backend error there used
+          # to read as "zero workers", and the apply would then DESTROY every
+          # worker node.
+          #
+          # Read ALL outputs in one go rather than asking for worker_slots by
+          # name. On a cold deploy nothing has been applied yet, so that output
+          # does not exist and "terraform output -json worker_slots" exits 1 -
+          # which this guard then treated as a broken backend and refused to
+          # create the infrastructure at all. Asking for every output returns
+          # "{}" and exit 0 on an empty state, so a real read failure stays
+          # distinguishable from simply having nothing yet.
+          set -o pipefail
+          if ! ALL_OUTPUTS=$(terraform output -json 2>&1); then
+            echo "::error::Could not read Terraform outputs, refusing to apply: $ALL_OUTPUTS"
+            exit 1
+          fi
+          CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
+          echo "Preserving existing worker slots: $CURRENT_SLOTS"
+          terraform apply -var="worker_slots=$CURRENT_SLOTS" -auto-approve -lock-timeout=5m
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387 # v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Fetch Kubeconfig from EC2
+        working-directory: deploy/terraform
+        run: |
+          export EC2_IP=$(terraform output -raw public_ip)
+
+          echo "Waiting for K3s to be ready on $EC2_IP..."
+          # Bounded. An unbounded loop here waited out GitHub's six-hour job
+          # limit whenever k3s failed to install (bad AMI, apt or network
+          # trouble in user_data), with the EC2 instance already created and
+          # billing and every later push queued behind it.
+          for attempt in $(seq 1 60); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$EC2_IP "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "::error::k3s did not finish installing within 10 minutes. Check cloud-init on the server ($EC2_IP): /var/log/cloud-init-output.log"
+              exit 1
+            fi
+            echo "Waiting for k3s.yaml... ($attempt/60)"
+            sleep 10
+          done
+
+          mkdir -p ~/.kube
+          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+
+      - name: Setup Werf
+        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d # branch v2 @ 2026-05-21
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: docker.io
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Verify Kubeconfig
+        run: |
+          kubectl get nodes
+
+      - name: Deploy application with Werf
+        env:
+          SECRET_ENV_SECRET_TOKEN: ${{ secrets.SECRET_TOKEN }}
+          SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
+          SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          REGISTRY_SERVER: https://index.docker.io/v1/
+        run: |
+          umask 077
+          # Read the instance shape back out of Terraform - the single place
+          # it is declared (deploy/terraform/variables.tf).
+          export TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
+          export TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
+          werf converge \
+            --parallel-tasks-limit=3 \
+            --repo docker.io/${{ env.REGISTRY_USER }}/${{ env.PROJECT_NAME }} \
+            --env production \
+            --values deploy/helm/flarops-ci-values.json
+
+# ===== .github/workflows/pr-capsule.yml
+name: Flarops PR Capsule
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+
+# Concurrency (instead of cancelling in-progress ones) so an
+# "opened" run's database dump/restore, and a "deploy" run's terraform apply,
+# never overlap with another run for the same PR - overlapping runs previously
+# could both pass the "not yet cloned" check and restore into the same database
+# concurrently, or race on the shared production Terraform workspace.
+# One run per pull request, NOT one across the repository.
+#
+# A repo-wide group did close the placement race, but GitHub cancels PENDING
+# runs in a concurrency group - so a teardown queued behind another PR's deploy
+# was dropped, and since "closed" never fires twice, that PR's namespace and
+# its clone of the production database leaked permanently. The busier the
+# repository, the more often it happened.
+#
+# The race is closed in the capacity oracle instead: a "yes" verdict reserves
+# the node it names until the capsule becomes measurable, so two pull requests
+# asking at the same moment cannot both be sent to it. See reservation in
+# dashboard/capacity.go.
+#
+# cancel-in-progress stays false: a half-applied capsule must finish, not be
+# killed mid-converge.
+concurrency:
+  group: flarops-pr-capsule-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  PROJECT_NAME: b-fourspace
+  REGISTRY_USER: testuser
+  BASE_DOMAIN: example.test
+  MAIN_NAMESPACE: b-fourspace-production
+  PR_NAMESPACE: b-fourspace-pr-${{ github.event.pull_request.number }}
+  PR_ENV_NAME: pr-${{ github.event.pull_request.number }}
+  PR_DOMAIN: pr-${{ github.event.pull_request.number }}.example.test
+
+
+jobs:
+  deploy-capsule:
+    name: Deploy PR Capsule
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    # Neither job has a natural bound - the k3s wait below and the werf
+    # converge can both stall indefinitely - and GitHub's own limit is six
+    # hours, during which the concurrency group keeps every later push queued.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          # Without this the job's GITHUB_TOKEN is left in .git/config, where
+          # every later step - and every third-party action among them - can
+          # read it. Nothing here pushes back to the repository.
+          persist-credentials: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: terraform init
+
+      - name: Terraform Workspace
+        working-directory: deploy/terraform
+        run: terraform workspace select -or-create main
+
+      - name: Fetch Kubeconfig from EC2
+        # The key is passed through the step environment, never interpolated
+        # into the script text: an expression substituted into a run block
+        # becomes part of the shell source the runner executes, so it lands in
+        # traces and in any error the shell prints back.
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          # See the teardown copy of this step: without set -e a failed
+          # terraform output or ssh leaves an empty kubeconfig and the step
+          # still goes green, because its last command is a sed that succeeds
+          # on an empty file.
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
+
+          mkdir -p ~/.kube
+          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+
+      - name: Decide where this capsule goes
+        env:
+          TF_VAR_domain: ${{ env.BASE_DOMAIN }}
+        run: |
+          set -euo pipefail
+
+          # ---------------------------------------------------------------
+          # 1. Is this capsule already placed?
+          #
+          # Every push to the PR re-runs this job. The capsule's volumes are
+          # provisioned by k3s's default local-path StorageClass, whose
+          # PersistentVolumes carry node affinity - they exist on one node's
+          # disk and cannot follow a pod anywhere else. Asking the oracle again
+          # can name a DIFFERENT node, and pinning there leaves the database
+          # pod Pending forever against a volume it can never reach.
+          #
+          # So an existing capsule is never re-placed: where it runs now is
+          # where it keeps running.
+          # ---------------------------------------------------------------
+          # The DATABASE pod's node, specifically - not whichever pod sorts
+          # first. Only stateful workloads carry dataNodeSelector, so api and
+          # frontend routinely sit on other nodes; taking the first pod in the
+          # list returned api's node and re-pinned the database onto it, which
+          # its local-path volume cannot follow. The result was the exact
+          # "volume node affinity conflict" this check exists to prevent.
+          TARGET_NODE=$(kubectl get pods -n "${{ env.PR_NAMESPACE }}" \
+            -l component=database -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
+
+          if [ -n "$TARGET_NODE" ]; then
+            echo "Capsule already runs on $TARGET_NODE - keeping it there."
+            echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # ---------------------------------------------------------------
+          # 2. First placement: ask the dashboard.
+          #
+          # The oracle listens on loopback inside the dashboard pod with no
+          # Service and no Ingress, so "kubectl exec" is the only way in - and
+          # anyone who can exec already holds cluster credentials. It measures
+          # real memory use, unlike node "allocatable", which only reflects
+          # what the scheduler has reserved and never moves now that the chart
+          # carries no resource requests.
+          #
+          # The size is passed explicitly - see requiredMi in
+          # templates/pr-capsule.yml.js for why letting the oracle guess it
+          # was wrong in both directions.
+          # ---------------------------------------------------------------
+          ask_capacity() {
+            kubectl exec -n "${{ env.MAIN_NAMESPACE }}" deploy/flarops-dashboard -- \
+              curl -sS --max-time 10 "http://127.0.0.1:9090/capacity?mib=256&for=${{ env.PR_ENV_NAME }}"
+          }
+
+          OUT=""
+          for attempt in 1 2 3; do
+            if OUT=$(ask_capacity 2>/tmp/capacity.err); then
+              break
+            fi
+            echo "Capacity oracle not answering (attempt $attempt): $(cat /tmp/capacity.err)"
+            OUT=""
+            sleep 10
+          done
+
+          if [ -z "$OUT" ]; then
+            echo "::error::Could not reach the dashboard's capacity oracle. Refusing to guess whether this capsule fits - check that the main deployment is healthy before re-running."
+            exit 1
+          fi
+
+          echo "$OUT"
+          VERDICT=$(printf '%s' "$OUT" | head -1)
+          TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
+
+          if [ "$VERDICT" = "unknown" ]; then
+            echo "::error::The dashboard has no fresh fleet data, so it cannot say whether this capsule fits. Refusing to deploy blind."
+            exit 1
+          fi
+
+          # ---------------------------------------------------------------
+          # 3. No room: add a worker in the lowest free slot.
+          #
+          # Slots are addressed individually (see worker_slots in
+          # deploy/terraform/variables.tf), so adding one never disturbs the
+          # others and the number chosen here is the one teardown can later
+          # remove on its own.
+          # ---------------------------------------------------------------
+          if [ "$VERDICT" = "no" ]; then
+            echo "::warning::No node has room for this capsule. Adding a worker..."
+
+            cd deploy/terraform
+            terraform init
+            # The workspace MUST match the one every other step (and deploy.yml)
+            # uses - the real infrastructure lives in "main". Applying in any
+            # other workspace starts from an empty state and would provision a
+            # second, parallel stack, repointing this domain's DNS records at a
+            # brand new empty cluster.
+            terraform workspace select -or-create main
+
+            # All outputs at once: naming one that does not exist yet exits 1,
+            # while an empty state answers "{}" with exit 0.
+            ALL_OUTPUTS=$(terraform output -json)
+            CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
+            # Lowest unused slot, so a reclaimed number is reused rather than
+            # the set growing forever.
+            NEW_SLOTS=$(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; s=[int(x) for x in json.load(sys.stdin)]; f=next(n for n in range(1,1000) if n not in s); print(json.dumps(sorted(s+[f])))")
+            echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
+            terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
+            EC2_IP=$(terraform output -raw public_ip)
+            cd - > /dev/null
+
+            echo "Waiting for the new worker to join..."
+            # Only the node that was just added. "--all" waits on every node in
+            # the cluster, so one stale NotReady node made every scale-up fail
+            # after 180s - each attempt leaving behind a brand-new billed
+            # instance, because nothing here rolls the apply back.
+            NEW_SLOT=$(printf '%s' "$NEW_SLOTS" | python3 -c "import json,sys; print(sorted(json.load(sys.stdin))[-1])")
+            NEW_NODE="${INSTANCE_NAME:-}"
+            if [ -z "$NEW_NODE" ]; then NEW_NODE=$(terraform -chdir=deploy/terraform output -raw instance_name); fi
+            NEW_NODE="${NEW_NODE}-worker-${NEW_SLOT}"
+            echo "Waiting for $NEW_NODE to join..."
+            ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo k3s kubectl wait --for=condition=Ready node/${NEW_NODE} --timeout=240s"
+
+            # The new node is Ready before metrics-server has measured it, and
+            # the oracle refuses to place onto a node it cannot measure - so
+            # keep asking until it can.
+            TARGET_NODE=""
+            for attempt in 1 2 3 4 5 6 7 8; do
+              sleep 15
+              OUT=$(ask_capacity 2>/dev/null || true)
+              if [ "$(printf '%s' "$OUT" | head -1)" = "yes" ]; then
+                TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
+                echo "$OUT"
+                break
+              fi
+            done
+
+            if [ -z "$TARGET_NODE" ]; then
+              echo "::error::A worker was added but no node reports room for this capsule. Not deploying onto a node that cannot hold it."
+              exit 1
+            fi
+          fi
+
+          if [ -z "$TARGET_NODE" ]; then
+            echo "::error::The capacity oracle said yes but named no node."
+            exit 1
+          fi
+
+          echo "Capsule will be placed on $TARGET_NODE"
+          echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
+
+      - name: Setup Werf
+        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d # branch v2 @ 2026-05-21
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: docker.io
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Deploy application with Werf
+        env:
+          SECRET_ENV_SECRET_TOKEN: ${{ secrets.SECRET_TOKEN }}
+          SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
+          SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          REGISTRY_SERVER: https://index.docker.io/v1/
+        run: |
+          umask 077
+          # Read the instance shape back out of Terraform - the single place
+          # it is declared (deploy/terraform/variables.tf).
+          export TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
+          export TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
+          werf converge \
+            --parallel-tasks-limit=3 \
+            --repo docker.io/${{ env.REGISTRY_USER }}/${{ env.PROJECT_NAME }} \
+            --env ${{ env.PR_ENV_NAME }} \
+            --set domain=${{ env.PR_DOMAIN }} \
+            --set "dataNodeSelector.kubernetes\.io/hostname=$TARGET_NODE" \
+            --values deploy/helm/flarops-ci-values.json
+
+  cleanup-capsule:
+    name: Teardown PR Capsule
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    # Neither job has a natural bound - the k3s wait below and the werf
+    # converge can both stall indefinitely - and GitHub's own limit is six
+    # hours, during which the concurrency group keeps every later push queued.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          # Without this the job's GITHUB_TOKEN is left in .git/config, where
+          # every later step - and every third-party action among them - can
+          # read it. Nothing here pushes back to the repository.
+          persist-credentials: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: terraform init
+
+      - name: Terraform Workspace
+        working-directory: deploy/terraform
+        run: terraform workspace select -or-create main
+
+      - name: Fetch Kubeconfig from EC2
+        # The key is passed through the step environment, never interpolated
+        # into the script text: an expression substituted into a run block
+        # becomes part of the shell source the runner executes, so it lands in
+        # traces and in any error the shell prints back.
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          # Without this the step's last command is a sed that succeeds on an
+          # empty file, so a failed terraform output or a failed ssh left a
+          # useless kubeconfig behind and the step went green - after which the
+          # teardown "reclaimed nothing" and reported success while the capsule
+          # was still running and every worker still billing.
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
+
+          mkdir -p ~/.kube
+          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+
+      - name: Setup Werf
+        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d # branch v2 @ 2026-05-21
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: docker.io
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Dismiss application with Werf
+        # A PR whose deploy never succeeded has no release to dismiss, and werf
+        # exits non-zero on one that is not there. That failure used to abort
+        # the job before the scale-down step below, so the worker a failed
+        # capsule had triggered stayed provisioned - and kept being billed -
+        # until someone noticed.
+        continue-on-error: true
+        run: |
+          werf dismiss \
+            --repo docker.io/${{ env.REGISTRY_USER }}/${{ env.PROJECT_NAME }} \
+            --env ${{ env.PR_ENV_NAME }} \
+            --with-namespace
+
+      - name: Reclaim idle worker nodes
+        env:
+          TF_VAR_domain: ${{ env.BASE_DOMAIN }}
+        run: |
+          set -euo pipefail
+
+          cd deploy/terraform
+          terraform init
+          # Same workspace as every other step - the real infrastructure lives
+          # in "main".
+          terraform workspace select -or-create main
+          if ! ALL_OUTPUTS=$(terraform output -json 2>&1); then
+            echo "::error::Could not read Terraform outputs: $ALL_OUTPUTS"
+            exit 1
+          fi
+          CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
+          INSTANCE_NAME=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('instance_name',{}).get('value',''))")
+          cd - > /dev/null
+
+          if [ "$CURRENT_SLOTS" = "[]" ]; then
+            echo "No worker nodes to reclaim."
+            exit 0
+          fi
+          if [ -z "$INSTANCE_NAME" ]; then
+            echo "::error::Could not read instance_name from Terraform. Refusing to guess node names - a wrong guess drains a node that is carrying work."
+            exit 1
+          fi
+
+          # Node names are DERIVED from the same Terraform values that set the
+          # instance hostnames, not reconstructed from the project name here.
+          # The old code built "<project>-instance-worker-N" by hand; the real
+          # name comes from var.instance_name, which an operator may change.
+          # When the two drifted, every lookup matched nothing, every node
+          # looked idle, and nodes carrying live capsules were drained.
+          #
+          # A node is only reclaimed when kubectl SUCCEEDS and reports zero
+          # non-system pods. pipefail is what makes that true: without it a
+          # failed kubectl still ended the pipeline with "0" from wc, and an
+          # unreachable cluster read as "everything is idle".
+          FREED=""
+          for SLOT in $(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; print(' '.join(str(s) for s in sorted((int(x) for x in json.load(sys.stdin)), reverse=True)))"); do
+            NODE_NAME="${INSTANCE_NAME}-worker-${SLOT}"
+            echo "Checking $NODE_NAME ..."
+
+            # stderr is captured SEPARATELY. Folding it in with 2>&1 meant
+            # kubectl's own "No resources found" - which it prints to stderr -
+            # counted as a line of output, so an empty node read as holding one
+            # pod and was never reclaimed. A node that exists in Terraform but
+            # not in Kubernetes then bills forever.
+            if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" --no-headers 2>/tmp/kubectl.err); then
+              echo "  could not query pods on $NODE_NAME ($(cat /tmp/kubectl.err)) - leaving it alone."
+              continue
+            fi
+            PODS=$(printf '%s' "$RAW" | grep -v '^$' | grep -cv '^kube-system ' || true)
+
+            if [ "$PODS" -ne 0 ]; then
+              echo "  $PODS active pod(s) - keeping it."
+              continue
+            fi
+
+            echo "  idle - draining and removing."
+            kubectl drain "$NODE_NAME" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s || true
+            kubectl delete node "$NODE_NAME" --ignore-not-found
+            FREED="$FREED $SLOT"
+          done
+
+          if [ -z "$FREED" ]; then
+            echo "Nothing to reclaim."
+            exit 0
+          fi
+
+          # Slots are addressed individually, so any idle worker can go - a
+          # busy node no longer blocks reclaiming an idle one below it, which
+          # is what kept paying for nodes nobody was using.
+          NEW_SLOTS=$(FREED="$FREED" CURRENT="$CURRENT_SLOTS" python3 -c "import json,os; c=[int(x) for x in json.loads(os.environ['CURRENT'])]; f={int(x) for x in os.environ['FREED'].split()}; print(json.dumps(sorted(s for s in c if s not in f)))")
+          echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
+          cd deploy/terraform
+          terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
+
+# ===== .gitignore
+#autogenerated by flarops
+.env
+.keys/
+FLAROPS.md
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*tfplan*
+deploy/helm/flarops-ci-values.json
+
+# ===== FLAROPS.md
+# Flarops Deployment Guide
+
+Flarops has successfully generated the infrastructure and CI/CD configuration for your project!
+
+## Next Manual Steps
+
+To complete the setup and perform your first deployment, please follow these instructions:
+
+### 1. Add GitHub Secrets
+You must manually add the generated secrets to your GitHub repository. 
+1. Go to your GitHub repository.
+2. Navigate to **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**.
+3. Open the generated `deploy/.env` file in your project.
+4. For each variable in that file, create a new Repository Secret with the exact same name (e.g., `AWS_ACCESS_KEY_ID`) and its corresponding value.
+*(Note: Be sure to copy multiline secrets like `SSH_PRIVATE_KEY` exactly as they are, including line breaks, without any surrounding quotation marks).*
+
+### 2. Push to your Branch
+Commit the newly generated files to your repository. Flarops has automatically updated your `.gitignore` to exclude sensitive files like `.env` and your local `.keys/` directory.
+
+```bash
+git add .
+git commit -m "chore: setup Flarops CI/CD and infrastructure"
+git push origin main
+```
+
+Once you push to the `main` branch (or trigger it manually), the GitHub Actions workflow (`deploy.yml`) will automatically start provisioning your infrastructure and deploying your application.
+
+# ===== backend/Dockerfile
+FROM node:20
+
+# ===== backend/index.js
+const express=require("express");const app=express();process.env.SECRET_TOKEN;process.env.APP_MODE;app.get("/items",(q,r)=>r.json([]));app.listen(3000)
+
+# ===== backend/package.json
+{"name":"b","dependencies":{"express":"^4"}}
+
+# ===== deploy/.env
+# These secrets must be saved in Github repository secrets with the same name
+AWS_ACCESS_KEY_ID="AKIATEST"
+AWS_SECRET_ACCESS_KEY="secrettest"
+SSH_PRIVATE_KEY="<PEM>"
+REGISTRY_PASSWORD="testpass"
+
+# Extracted sensitive variables from project .env files
+SECRET_TOKEN=s3cr3t
+
+# Generated by Flarops for the deployment dashboard - not taken from your project
+DASHBOARD_PASSWORD_HASH='pbkdf2-sha256$i=600000$<PBKDF2>'
+
+# ===== deploy/.env.safety
+DATABASE_USER=
+DATABASE_TYPE=
+DOCKER_REGISTRY=
+DOMAIN=example.test
+AWS_REGION=us-west-2
+
+# ===== deploy/helm/Chart.yaml
+apiVersion: v2
+name: b-fourspace
+description: A Helm chart for b-fourspace generated by Flarops
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+# ===== deploy/helm/templates/01-ingress.yaml
+{{/*
+An Ingress with an empty paths list is not merely useless - "paths: null"
+fails HTTPIngressRuleValue's schema and the API server rejects the object, so
+werf converge aborts and NOTHING deploys. A project can legitimately end up
+with no public route (every service behind a gateway that itself exposes
+nothing, or two services whose conflicting prefixes were both dropped), and
+that should leave the services running and reachable inside the cluster rather
+than blocking the whole deployment. init prints a NOTE when it happens.
+*/}}
+{{- $hasApiRoutes := and .Values.hasBackend .Values.apiRoutes }}
+{{- $hasDirect := false }}
+{{- range $service := (.Values.additionalServices | default list) }}
+{{- if and $service.exposedRoutes $service.exposeDirectly }}{{ $hasDirect = true }}{{ end }}
+{{- end }}
+{{- $hasRoot := or .Values.hasFrontend (and .Values.hasBackend .Values.apiServesFrontend) }}
+{{- if or $hasApiRoutes $hasDirect $hasRoot }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.projectName }}-ingress
+  labels:
+    app: {{ .Values.projectName }}
+  annotations:
+    # No cert-manager issuer and no tls: block, on either path.
+    #
+    # The non-Cloudflare path used to declare both, and the certificate was
+    # even issued - HTTP-01 only needs port 80. But the generated security
+    # group opens 22, 80 and 6443 and nothing else, so 443 was unreachable and
+    # every request stayed cleartext while the chart claimed otherwise. A
+    # declared-but-unserviceable TLS is worse than none: it reads as secure in
+    # the manifest, and the dashboard's Secure/__Host- cookies are then
+    # rejected by the browser on an http:// origin, so login cannot complete
+    # at all. TLS termination belongs in front of the cluster (Cloudflare, or
+    # whatever the operator puts there), which is where it already was on the
+    # only path that worked.
+    kubernetes.io/ingress.class: "traefik"
+spec:
+  ingressClassName: traefik
+  rules:
+{{- if .Values.domain }}
+    - host: {{ .Values.domain }}
+      http:
+{{- else }}
+    - http:
+{{- end }}
+        paths:
+{{- if .Values.additionalServices }}
+{{- range $service := .Values.additionalServices }}
+{{- if $service.exposedRoutes }}
+{{- if $service.exposeDirectly }}
+{{- range $route := $service.exposedRoutes }}
+          - path: {{ $route }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $service.name }}
+                port:
+                  number: {{ index $service.ports 0 | default 80 }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.hasBackend .Values.apiRoutes }}
+{{- range $route := .Values.apiRoutes }}
+          - path: {{ $route }}
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: {{ index $.Values.apiPorts 0 | default 3000 }}
+{{- end }}
+{{- end }}
+{{- if .Values.hasFrontend }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: {{ index .Values.frontendPorts 0 }}
+{{- else if and .Values.hasBackend .Values.apiServesFrontend }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: {{ index .Values.apiPorts 0 | default 3000 }}
+{{- end }}
+{{- end }}
+
+# ===== deploy/helm/templates/_helpers.tpl
+{{/*
+The pod-template annotation that forces a rollout when secret material changes
+used to hash the WHOLE .Values.env map in every workload, so rotating any one
+secret restarted every pod in the project - including the ones that never read
+it. This picks out only the keys a given workload actually consumes, so a
+rotation rolls exactly the pods that depend on it.
+
+Takes a dict: "env" (the secret map), "keys" (the key names this workload
+mounts) and "password" (the database password, for the workloads wired to it).
+A workload consuming neither still gets a stable, non-empty hash.
+*/}}
+{{- define "flarops.secretChecksum" -}}
+{{- $env := .env | default dict -}}
+{{- $picked := dict -}}
+{{- range $k := (.keys | default list) -}}
+{{- $_ := set $picked $k (index $env $k | default "") -}}
+{{- end -}}
+{{- printf "%s|%s" (toJson $picked) (toString (.password | default "")) | sha256sum -}}
+{{- end -}}
+
+{{/*
+A replica count that keeps an explicit 0.
+
+"{{ .replicas | default 1 }}" cannot express "scaled to zero": sprig's default
+treats 0 as empty exactly like nil, so setting replicas: 0 in values.yaml
+silently brought the workload back up with one pod and there was no way to stop
+a service from the chart at all. Only an absent value falls back.
+*/}}
+{{- define "flarops.replicas" -}}
+{{- if kindIs "invalid" . -}}1{{- else -}}{{ . }}{{- end -}}
+{{- end -}}
+
+# ===== deploy/helm/templates/api.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    app: {{ .Values.projectName }}
+    component: api
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: api
+  ports:
+{{- range $port := .Values.apiPorts }}
+    - name: port-{{ $port }}
+      protocol: TCP
+      port: {{ $port }}
+      targetPort: {{ $port }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app: {{ .Values.projectName }}
+    component: api
+spec:
+  replicas: {{ include "flarops.replicas" .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: api
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: api
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.api.secretKeys | default list) (list "DATABASE_PASSWORD")) "password" ((.Values.database | default dict).password | default "")) }}
+    spec:
+      automountServiceAccountToken: false
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+
+      containers:
+        - name: api
+          image: {{ if .Values.werf }}{{ .Values.werf.image.api }}{{ else }}{{ .Values.images.api | default "api:latest" }}{{ end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+
+{{- if or .Values.api.env .Values.api.secretKeys false false false }}
+          env:
+{{- if .Values.api.env }}
+{{- range $key, $value := .Values.api.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+{{- if .Values.api.secretKeys }}
+{{- range $key := .Values.api.secretKeys }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: {{ $key }}
+{{- end }}
+{{- end }}
+
+{{- end }}
+          # No resource requests or limits are set here on purpose. A generated
+          # figure is a guess about someone else's workload, and the two ways it
+          # can be wrong are both bad: too low and the pod is OOM-killed or
+          # throttled under load, too high and the scheduler reserves capacity
+          # nothing uses, which is exactly the capacity the capsule placement
+          # maths is trying to account for. Set them per service in
+          # deploy/helm/values.yaml when the real numbers are known.
+{{- if .Values.api.healthRoute }}
+          # A startup probe covers the (often long) boot of a JVM/runtime
+          # without forcing the liveness probe to be slack for the whole life
+          # of the pod: liveness only begins once startup has succeeded, so a
+          # slow start no longer reads as a crash, and a real hang is still
+          # caught quickly afterwards.
+          startupProbe:
+            httpGet:
+              path: {{ .Values.api.healthRoute }}
+              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+            periodSeconds: 10
+            # A JVM answering its first probes while still warming up regularly
+            # needs more than the 1s default, and a probe that times out counts
+            # as a failure exactly like a 404 would.
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.api.healthRoute }}
+              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.api.healthRoute }}
+              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+{{- end }}
+
+# ===== deploy/helm/templates/dashboard.yaml
+{{- if eq .Values.werf.env "production" }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flarops-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.projectName }}-dashboard-role-{{ .Values.werf.env }}
+rules:
+# nodes/proxy is deliberately NOT here. The API server maps a GET on a proxy
+# subresource to "get", and the kubelet serves /exec on GET as well as POST, so
+# that one verb also authorizes
+#   GET /api/v1/nodes/<node>/proxy/exec/<ns>/<pod>/<container>?command=sh
+# on every container in the cluster - and RBAC cannot narrow a subresource to
+# one path. It was needed only for the node disk gauge, which now comes from
+# the DaemonSet below instead.
+- apiGroups: [""]
+  resources: ["nodes", "pods", "namespaces", "persistentvolumeclaims"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.projectName }}-dashboard-binding-{{ .Values.werf.env }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.projectName }}-dashboard-role-{{ .Values.werf.env }}
+subjects:
+- kind: ServiceAccount
+  name: flarops-dashboard
+  namespace: {{ .Release.Namespace }}
+---
+# configmaps are only ever read from the "default" namespace (see
+# dashboard/collector.go's GetConfigMaps("default") call) - scoped to a
+# namespaced Role instead of the cluster-wide ClusterRole above, so a
+# compromised dashboard pod can't enumerate configmaps in every namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.projectName }}-dashboard-configmaps-{{ .Values.werf.env }}
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.projectName }}-dashboard-configmaps-binding-{{ .Values.werf.env }}
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.projectName }}-dashboard-configmaps-{{ .Values.werf.env }}
+subjects:
+- kind: ServiceAccount
+  name: flarops-dashboard
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flarops-dashboard-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.dashboard.storage | default "1Gi" }}
+---
+{{- if eq .Values.werf.env "production" }}
+# Reports one node's disk usage and nothing else. It replaces the dashboard's
+# former "get nodes/proxy", which reached the kubelet's stats/summary and, with
+# the same verb, exec on every container in the cluster (see the ClusterRole
+# above and dashboard/nodeagent.go).
+#
+# It mounts the host root READ-ONLY and is given no ServiceAccount token and no
+# API access at all: it answers two integers over the pod network. That is a
+# far smaller thing to hold than the authority it removes.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: flarops-node-agent
+  labels:
+    app: flarops-node-agent
+spec:
+  selector:
+    matchLabels:
+      app: flarops-node-agent
+  template:
+    metadata:
+      labels:
+        app: flarops-node-agent
+    spec:
+      automountServiceAccountToken: false
+      # The figures are for the node, so the agent has to be on every node -
+      # including any the operator has tainted.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-agent
+          image: {{ if .Values.werf }}{{ .Values.werf.image.dashboard }}{{ else }}{{ .Values.images.dashboard | default "dashboard:latest" }}{{ end }}
+          env:
+            - name: FLAROPS_NODE_AGENT
+              value: "1"
+            - name: FLAROPS_HOST_ROOT
+              value: /host
+          ports:
+            - containerPort: 9101
+              name: disk
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "5m"
+            limits:
+              memory: "64Mi"
+              cpu: "50m"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9101
+            periodSeconds: 30
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flarops-dashboard
+spec:
+  replicas: {{ include "flarops.replicas" .Values.dashboard.replicas }}
+  selector:
+    matchLabels:
+      app: flarops-dashboard
+  template:
+    metadata:
+      labels:
+        app: flarops-dashboard
+      annotations:
+        # Rotating the dashboard credential rewrites the Secret but changes
+        # nothing about this Deployment, so without this the pod kept running
+        # on the old hash and the new password simply did not work until
+        # someone deleted the pod by hand.
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (list "DASHBOARD_PASSWORD_HASH")) }}
+    spec:
+      serviceAccountName: flarops-dashboard
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: dashboard
+        image: {{ .Values.werf.image.dashboard }}
+        imagePullPolicy: Always
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        env:
+        # The dashboard refuses to start without this (see loadAuthConfig in
+        # dashboard/auth.go) rather than falling back to serving the cluster's
+        # internals unauthenticated. Only the PBKDF2 hash travels here; the
+        # password itself was shown once by "flarops init" and stored nowhere.
+        - name: DASHBOARD_PASSWORD_HASH
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.projectName }}-secrets
+              key: DASHBOARD_PASSWORD_HASH
+        # Traefik terminates TLS and proxies to this pod, so the peer address
+        # is the ingress controller and the real client is only in
+        # X-Forwarded-For - which login rate limiting is keyed on.
+        - name: DASHBOARD_TRUST_PROXY
+          value: "1"
+        - name: DOMAIN
+          value: {{ .Values.domain | quote }}
+        - name: DB_PATH
+          value: "/data/flarops_metrics.db"
+        # The cost model used to hardcode this project's own region, instance
+        # type and root volume size, so spend was wrong for anyone running a
+        # different shape. Pass the real values the infrastructure was
+        # provisioned with instead.
+        - name: AWS_REGION
+          value: {{ .Values.aws.region | quote }}
+        - name: FLAROPS_DEFAULT_INSTANCE_TYPE
+          value: {{ .Values.aws.instanceType | default "" | quote }}
+        - name: FLAROPS_EBS_GB
+          value: {{ .Values.aws.volumeSize | default "" | quote }}
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: flarops-dashboard-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flarops-dashboard
+spec:
+  selector:
+    app: flarops-dashboard
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flarops-dashboard
+  annotations:
+    # Same reasoning as templates/01-ingress.js: no cert-manager issuer and no
+    # tls: block, because the generated security group never opens 443. This
+    # one mattered more than the application's - the dashboard's session
+    # cookies carry the __Host- prefix and Secure, which a browser refuses to
+    # store on an http:// origin, so declaring TLS that cannot be served left
+    # the dashboard impossible to log into rather than merely unencrypted.
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    kubernetes.io/ingress.class: traefik
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: dashboard.example.test
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: flarops-dashboard
+            port:
+              number: 80
+{{- end }}
+
+# ===== deploy/helm/templates/registry-secret.yaml
+{{- if and .Values.imagePullSecret (kindIs "map" .Values.imagePullSecret) }}
+{{- $reg := .Values.imagePullSecret }}
+{{- $auth := printf "%s:%s" ($reg.username | toString) ($reg.password | toString) | b64enc }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.projectName }}-registry
+  labels:
+    app: {{ .Values.projectName }}
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: {{ dict "auths" (dict ($reg.server | toString) (dict "username" ($reg.username | toString) "password" ($reg.password | toString) "auth" $auth)) | toJson | b64enc }}
+{{- end }}
+
+# ===== deploy/helm/templates/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.projectName }}-secrets
+  labels:
+    app: {{ .Values.projectName }}
+type: Opaque
+stringData:
+{{- if .Values.env }}
+{{- range $key, $value := .Values.env }}
+  {{ $key }}: {{ $value | quote }}
+{{- end }}
+{{- end }}
+
+# ===== deploy/helm/values.yaml
+projectName: b-fourspace
+domain: "example.test"
+hasBackend: true
+hasFrontend: false
+apiServesFrontend: false
+images:
+  api: api:latest
+  db: postgres:15-alpine
+
+dbCloneSource: ""
+dbType: null
+dbPort: null
+database:
+  user: "postgres"
+  password: null
+  name: "appdb"
+  replicas: 1
+  storage: "10Gi"
+  env:
+    # KEY: "VALUE"
+api:
+  replicas: 1
+  healthRoute: null
+  healthPort: null
+  secretKeys:
+    - SECRET_TOKEN
+  env:
+    APP_MODE: "production"
+apiPorts:
+  - 3000
+
+
+apiRoutes:
+  - "/items"
+
+# instanceType and volumeSize are deliberately NOT set here. They are declared
+# once, in deploy/terraform/variables.tf, and CI reads them back out of
+# Terraform's outputs into these keys at deploy time (see the workflow's
+# buildValuesScript). Writing them here as well would mean three copies of the
+# same fact - chart, Terraform and dashboard - that drift the first time
+# someone resizes the fleet and only edits one of them.
+#
+# region is the exception: Terraform cannot be its source, because the region
+# has to be known before Terraform can initialise its own S3 backend.
+aws:
+  region: "us-west-2"
+  instanceType: null
+  volumeSize: null
+dashboard:
+  replicas: 1
+  storage: "1Gi"
+# Populated by CI from the registry credentials (see the workflow's
+# buildValuesScript) so private images can be pulled. Left null here on
+# purpose - nothing secret belongs in a committed file.
+imagePullSecret: null
+# Set by the PR-capsule workflow to the node the dashboard's capacity oracle
+# picked. Only the STATEFUL workloads read it: their volumes come from k3s's
+# local-path provisioner and live on one node's disk, so a database pod that
+# moves can never reach its data again. Stateless workloads are deliberately
+# left to the scheduler, so a capsule can use room spread across the fleet.
+dataNodeSelector: {}
+
+# ===== deploy/terraform/main.tf
+terraform {
+  backend "s3" {
+    bucket = "b-fourspace-remote-state"
+    key    = "terraform.tfstate"
+    region = "us-west-2"
+    # The state file contains the k3s join token and the deploy public key in
+    # clear text, so it is encrypted at rest. use_lockfile is S3-native state
+    # locking (Terraform 1.10+): without any lock, the three places that run
+    # "terraform apply" - a push to main, a PR capsule scaling up, and one
+    # scaling down - could interleave and corrupt the state.
+    encrypt      = true
+    use_lockfile = true
+  }
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 4.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  tags = {
+    Name = "${var.instance_name}-vpc"
+  }
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = "${var.aws_region}a"
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "random_password" "k3s_token" {
+  length  = 32
+  special = false
+}
+
+resource "aws_security_group" "sg" {
+  name        = "${var.instance_name}-sg"
+  description = "Allow SSH, HTTP, and Kubernetes API"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "Intra-cluster communication"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
+  }
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Kubernetes API"
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-*-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_instance" "server" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.sg.id]
+
+  root_block_device {
+    volume_size = var.volume_size
+    volume_type = "gp3"
+  }
+
+  # The instance metadata service hands out whatever is in user_data - which
+  # includes the k3s join token. With IMDSv1 any process that can make an
+  # outbound HTTP request could read it, so an SSRF in an application pod was
+  # enough to take over the cluster. Requiring a session token (IMDSv2) blocks
+  # the plain-GET SSRF shape, and a hop limit of 1 means the response never
+  # survives the extra network hop out of a container - only the host itself
+  # can reach it. Nothing in user_data queries the metadata service any more,
+  # so requiring tokens costs nothing.
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+    instance_metadata_tags      = "disabled"
+  }
+
+  user_data = sensitive(<<-EOF
+    #!/bin/bash
+    mkdir -p /home/ubuntu/.ssh
+    echo "${var.ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
+    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+    chmod 700 /home/ubuntu/.ssh
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${var.k3s_version}" INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --token ${random_password.k3s_token.result} --tls-san ${aws_eip.eip.public_ip}" sh -
+  EOF
+  )
+
+  tags = {
+    Name = var.instance_name
+  }
+
+  lifecycle {
+    # user_data is ignored for the same reason as ami: cloud-init runs it only
+    # on FIRST boot, so a change to it (bumping var.k3s_version, rotating the
+    # deploy key) cannot take effect on a running instance - it only stops and
+    # starts it, taking the cluster down for nothing. Applying a new k3s
+    # version means replacing the node deliberately, not letting a plan do it
+    # as a side effect: the whole cluster, including every local-path volume
+    # holding the database, lives on this instance's root EBS.
+    ignore_changes = [ami, user_data]
+  }
+}
+
+# The Elastic IP is allocated BEFORE the server so its address can be baked
+# into the API server certificate via --tls-san above. When the EIP was
+# instead declared with "instance = aws_instance.server.id", k3s booted first
+# and could only see the temporary auto-assigned public IP; the EIP attached
+# afterwards, and every later "terraform output public_ip" returned an address
+# the certificate did not cover, so kubectl failed with
+# "x509: certificate is valid for <old-ip>". Association is a separate
+# resource purely to keep the dependency pointing this way.
+resource "aws_eip" "eip" {
+  domain = "vpc"
+}
+
+resource "aws_eip_association" "eip_assoc" {
+  instance_id   = aws_instance.server.id
+  allocation_id = aws_eip.eip.id
+}
+
+resource "aws_instance" "worker" {
+  for_each               = toset([for slot in var.worker_slots : tostring(slot)])
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.sg.id]
+
+  root_block_device {
+    volume_size = var.volume_size
+    volume_type = "gp3"
+  }
+
+  # The instance metadata service hands out whatever is in user_data - which
+  # includes the k3s join token. With IMDSv1 any process that can make an
+  # outbound HTTP request could read it, so an SSRF in an application pod was
+  # enough to take over the cluster. Requiring a session token (IMDSv2) blocks
+  # the plain-GET SSRF shape, and a hop limit of 1 means the response never
+  # survives the extra network hop out of a container - only the host itself
+  # can reach it. Nothing in user_data queries the metadata service any more,
+  # so requiring tokens costs nothing.
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+    instance_metadata_tags      = "disabled"
+  }
+
+  user_data = sensitive(<<-EOF
+    #!/bin/bash
+    HOSTNAME="${var.instance_name}-worker-${each.key}"
+    hostnamectl set-hostname $HOSTNAME
+
+    mkdir -p /home/ubuntu/.ssh
+    echo "${var.ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
+    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+    chmod 700 /home/ubuntu/.ssh
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${var.k3s_version}" INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" K3S_URL=https://${aws_instance.server.private_ip}:6443 K3S_TOKEN=${random_password.k3s_token.result} sh -
+  EOF
+  )
+
+  tags = {
+    Name = "${var.instance_name}-worker-${each.key}"
+    Role = "worker"
+  }
+
+  lifecycle {
+    # user_data is ignored for the same reason as ami: cloud-init runs it only
+    # on FIRST boot, so a change to it (bumping var.k3s_version, rotating the
+    # deploy key) cannot take effect on a running instance - it only stops and
+    # starts it, taking the cluster down for nothing. Applying a new k3s
+    # version means replacing the node deliberately, not letting a plan do it
+    # as a side effect: the whole cluster, including every local-path volume
+    # holding the database, lives on this instance's root EBS.
+    ignore_changes = [ami, user_data]
+  }
+}
+
+output "public_ip" {
+  value = aws_eip.eip.public_ip
+}
+
+# The instance shape is declared once, in variables.tf, and read back out
+# here. CI feeds these outputs into the Helm values (see deploy.yml), which is
+# what the dashboard prices the fleet against - so changing the instance type
+# means editing exactly one line in variables.tf, not three files that can
+# silently disagree about what is actually running.
+# The slots currently provisioned. CI reads this instead of counting lines in
+# "terraform state list", so scaling decisions are made against a real value
+# Terraform itself reports rather than a grep over its output.
+# Node names are derived from this, so CI must read it rather than rebuild it
+# from the project name - they are only equal until someone edits the variable.
+output "instance_name" {
+  value = var.instance_name
+}
+
+output "worker_slots" {
+  # Numbers, not strings. Terraform's sort() only takes a list of strings and
+  # gives strings back, so sorting the numbers directly emitted ["1","3"] -
+  # and the CI arithmetic that picks the next free slot then compared integers
+  # against strings, found every slot "free", and handed back a number that
+  # collided with a running worker.
+  value = [for s in sort([for x in var.worker_slots : tostring(x)]) : tonumber(s)]
+}
+
+output "worker_nodes" {
+  description = "Kubernetes node names of the workers, derived from the same values that set their hostnames."
+  value       = sort([for slot in var.worker_slots : "${var.instance_name}-worker-${slot}"])
+}
+
+output "instance_type" {
+  value = var.instance_type
+}
+
+output "volume_size" {
+  value = var.volume_size
+}
+
+# ===== deploy/terraform/variables.tf
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-west-2"
+}
+
+variable "instance_name" {
+  description = "Name tag for the EC2 instance"
+  type        = string
+  default     = "b-fourspace-instance"
+}
+
+# Workers are addressed by SLOT, not by position in a list.
+#
+# With "count", Terraform identifies an instance by its index, so removing a
+# node in the middle renumbers every node above it - and reducing the count
+# destroys the highest index, whichever node that happens to be. Reclaiming an
+# idle worker while a busier one sits above it was therefore impossible, and
+# the PR-capsule teardown could only ever peel nodes off the top.
+#
+# A set of slot numbers makes each worker independently addressable:
+# dropping 2 from [1,2,3] destroys exactly worker 2 and leaves 1 and 3 alone.
+variable "worker_slots" {
+  description = "Slot numbers of the worker nodes to run, e.g. [1,3]. Each slot is one instance, addressable independently of the others."
+  type        = set(number)
+  default     = []
+}
+
+variable "instance_type" {
+  description = "Type of the instance"
+  type        = string
+  default     = "t3a.medium"
+}
+
+# Pinned on purpose. "curl https://get.k3s.io | sh" without a version installs
+# whatever is current the moment each node boots, so a fleet grown over weeks
+# ends up running different Kubernetes versions, and a compromise of the
+# install endpoint would land on every node that has yet to be created. Change
+# it here and nowhere else - both the server and the agents read this.
+variable "k3s_version" {
+  description = "k3s version installed on every node (see https://github.com/k3s-io/k3s/releases)"
+  type        = string
+  default     = "v1.36.4+k3s1"
+}
+
+variable "volume_size" {
+  description = "Size of the root volume in GB"
+  type        = number
+  default     = 40
+}
+
+variable "ssh_public_key" {
+  description = "Public SSH key for EC2 instance"
+  type        = string
+  default     = "ssh-rsa <PUBKEY>"
+  sensitive   = true
+}
+
+variable "domain" {
+  description = "Domain Name"
+  type        = string
+  default     = "example.test"
+}
+
+# ===== docker-compose.yml
+services:
+    backend:
+        build: ./backend
+        ports:
+            - "3000:3000"
+        environment:
+            SECRET_TOKEN: s3cr3t
+            APP_MODE: production
+
+# ===== werf-giterminism.yaml
+giterminismConfigVersion: 1
+config:
+  dockerfile:
+    allowUncommitted:
+      - .env
+      - deploy/.env
+helm:
+  allowUncommittedFiles:
+    - deploy/helm/flarops-ci-values.json
+
+# ===== werf.yaml
+project: b-fourspace
+configVersion: 1
+deploy:
+  helmChartDir: deploy/helm
+---
+image: api
+dockerfile: Dockerfile
+context: backend
+---
+image: dashboard
+dockerfile: Dockerfile
+context: deploy/dashboard

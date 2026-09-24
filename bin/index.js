@@ -5,7 +5,8 @@ const command = process.argv[2];
 function showHelp() {
   console.log(
     "Available commands:\n" +
-    "  init         Initialize terraform configuration\n"
+    "  init         Analyze this repository and generate the deployment stack\n" +
+    "  sync         Remove generated chart templates that no longer match any service\n"
   );
 }
 
@@ -14,6 +15,11 @@ function showHelp() {
     case 'init': {
       const initCmd = require('./commands/init.js');
       await initCmd();
+      break;
+    }
+    case 'sync': {
+      const syncCmd = require('./commands/sync.js');
+      await syncCmd();
       break;
     }
     default:

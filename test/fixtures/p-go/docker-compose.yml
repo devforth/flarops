@@ -1,0 +1,13 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: gopw
+      POSTGRES_DB: godb
+  api:
+    build: ./backend
+    ports: ["8090:8090"]
+    command: ["/app/server", "-listen", ":8090", "-db-host", "db"]
+    environment:
+      DB_NAME: godb
+    depends_on: [db]

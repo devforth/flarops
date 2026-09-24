@@ -186,8 +186,11 @@ ${hasVolumes ? `  strategy:
         component: ${service.name}
       annotations:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (${idx}.secretKeys | default list) (list ${extraKeyList}))) }}${hasConfigMap ? `
-        # Rolls the pod when the carried configuration changes, the same way
-        # checksum/secret does for secret material.
+        # Rolls the pod when the carried configuration changes. NOT the same
+        # mechanism as checksum/secret above: that one is evaluated by Helm at
+        # render time, this is a hash computed by the generator, so it only
+        # changes when flarops init re-runs. Editing the ConfigMap by hand will
+        # not roll the pod.
         checksum/config: ${require('crypto').createHash('sha256').update(JSON.stringify(service.configMapData)).digest('hex').slice(0, 32)}` : ''}
     spec:
       automountServiceAccountToken: false

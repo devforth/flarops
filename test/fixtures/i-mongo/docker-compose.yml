@@ -1,0 +1,12 @@
+services:
+  mongo:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_PASSWORD: mongopw
+      MONGO_INITDB_DATABASE: events
+  api:
+    build: ./backend
+    ports: ["5000:5000"]
+    environment:
+      MONGO_URL: mongodb://root:mongopw@mongo:27017/events
+    depends_on: [mongo]

@@ -231,12 +231,17 @@ async function analyzeBackendExposedRoutes(backendDir) {
     } catch (e) {}
   }
 
-  if (Object.keys(mountScores).length > 0) {
-    return Object.entries(mountScores).sort((a, b) => b[1] - a[1]).map(r => r[0]);
+  // Mounts and method routes are MERGED, not either-or. Returning only the
+  // mounts when any existed meant a single
+  //   app.use('/uploads', express.static('uploads'))
+  // discarded every app.get('/api/...') in the file - the Ingress then carried
+  // one rule for /uploads and the entire API answered 404. A mount outranks a
+  // method route of the same prefix, which the score ordering already does.
+  const merged = { ...routeScores };
+  for (const [route, score] of Object.entries(mountScores)) {
+    merged[route] = (merged[route] || 0) + score + 1;
   }
-
-  const sortedRoutes = Object.entries(routeScores).sort((a, b) => b[1] - a[1]);
-  return sortedRoutes.map(r => r[0]);
+  return Object.entries(merged).sort((a, b) => b[1] - a[1]).map(r => r[0]);
 }
 
 module.exports = { analyzeBackendExposedRoutes, 

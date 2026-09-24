@@ -661,9 +661,15 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		tooManyAttempts(w, wait)
 		return
 	}
+	// The global limiter deliberately does NOT gate the request here any more.
+	// Consulted before the credential was examined, it let distributed noise
+	// lock the operator out of their own dashboard with a correct password -
+	// 500 failures cost about three minutes of wall time against a fifteen
+	// minute window, so a handful of addresses kept it permanently tripped.
+	// Its real job is bounding CPU, and the verifier queue above does that
+	// directly. It stays as a signal.
 	if wait := globalLimiter.retryAfter("global"); wait > 0 {
-		tooManyAttempts(w, wait)
-		return
+		log.Printf("auth: global failure rate is elevated (%s remaining in window)", wait.Truncate(time.Second))
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
@@ -701,6 +707,13 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		// Not counted as a failed attempt: the credential was never read, and
 		// counting it would let a burst of anonymous requests exhaust the
 		// operator's own allowance.
+		//
+		// It IS counted against the source address, though. Turning requests
+		// away for free meant an attacker could keep the queue full
+		// indefinitely at no cost, which denied the operator the login they
+		// were being protected for - the refusal was as effective a lockout as
+		// the one it prevents.
+		perIPLimiter.recordFailure(ip)
 		tooManyAttempts(w, 5*time.Second)
 		return
 	}

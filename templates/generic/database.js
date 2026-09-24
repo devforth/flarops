@@ -134,7 +134,7 @@ spec:
               drop: ["NET_RAW"]
             seccompProfile:
               type: RuntimeDefault
-          env:${envBlock}${renderProbes(db.type, db.image)}
+          env:${envBlock}${renderProbes(db.type)}
           # No resource requests or limits are set here on purpose. A generated
           # figure is a guess about someone else's workload, and the two ways it
           # can be wrong are both bad: too low and the pod is OOM-killed or

@@ -1,0 +1,13 @@
+services:
+  db:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpw
+      MARIADB_DATABASE: crmdb
+  api:
+    build: ./backend
+    ports: ["8080:8080"]
+    environment:
+      DB_HOST: db
+      DB_NAME: crmdb
+    depends_on: [db]

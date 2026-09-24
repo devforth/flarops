@@ -1,0 +1,23 @@
+services:
+  auth-db:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: authpw
+      POSTGRES_DB: authdb
+  billing-db:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: billpw
+      POSTGRES_DB: billingdb
+  auth-service:
+    build: ./auth-service
+    ports: ["4001:4001"]
+    environment:
+      DATABASE_URL: postgres://postgres:authpw@auth-db:5432/authdb
+    depends_on: [auth-db]
+  billing-service:
+    build: ./billing-service
+    ports: ["4002:4002"]
+    environment:
+      DATABASE_URL: postgres://postgres:billpw@billing-db:5432/billingdb
+    depends_on: [billing-db]

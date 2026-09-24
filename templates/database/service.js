@@ -1,7 +1,8 @@
 module.exports = (config) => {
-  // The port has to be the engine's own default, not Postgres' - a MongoDB
-  // project whose dbPort ended up unset used to get a Service on 5432 in
-  // front of a container listening on 27017.
+  // config.dbPort is resolved per engine by the caller (see defaultPortFor in
+  // utils/dbDefaults.js). The 5432 here is only the last resort for a chart
+  // rendered with no database detected at all - it is NOT engine-aware, so do
+  // not rely on it to be right for MongoDB or MySQL.
   const dbPort = (config && config.dbPort) || 5432;
 
   return `
@@ -18,7 +19,8 @@ spec:
   # nominally wants, but spec.clusterIP is immutable once assigned, so every
   # already-deployed project would fail its next converge on "may not change
   # once set" - and a headless Service publishes no DNS records at all while
-  # its pod is unready, which turns the readiness probe above into a hard
+  # its pod is unready, which turns the readiness probe on the StatefulSet
+  # (templates/database/deployment.js, concatenated after this file) into a hard
   # NXDOMAIN for every client during database startup instead of a retryable
   # refused connection. Nothing generated here addresses a database pod
   # individually, so the per-pod name buys nothing against those two costs.

@@ -381,9 +381,30 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
     // Never reach outside the repository: a mount of /etc or ~/ is the host's
     // own configuration, not this project's, and copying it into a ConfigMap
     // would put whatever it holds into the cluster.
-    const rel = pathMod.relative(baseDir, abs);
+    //
+    // The check is on the RESOLVED path, because statSync and readdirSync
+    // resolve too. Comparing the lexical path let a symlink whose own name sat
+    // inside the repository - "./initdb" pointing at ~/.kube - pass the test
+    // and be read straight through into a chart the operator is told to
+    // commit. Nothing in the secret-material filter catches that: a kubeconfig
+    // is named "config" and its keys are client-key-data and
+    // certificate-authority-data.
+    let realAbs;
+    try {
+      realAbs = fsMod.realpathSync(abs);
+    } catch (e) {
+      unresolved.push({ ...mount, reason: 'does not exist in the repository' });
+      continue;
+    }
+    let realBase;
+    try {
+      realBase = fsMod.realpathSync(baseDir);
+    } catch (e) {
+      realBase = baseDir;
+    }
+    const rel = pathMod.relative(realBase, realAbs);
     if (rel.startsWith('..') || pathMod.isAbsolute(rel)) {
-      unresolved.push({ ...mount, reason: 'points outside the repository' });
+      unresolved.push({ ...mount, reason: 'resolves outside the repository' });
       continue;
     }
 
@@ -415,6 +436,8 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
       // worse failure than carrying none of it and saying so.
       let dirSecretReason = null;
       for (const entry of entries) {
+        // isFile() is false for a symlink under withFileTypes, so links inside
+        // a mounted directory are skipped rather than followed.
         if (!entry.isFile()) continue;
         let buf;
         try { buf = fsMod.readFileSync(pathMod.join(abs, entry.name)); } catch (e) { continue; }

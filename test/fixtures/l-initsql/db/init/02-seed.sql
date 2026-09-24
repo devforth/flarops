@@ -1,0 +1,1 @@
+INSERT INTO items (sku) VALUES ('demo-001') ON CONFLICT DO NOTHING;

@@ -34,8 +34,10 @@ import (
 // disagree about what "fits" means.
 const CapsuleHeadroom = 0.15
 
-// EffectiveMiB is the size a capsule really occupies. Never returns 0 - it is
-// used as a divisor.
+// EffectiveMiB is the size a capsule really occupies. It never returns 0
+// because the dashboard divides free memory by it to draw "fits N more"
+// (see effectiveSize in dashboard/static/index.html); Go only compares with
+// it, but the two must agree.
 func EffectiveMiB(mib int) int {
 	if mib < 0 {
 		mib = 0
@@ -122,6 +124,77 @@ func ReservedMiB(h HostState) int {
 	return 0
 }
 
+// A capsule the oracle has promised a node to, but which is not yet visible in
+// the cluster. The collector samples every two seconds and a capsule takes far
+// longer than that to appear, so without this two pull requests asking at the
+// same moment are both told the same node - each measuring a fleet that does
+// not yet contain the other's capsule.
+//
+// This is what lets PR pipelines run concurrently again. Serialising them
+// repo-wide also closed the race, but GitHub cancels PENDING runs in a
+// concurrency group, so a teardown queued behind another PR's deploy was
+// silently dropped and its namespace - holding a clone of the production
+// database - leaked forever.
+type reservation struct {
+	node    string
+	mib     int
+	expires time.Time
+}
+
+// Reservations are held only long enough for a capsule to become measurable.
+// Too short and the race reopens; too long and a failed deploy keeps a node
+// artificially full. A capsule that has not appeared in five minutes is not
+// coming.
+const reservationTTL = 5 * time.Minute
+
+var (
+	reservationsMu sync.Mutex
+	reservations   = map[string]*reservation{}
+)
+
+// reserve records an intent against a node, keyed by the caller's own id so a
+// pipeline that asks twice replaces its own reservation instead of stacking a
+// second one on top.
+func reserve(key, node string, mib int) {
+	reservationsMu.Lock()
+	defer reservationsMu.Unlock()
+	reservations[key] = &reservation{node: node, mib: mib, expires: time.Now().Add(reservationTTL)}
+}
+
+// reservedOn totals the outstanding promises against one node, dropping any
+// that have expired.
+//
+// exceptKey is the caller's own id, and skipping it is not an optimisation:
+// the PR workflow asks up to three times, and after adding a worker it polls
+// eight more. Counting a caller's own earlier promise against it would make
+// every one of those retries answer "no" - the reservation would break the
+// exact flow it exists to protect.
+func reservedOn(node, exceptKey string) int {
+	reservationsMu.Lock()
+	defer reservationsMu.Unlock()
+	now := time.Now()
+	total := 0
+	for k, r := range reservations {
+		if now.After(r.expires) {
+			delete(reservations, k)
+			continue
+		}
+		if k == exceptKey {
+			continue
+		}
+		if r.node == node {
+			total += r.mib
+		}
+	}
+	return total
+}
+
+func releaseReservation(key string) {
+	reservationsMu.Lock()
+	defer reservationsMu.Unlock()
+	delete(reservations, key)
+}
+
 type placement struct {
 	Fits        bool
 	Node        string
@@ -132,7 +205,7 @@ type placement struct {
 // Picks the node with the most free memory that can take a capsule of the
 // given size. Deliberately the SAME rule the dashboard draws: the capsule is
 // measured at its effective size, not its requested one.
-func planPlacement(d *DashboardData, requestMiB int) placement {
+func planPlacement(d *DashboardData, requestMiB int, callerKey string) placement {
 	required := EffectiveMiB(requestMiB)
 	best := placement{RequiredMiB: required}
 	for _, h := range d.Hosts {
@@ -149,7 +222,12 @@ func planPlacement(d *DashboardData, requestMiB int) placement {
 		if !h.Schedulable || !h.MetricsKnown || h.RamAllocatable <= 0 {
 			continue
 		}
-		free := FreeForSchedulingMiB(h)
+		// Memory already promised to a capsule that has not appeared yet is
+		// not free, however empty the node currently measures.
+		free := FreeForSchedulingMiB(h) - reservedOn(h.ID, callerKey)
+		if free < 0 {
+			free = 0
+		}
 		if free > best.FreeMiB {
 			best.FreeMiB = free
 			best.Node = h.ID
@@ -209,10 +287,21 @@ func handleCapacity(w http.ResponseWriter, r *http.Request) {
 		requested = largestCapsuleMiB(d)
 	}
 
-	p := planPlacement(d, requested)
+	// The caller identifies itself with ?for=<pr-env> so its own outstanding
+	// promise does not count against it on a retry.
+	callerKey := r.URL.Query().Get("for")
+	p := planPlacement(d, requested, callerKey)
 	verdict := "no"
 	if p.Fits {
 		verdict = "yes"
+		// A "yes" is a promise, so hold the node until the capsule shows up.
+		// An anonymous caller is keyed by node, which still stops a second
+		// anonymous caller being handed the same node in the same window.
+		key := callerKey
+		if key == "" {
+			key = "anon:" + p.Node
+		}
+		reserve(key, p.Node, p.RequiredMiB)
 	}
 	reserved := 0
 	for _, h := range d.Hosts {
@@ -234,6 +323,19 @@ func startCapacityServer() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/capacity", handleCapacity)
+	// Lets a pipeline hand a node back when its deploy failed, instead of
+	// leaving the node looking full until the reservation ages out.
+	mux.HandleFunc("/release", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("for")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if key == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, "missing 'for' parameter\n")
+			return
+		}
+		releaseReservation(key)
+		fmt.Fprint(w, "released\n")
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok\n")
 	})

@@ -1574,9 +1574,7 @@
     let ALL_CAPS = [];
     let FLEET_RAM = 0;
     let FLEET_RAM_USED = 0;
-    let BIGGEST_VOL = 1;
     let BIGGEST_CAP = 1;
-    let BLOCKED = [];
 
     /* ------------------------------------------------------------------ helpers */
     const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -1636,8 +1634,9 @@
       return Math.max(0, Math.min(physical, schedulable));
     };
 
-    /* Used as a share of what is actually available to pods, not of the
-       machine's raw size - the reserve is never going to be free. */
+    /* Deliberately a share of the machine's RAM, not of what pods can have:
+       this gauge answers "how full is this box", and the allocation bar below
+       is where the schedulable figure lives. */
     const hostRam = h => pct(h.ramUsed, h.ramTotal);
     const hostCpu = h => pct(h.cpuUsed, cpuCap(h));
     const hostSwap = h => pct(h.swapUsed, h.swapTotal);
@@ -1658,8 +1657,24 @@
       return Object.keys(t).map(k => t[k] + " " + STATUS[k].label.split(" ")[0].toLowerCase()).join(" · ");
     }
 
-    const freeOf = h => h.ramTotal - h.ramUsed;
-    const roomiest = () => HOSTS.length > 0 ? HOSTS.reduce((best, h) => freeOf(h) > freeOf(best) ? h : best, HOSTS[0]) : { ramTotal: 0, ramUsed: 0 };
+    /* freeForScheduling is defined below and used here: the page must answer
+       "does this fit" exactly as the capacity oracle does. It previously did
+       not - the fleet bar subtracted the kubelet's reserve while the queue row
+       did not, so one host could read "1.2G free" in its bar and "3.1G free"
+       two lines down. The naive figure is also the one that overfilled a node
+       badly enough to take it out. */
+    const freeOf = h => freeForScheduling(h);
+    /* Cordoned, NotReady and unmeasured nodes are excluded here for the same
+       reason planPlacement excludes them (dashboard/capacity.go): a draining
+       node reports almost no usage and therefore wins on free memory, while
+       nothing scheduled onto it will ever start. */
+    const usableHosts = () => HOSTS.filter(h => h.schedulable !== false && h.metricsKnown !== false && h.ramAllocatable);
+    const roomiest = () => {
+      const usable = usableHosts();
+      return usable.length > 0
+        ? usable.reduce((best, h) => freeOf(h) > freeOf(best) ? h : best, usable[0])
+        : { id: "", ramTotal: 0, ramUsed: 0, ramAllocatable: 0, capsules: [] };
+    };
 
     /* A capsule's footprint is not the figure it currently reports. It grows
        after start, the kubelet keeps its own reserves, and page cache is
@@ -1982,10 +1997,7 @@
         ALL_CAPS = HOSTS.flatMap(h => h.capsules);
         FLEET_RAM = HOSTS.reduce((s, h) => s + h.ramTotal, 0);
         FLEET_RAM_USED = HOSTS.reduce((s, h) => s + h.ramUsed, 0);
-        const allVols = ALL_CAPS.flatMap(c => c.vol ? c.vol.map(v => v.mib) : []);
-        BIGGEST_VOL = allVols.length > 0 ? Math.max.apply(null, allVols) : 1;
         BIGGEST_CAP = ALL_CAPS.length > 0 ? Math.max.apply(null, ALL_CAPS.map(c => c.ram)) : 1;
-        BLOCKED = QUEUE.filter(c => !placeable(c.reqRam));
 
         render(document.querySelector('[data-render="board"]'));
       };

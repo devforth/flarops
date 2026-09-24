@@ -344,8 +344,14 @@ async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort,
     new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?:process\\.env\\.)?(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)(?:${portNamesPattern})\\s*\\|\\|\\s*(\\d+)`, 'gim'),
     new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)port\\s*[:=]\\s*["']?(\\d+)["']?`, 'gim'),
     new RegExp(`^(?!\\s*(?:#|\\/\\/)).*--inspect(?:-brk)?=(?:[^:]+:)?(\\d+)`, 'gim'),
-    new RegExp(`(?:^|\\s)(?:--port|-p)\\s*[=:]?\\s*(\\d+)`, 'gim'),
-    new RegExp(`(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)\\bport\\b.{0,15}?(?<![a-zA-Z0-9.-])(\\d{2,5})\\b`, 'gim'),
+    // These two carry the same comment guard as the ones above. Without it the
+    // loosest pattern - "port" followed by any number within 15 characters -
+    // matched prose: a Dockerfile line reading "# The old image exposed port
+    // 9000; the app now listens on 4000" contributed 9000, which then became
+    // apiPorts[0] and drove the Service, the Ingress backend and the readiness
+    // probe at a port nothing listens on.
+    new RegExp(`^(?!\\s*(?:#|\\/\\/))(?:.*?)(?:^|\\s)(?:--port|-p)\\s*[=:]?\\s*(\\d+)`, 'gim'),
+    new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)\\bport\\b.{0,15}?(?<![a-zA-Z0-9.-])(\\d{2,5})\\b`, 'gim'),
     new RegExp(`^\\s*EXPOSE\\s+(\\d+)`, 'gim')
   ];
 
@@ -1170,6 +1176,79 @@ async function rootContextExcludes(baseDir, claimedPaths = []) {
   return Array.from(excludes);
 }
 
+/**
+ * One entry of the additionalServices[] list: a service this repository builds
+ * that is neither the primary backend nor the primary frontend.
+ *
+ * The shape is declared in one place because it is filled in two very
+ * different ones. The DISCOVERY fields below come from this file and describe
+ * what was found on disk; the DEPLOYMENT fields are written later by
+ * bin/commands/init.js as it scans docker-compose, wires databases and
+ * resolves route ownership. Before this factory existed the deployment fields
+ * simply appeared, each guarded by its own `s.x = s.x || []` at whichever
+ * write site happened to run first - so whether a field was an array, a Set,
+ * null or absent depended on which code path a given project took, and every
+ * template had to defend against all four.
+ *
+ * @typedef {Object} ServiceEntry
+ *
+ * -- discovery (analyzeAdditionalServices) --
+ * @property {string}   name         k8s object name; init.js sanitizes this to RFC 1123 and de-duplicates it.
+ * @property {string}   originalName the name before that sanitization, so compose keys still match.
+ * @property {string}   composeName  the docker-compose key, which every env/depends_on lookup keys off.
+ * @property {string}   path         absolute build context.
+ * @property {string}   dockerfile   Dockerfile path relative to the context.
+ * @property {number[]} ports        ports the service listens on; [80] when nothing was found.
+ * @property {?string}  healthRoute  HTTP path for the probes, or null.
+ * @property {?number}  healthPort   port for the probes when compose named one.
+ * @property {string[]} usedEnvVars  env var names the source actually reads.
+ * @property {boolean}  isMavenReactorModule  changes how werf.yaml addresses the context.
+ *
+ * -- deployment (bin/commands/init.js) --
+ * @property {string}            relativePath   context relative to the repo root, for werf.yaml.
+ * @property {Object}            env            plain config, rendered into values.yaml in the clear.
+ * @property {string[]}          secretKeys     Secret keys mounted under their own names.
+ * @property {Set<string>}       forcedSecretKeys keys wired during the compose
+ *   scan. secretKeys is fully REASSIGNED later from a usedEnvVars filter that
+ *   can only be computed once the whole scan has finished, so anything pushed
+ *   onto it during the scan would be silently discarded at that moment; these
+ *   are collected separately and merged back in afterwards.
+ * @property {Array<{envName: string, secretKey: string}>} extraSecretEnvMappings  container-side name differs from the Secret key.
+ * @property {string[]}          exposedRoutes  HTTP prefixes this service owns on the Ingress.
+ * @property {boolean}           suppressDirectIngress  true when a gateway fronts it, so it gets no Ingress of its own.
+ * @property {?Object}           db             the database this service talks to, or null.
+ * @property {?string}           dbPasswordKey  Secret key holding that database's password.
+ * @property {Array<{key: string, dbName: ?string, query: ?string}>} dbUrlVars  env vars to be rebuilt as full DB URLs.
+ * @property {?string}           springDatasourcePasswordSecretKey  Spring reads its password under a fixed name.
+ * @property {?Object}           buildArgs      docker build args; null, never {}, so werf.yaml emits no empty args block.
+ * @property {?string[]}         command        compose `command:` override, carried to the pod as args.
+ */
+
+// Every deployment field gets its final TYPE here even though its value is
+// filled in later, so a consumer can read `service.secretKeys.length` without
+// asking first whether this particular project's code path happened to create
+// it. The three fields defaulting to null rather than an empty container are
+// the ones whose emptiness is meaningful: an absent database, an absent
+// command and an absent build-args block are each rendered differently from
+// empty ones.
+function makeServiceEntry(discovered) {
+  return {
+    ...discovered,
+    env: {},
+    secretKeys: [],
+    forcedSecretKeys: new Set(),
+    extraSecretEnvMappings: [],
+    exposedRoutes: discovered.exposedRoutes || [],
+    suppressDirectIngress: false,
+    db: null,
+    dbPasswordKey: null,
+    dbUrlVars: [],
+    springDatasourcePasswordSecretKey: null,
+    buildArgs: null,
+    command: null,
+  };
+}
+
 async function buildServiceEntry(baseDir, dirPath, name, composeNames, siblingExcludes, composeDockerfile) {
   // A compose service names its OWN Dockerfile, and several services routinely
   // share one build context with a different one each ("Dockerfile.api" and
@@ -1197,8 +1276,16 @@ async function buildServiceEntry(baseDir, dirPath, name, composeNames, siblingEx
   const exposedRoutes = await analyzeBackendExposedRoutes(dirPath);
   const isReactorModule = await isMavenReactorModule(baseDir, dirPath);
 
-  return {
+  return makeServiceEntry({
     name,
+    // Set here rather than in init.js, where it used to be filled in only
+    // after the compose scan. The root-context check that decides whether the
+    // repository needs a .dockerignore runs well before that point and reads
+    // this field, so for an additionalService both of its arms compared
+    // against undefined and never fired - the one case the check was added
+    // for (a compose service declaring "context: .") was exactly the one it
+    // could not see.
+    relativePath: path.relative(baseDir, dirPath),
     // init.js sanitizes `name` into an RFC-1123 k8s name ("My_Service" ->
     // "my-service"), after which matching it against a raw docker-compose
     // service key silently stopped working and that service's whole
@@ -1217,10 +1304,10 @@ async function buildServiceEntry(baseDir, dirPath, name, composeNames, siblingEx
     dockerfile,
     exposedRoutes,
     isMavenReactorModule: isReactorModule,
-  };
+  });
 }
 
-async function analyzeAdditionalServices(baseDir, knownPaths) {
+async function analyzeAdditionalServices(baseDir, knownPaths, claimedComposeNames = new Set()) {
   const services = [];
   const claimed = new Set((knownPaths || []).filter(Boolean).map(p => path.resolve(p)));
   const seen = new Set();
@@ -1244,7 +1331,15 @@ async function analyzeAdditionalServices(baseDir, knownPaths) {
   // reached werf.yaml, never got a Deployment, and nothing said so.
   const addCandidate = (dirPath, name, composeName, dockerfile, fromCompose) => {
     const resolved = path.resolve(dirPath);
-    if (claimed.has(resolved)) return;
+    // A claimed path is one already generated as the primary backend or
+    // frontend - but compose can declare SEVERAL services over that same
+    // context ("api" and "worker" sharing ./app, different Dockerfiles). Only
+    // the one whose compose key matches what was claimed is a duplicate; the
+    // others are distinct services, and short-circuiting on the path alone
+    // dropped them silently, which is the very case the keying below exists
+    // to handle.
+    if (claimed.has(resolved) && !fromCompose) return;
+    if (claimed.has(resolved) && fromCompose && claimedComposeNames.has(composeName)) return;
     const key = fromCompose ? 'compose\u0000' + composeName : 'dir\u0000' + resolved;
     if (seen.has(key)) return;
     seen.add(key);
@@ -1345,4 +1440,4 @@ async function analyzeAdditionalServices(baseDir, knownPaths) {
   return services;
 }
 
-module.exports = { analyzeAdditionalServices, extractUsedEnvVars,  analyzeBackend, analyzeFrontend, detectApiMigrationStep, detectApiWorkerCount, findRoutePortMapFromGatewayConfig, findBuildableComposeServices, rootContextExcludes };
+module.exports = { analyzeAdditionalServices, makeServiceEntry, extractUsedEnvVars,  analyzeBackend, analyzeFrontend, detectApiMigrationStep, detectApiWorkerCount, findRoutePortMapFromGatewayConfig, findBuildableComposeServices, rootContextExcludes };

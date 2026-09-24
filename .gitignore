@@ -2,4 +2,9 @@ PLAN.md
 EXECUTION_FLOW.md
 dashboard/dashboard
 dashboard/flarops.db
+# Runtime state of a locally-run dashboard, not source.
+dashboard/*.db
+dashboard/*.db-wal
+dashboard/*.db-shm
 SECURITY_AUDIT_REPORT*
+CODE_REVIEW.md

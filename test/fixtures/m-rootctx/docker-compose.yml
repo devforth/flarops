@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: rootctxpw
+      POSTGRES_DB: monorepo
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    ports: ["3000:3000"]
+    environment:
+      DB_HOST: db
+    depends_on: [db]

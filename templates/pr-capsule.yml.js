@@ -95,6 +95,20 @@ module.exports = function prCapsuleYmlTemplate(config) {
           TF_VAR_domain: \${{ env.BASE_DOMAIN }}
 `;
 
+  // Anything read out of the scanned repository is a single-line, quoted YAML
+  // scalar here - never raw text pasted into the document.
+  //
+  // dbAnalyzer's key regex has a branch that matches across newlines, so a
+  // quoted multi-line value in someone's .env came back whole; interpolated
+  // unquoted into the workflow's env: map it added its own keys at column 0.
+  // Kept at two-space indent they are schema-valid workflow-level environment
+  // variables, inherited by every step of a job that holds the AWS keys, the
+  // deploy SSH key and a cluster-admin kubeconfig. values.yaml already escaped
+  // this correctly; only the workflow did not.
+  const yamlScalar = (value) => JSON.stringify(String(value == null ? '' : value)
+    .replace(/[\r\n\t]+/g, ' ')
+    .trim());
+
   const mainExec = `kubectl exec -n \${{ env.MAIN_NAMESPACE }} database-0 --`;
   const prExec = `kubectl exec -i -n \${{ env.PR_NAMESPACE }} database-0 --`;
 
@@ -126,7 +140,13 @@ module.exports = function prCapsuleYmlTemplate(config) {
 
   const dbCloningLogic = config.hasDb ? `
       - name: Database Clone & Restore
-        if: github.event.action == 'opened' || github.event.action == 'reopened'
+        # Runs on every event, not only opened/reopened. The marker configmap
+        # below is written ONLY after a successful clone, so this is already
+        # idempotent - and gating on the event meant a clone that failed once
+        # (a dump error, a slow first image pull tripping the rollout wait) was
+        # never retried: every later push is "synchronize", so the capsule
+        # served an empty database for the life of the pull request and nothing
+        # said so.
         run: |
           # pipefail matters here: the clone is one pipe between two pods, and
           # without it a failing dump still exits 0 as long as the restore
@@ -154,8 +174,8 @@ module.exports = function prCapsuleYmlTemplate(config) {
           fi
 ` : '';
 
-  const envsBlock = config.hasDb ? `  DB_USER: ${config.dbUser || 'root'}
-  DB_NAME: ${config.dbName || 'appdb'}` : '';
+  const envsBlock = config.hasDb ? `  DB_USER: ${yamlScalar(config.dbUser || 'root')}
+  DB_NAME: ${yamlScalar(config.dbName || 'appdb')}` : '';
 
 
   const domainParts = config.domain.split('.');
@@ -168,19 +188,26 @@ module.exports = function prCapsuleYmlTemplate(config) {
     prDomainLogic = `pr-\${{ github.event.pull_request.number }}.${config.domain}`;
   }
 
-  // A rough footprint for one PR capsule, scaled by how many components this
-  // project actually has. It is only a HINT: the dashboard's capacity oracle
-  // adds its own headroom and compares against measured usage, so this number
-  // decides nothing on its own - it just tells the oracle what size of capsule
-  // to plan for. The chart no longer carries resource requests, so there is
-  // nothing more precise to derive it from.
+  // The footprint this capsule is planned at, scaled by how many components
+  // the project actually has. It is ALWAYS passed to the capacity oracle.
+  //
+  // Letting the oracle size the request itself was wrong in both directions.
+  // It sizes from the largest running capsule, and it counts the
+  // "<project>-production" namespace as a capsule - so every pull request was
+  // planned as needing the entire production stack, which produced spurious
+  // "no" verdicts and bought worker nodes nobody needed. Before metrics-server
+  // has measured anything the same code sizes the request at zero, which
+  // floors at 1 MiB and makes any node with a megabyte free look like a fit.
+  //
+  // A generated estimate is coarse, but it is an estimate OF THIS CAPSULE, and
+  // it does not swing between those two extremes. The oracle still applies its
+  // own headroom on top.
   let requiredMi = 0;
   if (config.hasBackend) requiredMi += 256;
   if (config.hasFrontend) requiredMi += 128;
   if (config.hasDb) requiredMi += 256;
   if (config.additionalServices && config.additionalServices.length > 0) requiredMi += config.additionalServices.length * 128;
   if (requiredMi === 0) requiredMi = 256;
-  const requiredKi = requiredMi * 1024;
 
   return `name: Flarops PR Capsule
 
@@ -191,24 +218,28 @@ on:
 permissions:
   contents: read
 
-# Serialize workflow runs per PR (instead of cancelling in-progress ones) so an
+# Concurrency (instead of cancelling in-progress ones) so an
 # "opened" run's database dump/restore, and a "deploy" run's terraform apply,
 # never overlap with another run for the same PR - overlapping runs previously
 # could both pass the "not yet cloned" check and restore into the same database
 # concurrently, or race on the shared production Terraform workspace.
-# ONE capsule pipeline at a time across the whole repository, not one per PR.
+# One run per pull request, NOT one across the repository.
 #
-# Keyed by PR number, two pull requests ran side by side - and both asked the
-# dashboard whether a capsule fits, both got the same answer naming the same
-# node, and both deployed onto it. The oracle reports what is running now; it
-# cannot see a capsule another job is about to create. Scaling is worse still:
-# two jobs can run "terraform apply" against one state at the same time.
+# A repo-wide group did close the placement race, but GitHub cancels PENDING
+# runs in a concurrency group - so a teardown queued behind another PR's deploy
+# was dropped, and since "closed" never fires twice, that PR's namespace and
+# its clone of the production database leaked permanently. The busier the
+# repository, the more often it happened.
 #
-# Serialising costs latency on busy repositories and is the only thing that
-# makes the placement answer true by the time it is acted on. cancel-in-progress
-# stays false: a half-applied capsule must finish, not be killed mid-converge.
+# The race is closed in the capacity oracle instead: a "yes" verdict reserves
+# the node it names until the capsule becomes measurable, so two pull requests
+# asking at the same moment cannot both be sent to it. See reservation in
+# dashboard/capacity.go.
+#
+# cancel-in-progress stays false: a half-applied capsule must finish, not be
+# killed mid-converge.
 concurrency:
-  group: flarops-pr-capsule
+  group: flarops-pr-capsule-\${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 env:
@@ -227,6 +258,10 @@ jobs:
     name: Deploy PR Capsule
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
+    # Neither job has a natural bound - the k3s wait below and the werf
+    # converge can both stall indefinitely - and GitHub's own limit is six
+    # hours, during which the concurrency group keeps every later push queued.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -263,11 +298,16 @@ jobs:
         env:
           SSH_PRIVATE_KEY: \${{ secrets.SSH_PRIVATE_KEY }}
         run: |
+          # See the teardown copy of this step: without set -e a failed
+          # terraform output or ssh leaves an empty kubeconfig and the step
+          # still goes green, because its last command is a sed that succeeds
+          # on an empty file.
+          set -euo pipefail
+
           mkdir -p ~/.ssh
           printf '%s\\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-          # Retrieve EC2 IP using Terraform or from secrets if exported
           export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
 
           mkdir -p ~/.kube
@@ -293,8 +333,14 @@ ${terraformProviderEnv}        run: |
           # So an existing capsule is never re-placed: where it runs now is
           # where it keeps running.
           # ---------------------------------------------------------------
+          # The DATABASE pod's node, specifically - not whichever pod sorts
+          # first. Only stateful workloads carry dataNodeSelector, so api and
+          # frontend routinely sit on other nodes; taking the first pod in the
+          # list returned api's node and re-pinned the database onto it, which
+          # its local-path volume cannot follow. The result was the exact
+          # "volume node affinity conflict" this check exists to prevent.
           TARGET_NODE=$(kubectl get pods -n "\${{ env.PR_NAMESPACE }}" \\
-            -o jsonpath='{.items[?(@.spec.nodeName)].spec.nodeName}' 2>/dev/null | tr ' ' '\\n' | head -1 || true)
+            -l component=database -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
 
           if [ -n "$TARGET_NODE" ]; then
             echo "Capsule already runs on $TARGET_NODE - keeping it there."
@@ -312,13 +358,13 @@ ${terraformProviderEnv}        run: |
           # what the scheduler has reserved and never moves now that the chart
           # carries no resource requests.
           #
-          # No size is passed: the oracle sizes the request from the largest
-          # capsule actually running, which is a measurement rather than the
-          # guess a generated constant would be.
+          # The size is passed explicitly - see requiredMi in
+          # templates/pr-capsule.yml.js for why letting the oracle guess it
+          # was wrong in both directions.
           # ---------------------------------------------------------------
           ask_capacity() {
             kubectl exec -n "\${{ env.MAIN_NAMESPACE }}" deploy/flarops-dashboard -- \\
-              curl -sS --max-time 10 "http://127.0.0.1:9090/capacity"
+              curl -sS --max-time 10 "http://127.0.0.1:9090/capacity?mib=${requiredMi}&for=\${{ env.PR_ENV_NAME }}"
           }
 
           OUT=""
@@ -373,12 +419,21 @@ ${terraformProviderEnv}        run: |
             # the set growing forever.
             NEW_SLOTS=$(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; s=[int(x) for x in json.load(sys.stdin)]; f=next(n for n in range(1,1000) if n not in s); print(json.dumps(sorted(s+[f])))")
             echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
-            terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve
+            terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
             EC2_IP=$(terraform output -raw public_ip)
             cd - > /dev/null
 
             echo "Waiting for the new worker to join..."
-            ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo k3s kubectl wait --for=condition=Ready node --all --timeout=180s"
+            # Only the node that was just added. "--all" waits on every node in
+            # the cluster, so one stale NotReady node made every scale-up fail
+            # after 180s - each attempt leaving behind a brand-new billed
+            # instance, because nothing here rolls the apply back.
+            NEW_SLOT=$(printf '%s' "$NEW_SLOTS" | python3 -c "import json,sys; print(sorted(json.load(sys.stdin))[-1])")
+            NEW_NODE="\${INSTANCE_NAME:-}"
+            if [ -z "$NEW_NODE" ]; then NEW_NODE=$(terraform -chdir=deploy/terraform output -raw instance_name); fi
+            NEW_NODE="\${NEW_NODE}-worker-\${NEW_SLOT}"
+            echo "Waiting for $NEW_NODE to join..."
+            ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo k3s kubectl wait --for=condition=Ready node/\${NEW_NODE} --timeout=240s"
 
             # The new node is Ready before metrics-server has measured it, and
             # the oracle refuses to place onto a node it cannot measure - so
@@ -439,6 +494,10 @@ ${dbCloningLogic}
     name: Teardown PR Capsule
     if: github.event.action == 'closed'
     runs-on: ubuntu-latest
+    # Neither job has a natural bound - the k3s wait below and the werf
+    # converge can both stall indefinitely - and GitHub's own limit is six
+    # hours, during which the concurrency group keeps every later push queued.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -475,6 +534,13 @@ ${dbCloningLogic}
         env:
           SSH_PRIVATE_KEY: \${{ secrets.SSH_PRIVATE_KEY }}
         run: |
+          # Without this the step's last command is a sed that succeeds on an
+          # empty file, so a failed terraform output or a failed ssh left a
+          # useless kubeconfig behind and the step went green - after which the
+          # teardown "reclaimed nothing" and reported success while the capsule
+          # was still running and every worker still billing.
+          set -euo pipefail
+
           mkdir -p ~/.ssh
           printf '%s\\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
@@ -545,8 +611,13 @@ ${terraformProviderEnv}        run: |
             NODE_NAME="\${INSTANCE_NAME}-worker-\${SLOT}"
             echo "Checking $NODE_NAME ..."
 
-            if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" --no-headers 2>&1); then
-              echo "  could not query pods on $NODE_NAME ($RAW) - leaving it alone."
+            # stderr is captured SEPARATELY. Folding it in with 2>&1 meant
+            # kubectl's own "No resources found" - which it prints to stderr -
+            # counted as a line of output, so an empty node read as holding one
+            # pod and was never reclaimed. A node that exists in Terraform but
+            # not in Kubernetes then bills forever.
+            if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" --no-headers 2>/tmp/kubectl.err); then
+              echo "  could not query pods on $NODE_NAME ($(cat /tmp/kubectl.err)) - leaving it alone."
               continue
             fi
             PODS=$(printf '%s' "$RAW" | grep -v '^$' | grep -cv '^kube-system ' || true)
@@ -573,6 +644,6 @@ ${terraformProviderEnv}        run: |
           NEW_SLOTS=$(FREED="$FREED" CURRENT="$CURRENT_SLOTS" python3 -c "import json,os; c=[int(x) for x in json.loads(os.environ['CURRENT'])]; f={int(x) for x in os.environ['FREED'].split()}; print(json.dumps(sorted(s for s in c if s not in f)))")
           echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
           cd deploy/terraform
-          terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve
+          terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
 `;
 };

@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -31,6 +34,30 @@ type NodeStatsSummary struct {
 			UsedBytes     int64 `json:"usedBytes"`
 		} `json:"volume"`
 	} `json:"pods"`
+}
+
+// nodeAgentClient is shared: one connection pool for the whole fleet, and a
+// short timeout so one wedged agent cannot stall a collection cycle.
+var nodeAgentClient = &http.Client{Timeout: 3 * time.Second}
+
+func fetchNodeDisk(podIP string) (nodeDisk, error) {
+	port := os.Getenv("NODE_AGENT_PORT")
+	if port == "" {
+		port = "9101"
+	}
+	resp, err := nodeAgentClient.Get("http://" + net.JoinHostPort(podIP, port) + "/disk")
+	if err != nil {
+		return nodeDisk{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nodeDisk{}, fmt.Errorf("node agent returned %s", resp.Status)
+	}
+	var disk nodeDisk
+	if err := json.NewDecoder(resp.Body).Decode(&disk); err != nil {
+		return nodeDisk{}, err
+	}
+	return disk, nil
 }
 
 func startCollector(k8s *K8sClient) {
@@ -114,6 +141,13 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		},
 		Hosts: []HostState{},
 		Queue: []CapsuleState{},
+	}
+
+	// One listing per cycle, reused for every node below.
+	nodeAgentIPs, agentErr := k8s.GetNodeAgentIPs()
+	if agentErr != nil {
+		log.Println("collector: could not list node agents:", agentErr)
+		nodeAgentIPs = map[string]string{}
 	}
 
 	nodes, err := k8s.GetNodes()
@@ -221,14 +255,16 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		eipRate := 0.005 / float64(len(nodes))
 		hourlyRate := ec2Rate + ebsRate + eipRate
 
+		// Disk comes from the node agent on that node. A node without a
+		// running agent simply reports zero rather than being guessed at.
 		diskTotal := 0
 		diskUsed := 0
-		if rawStats, err := k8s.GetNodeStatsSummary(n.Name); err == nil {
-			var stats NodeStatsSummary
-			if err := json.Unmarshal(rawStats, &stats); err == nil {
-				diskTotal = int(stats.Node.Fs.CapacityBytes / (1024 * 1024))
-				diskUsed = int(stats.Node.Fs.UsedBytes / (1024 * 1024))
-
+		if ip, ok := nodeAgentIPs[n.Name]; ok {
+			if disk, err := fetchNodeDisk(ip); err != nil {
+				log.Printf("collector: node agent on %s did not answer: %v", n.Name, err)
+			} else {
+				diskTotal = int(disk.TotalBytes / (1024 * 1024))
+				diskUsed = int(disk.UsedBytes / (1024 * 1024))
 			}
 		}
 

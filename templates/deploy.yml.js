@@ -89,6 +89,10 @@ jobs:
   infrastructure:
     name: Provision Infrastructure & Deploy
     runs-on: ubuntu-latest
+    # Neither job has a natural bound - the k3s wait below and the werf
+    # converge can both stall indefinitely - and GitHub's own limit is six
+    # hours, during which the concurrency group keeps every later push queued.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -145,7 +149,7 @@ jobs:
           fi
           CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
           echo "Preserving existing worker slots: $CURRENT_SLOTS"
-          terraform apply -var="worker_slots=$CURRENT_SLOTS" -auto-approve
+          terraform apply -var="worker_slots=$CURRENT_SLOTS" -auto-approve -lock-timeout=5m
 
       - name: Setup SSH
         uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387 # v0.9.0
@@ -158,8 +162,19 @@ jobs:
           export EC2_IP=$(terraform output -raw public_ip)
 
           echo "Waiting for K3s to be ready on $EC2_IP..."
-          until ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo test -f /etc/rancher/k3s/k3s.yaml"; do
-            echo "Waiting for k3s.yaml..."
+          # Bounded. An unbounded loop here waited out GitHub's six-hour job
+          # limit whenever k3s failed to install (bad AMI, apt or network
+          # trouble in user_data), with the EC2 instance already created and
+          # billing and every later push queued behind it.
+          for attempt in $(seq 1 60); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$EC2_IP "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "::error::k3s did not finish installing within 10 minutes. Check cloud-init on the server ($EC2_IP): /var/log/cloud-init-output.log"
+              exit 1
+            fi
+            echo "Waiting for k3s.yaml... ($attempt/60)"
             sleep 10
           done
 

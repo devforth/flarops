@@ -15,8 +15,15 @@ kind: ClusterRole
 metadata:
   name: {{ .Values.projectName }}-dashboard-role-{{ .Values.werf.env }}
 rules:
+# nodes/proxy is deliberately NOT here. The API server maps a GET on a proxy
+# subresource to "get", and the kubelet serves /exec on GET as well as POST, so
+# that one verb also authorizes
+#   GET /api/v1/nodes/<node>/proxy/exec/<ns>/<pod>/<container>?command=sh
+# on every container in the cluster - and RBAC cannot narrow a subresource to
+# one path. It was needed only for the node disk gauge, which now comes from
+# the DaemonSet below instead.
 - apiGroups: [""]
-  resources: ["nodes", "nodes/proxy", "pods", "namespaces", "persistentvolumeclaims"]
+  resources: ["nodes", "pods", "namespaces", "persistentvolumeclaims"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["metrics.k8s.io"]
   resources: ["nodes", "pods"]
@@ -73,6 +80,78 @@ spec:
   resources:
     requests:
       storage: {{ .Values.dashboard.storage | default "1Gi" }}
+---
+{{- if eq .Values.werf.env "production" }}
+# Reports one node's disk usage and nothing else. It replaces the dashboard's
+# former "get nodes/proxy", which reached the kubelet's stats/summary and, with
+# the same verb, exec on every container in the cluster (see the ClusterRole
+# above and dashboard/nodeagent.go).
+#
+# It mounts the host root READ-ONLY and is given no ServiceAccount token and no
+# API access at all: it answers two integers over the pod network. That is a
+# far smaller thing to hold than the authority it removes.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: flarops-node-agent
+  labels:
+    app: flarops-node-agent
+spec:
+  selector:
+    matchLabels:
+      app: flarops-node-agent
+  template:
+    metadata:
+      labels:
+        app: flarops-node-agent
+    spec:
+      automountServiceAccountToken: false
+      # The figures are for the node, so the agent has to be on every node -
+      # including any the operator has tainted.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-agent
+          image: {{ if .Values.werf }}{{ .Values.werf.image.dashboard }}{{ else }}{{ .Values.images.dashboard | default "dashboard:latest" }}{{ end }}
+          env:
+            - name: FLAROPS_NODE_AGENT
+              value: "1"
+            - name: FLAROPS_HOST_ROOT
+              value: /host
+          ports:
+            - containerPort: 9101
+              name: disk
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "5m"
+            limits:
+              memory: "64Mi"
+              cpu: "50m"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9101
+            periodSeconds: 30
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -173,20 +252,16 @@ kind: Ingress
 metadata:
   name: flarops-dashboard
   annotations:
+    # Same reasoning as templates/01-ingress.js: no cert-manager issuer and no
+    # tls: block, because the generated security group never opens 443. This
+    # one mattered more than the application's - the dashboard's session
+    # cookies carry the __Host- prefix and Secure, which a browser refuses to
+    # store on an http:// origin, so declaring TLS that cannot be served left
+    # the dashboard impossible to log into rather than merely unencrypted.
     traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
-    {{- if ${config.hasCloudflare ? 'true' : 'false'} }}
     kubernetes.io/ingress.class: traefik
-    {{- else }}
-    cert-manager.io/cluster-issuer: "letsencrypt-prod"
-    {{- end }}
 spec:
   ingressClassName: traefik
-  {{- if not ${config.hasCloudflare ? 'true' : 'false'} }}
-  tls:
-  - hosts:
-    - ${dashboardDomain}
-    secretName: flarops-dashboard-tls
-  {{- end }}
   rules:
   - host: ${dashboardDomain}
     http:

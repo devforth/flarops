@@ -18,7 +18,7 @@ function getPostgresMajorVersion(image) {
 // clone step, which waits on `kubectl rollout status`) was routed at it the
 // moment the pod started, which is why "connection refused" showed up as an
 // application error rather than as an unready pod.
-function buildProbeCommand(dbType, image) {
+function buildProbeCommand(dbType) {
   if (dbType === 'postgres' || dbType === 'postgresql') {
     // Run through a shell for the same reason the MySQL branch does: the
     // "$(VAR)" substitution Kubernetes performs on a container's command and
@@ -41,15 +41,16 @@ function buildProbeCommand(dbType, image) {
   }
   if (dbType === 'mongodb') {
     // The shell binary was renamed in MongoDB 6: "mongo" before, "mongosh"
-    // after. Probing with the wrong one fails permanently, so pick by tag and
-    // fall back to whichever exists.
+    // after. Probing with a fixed name fails permanently on the other half of
+    // the versions, so resolve at runtime - the image tag is not consulted.
     return ['sh', '-c', `(mongosh --quiet --eval 'db.adminCommand("ping")' || mongo --quiet --eval 'db.adminCommand("ping")')`];
   }
   return null;
 }
 
-function renderProbes(dbType, image, indent = '          ') {
-  const cmd = buildProbeCommand(dbType, image);
+// indent is fixed: both call sites render at the same container depth.
+function renderProbes(dbType, indent = '          ') {
+  const cmd = buildProbeCommand(dbType);
   if (!cmd) return '';
   const asYaml = cmd.map(part => JSON.stringify(part)).join(', ');
   return `
@@ -230,7 +231,7 @@ spec:
               drop: ["NET_RAW"]
             seccompProfile:
               type: RuntimeDefault
-          env:${envBlock}${renderProbes(config.dbType, config.images && config.images.db)}
+          env:${envBlock}${renderProbes(config.dbType)}
           # No resource requests or limits are set here on purpose. A generated
           # figure is a guess about someone else's workload, and the two ways it
           # can be wrong are both bad: too low and the pod is OOM-killed or

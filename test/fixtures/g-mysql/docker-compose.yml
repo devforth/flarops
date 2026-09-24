@@ -1,0 +1,13 @@
+services:
+  db:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: shopdb
+  api:
+    build: ./backend
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: mysql://root:rootpw@db:3306/shopdb
+      JWT_SECRET: devsecret
+    depends_on: [db]

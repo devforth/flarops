@@ -5,17 +5,11 @@ const { execFileSync } = require('child_process');
 const { getDefaultAWSCredentials, ensureAwsCli, handleS3Bucket } = require('../../utils/awsHelper.js');
 const { SENSITIVE_REGEX, DB_PASSWORD_REGEX, IGNORED_DIRS } = require('../../utils/constants.js');
 const { parseSupportService, extractBuildArgs, materializeBindMounts } = require('../../utils/composeSupport.js');
-
-// Escapes a value for safe interpolation inside a double-quoted HCL string literal.
-function hclEscapeString(s) {
-  return String(s)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n')
-    .replace(/\$\{/g, '$${')
-    .replace(/%\{/g, '%%{');
-}
+const writeTerraform = require('../../templates/terraform.js');
+const collectOperatorAnswers = require('./prompts.js');
+const { defaultUserFor, passwordKeyFor } = require('../../utils/dbDefaults.js');
+const isYes = collectOperatorAnswers.isYes;
+const hclEscapeString = writeTerraform.hclEscapeString;
 
 // True if targetPath is filePath itself or lives inside it - used instead of
 // raw String.startsWith(), which false-positives on sibling directories that
@@ -26,17 +20,6 @@ function isPathInside(dirPath, targetPath) {
   return rel === '' || (!rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel));
 }
 
-// Every choice prompt in init is "[Y/n]": pressing Enter accepts. The one
-// exception lives in utils/awsHelper.js - reusing a bucket that already exists
-// is not something to agree to by reflex, so it stays "[y/N]" and Enter
-// declines.
-//
-// Written once because the four call sites each parsed the answer themselves,
-// and a default that is only right in three of them is worse than none.
-function isYes(answer) {
-  const a = String(answer == null ? '' : answer).trim().toLowerCase();
-  return a === '' || a === 'y' || a === 'yes';
-}
 
 function askQuestion(query) {
   const rl = readline.createInterface({
@@ -300,9 +283,18 @@ function parseSelfReferentialPlaceholder(key, rawVal) {
   return null; // bare reference, or ":?", or ":-" with an empty default
 }
 
-function processEnvVariable(key, rawVal, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext, matchedAdditionalServices) {
-  if (foundDbUrls[key]) return;
-  if (dbPasswordRegex.test(key)) return;
+// Decides what a single scanned environment variable IS - the value to use for
+// it and the bucket it belongs in - and touches nothing. Splitting the decision
+// out from the writing is what makes the rule below legible: the value and the
+// bucket are chosen by different tests and must stay independent of each other.
+//
+// Returns null when the variable is already accounted for by a more specific
+// mechanism, otherwise { key, value, disposition } where disposition is
+// 'secret' (goes to the extracted-secrets file, and from there to a GitHub
+// secret) or 'config' (goes to values.yaml in the clear).
+function classifyEnvVariable(key, rawVal, foundDbUrls) {
+  if (foundDbUrls[key]) return null;
+  if (dbPasswordRegex.test(key)) return null;
 
   // A bare "KEY: ${KEY}"-style declaration means the real value is only known
   // externally - Flarops has no business fabricating a random-looking value
@@ -315,9 +307,20 @@ function processEnvVariable(key, rawVal, isBackend, isFrontend, foundDbUrls, api
   // values.yaml, not suddenly demanding a GitHub secret just because their
   // real value happens to be unknown at generation time.
   const selfRef = parseSelfReferentialPlaceholder(key, rawVal);
-  const val = selfRef !== undefined ? (selfRef || '') : sanitizeEnvValue(rawVal, key);
+  const value = selfRef !== undefined ? (selfRef || '') : sanitizeEnvValue(rawVal, key);
 
-  if (isSensitiveKey(key)) {
+  return { key, value, disposition: isSensitiveKey(key) ? 'secret' : 'config' };
+}
+
+// Writes a decision from classifyEnvVariable into the collections that become
+// the generated files. Every destination is named in one object rather than
+// spread across positional arguments, so a call site reads as a list of what
+// it can affect.
+function applyEnvDecision(decision, targets) {
+  const { key, value } = decision;
+  const { isBackend, isFrontend, apiEnv, frontendEnv, sensitiveContext, matchedAdditionalServices } = targets;
+
+  if (decision.disposition === 'secret') {
     // Dedup by KEY alone, not the full "KEY=VALUE" line - the same secret is
     // routinely declared in more than one place with a different literal
     // value each time (e.g. a placeholder in .env vs. a "${KEY:?...}"
@@ -327,17 +330,23 @@ function processEnvVariable(key, rawVal, isBackend, isFrontend, foundDbUrls, api
     // and fails the whole workflow.
     const keyAlreadyPresent = new RegExp(`(^|\\n)${escapeRegex(key)}=`).test(sensitiveContext.content);
     if (!keyAlreadyPresent) {
-      sensitiveContext.content += `${key}=${val}\n`;
+      sensitiveContext.content += `${key}=${value}\n`;
     }
-  } else {
-    if (isBackend) apiEnv[key] = val;
-    if (isFrontend) frontendEnv[key] = val;
-    if (matchedAdditionalServices && matchedAdditionalServices.length > 0) {
-      for (const s of matchedAdditionalServices) {
-        s.env[key] = val;
-      }
-    }
+    return;
   }
+
+  if (isBackend) apiEnv[key] = value;
+  if (isFrontend) frontendEnv[key] = value;
+  for (const service of matchedAdditionalServices || []) {
+    service.env[key] = value;
+  }
+}
+
+// Classify then apply, for the two scan loops that want both.
+function processEnvVariable(key, rawVal, targets) {
+  const decision = classifyEnvVariable(key, rawVal, targets.foundDbUrls);
+  if (decision) applyEnvDecision(decision, targets);
+  return decision;
 }
 
 
@@ -495,81 +504,17 @@ module.exports = async function init() {
 
 
 
-  const registryAnswer = await askQuestion('Enter docker registry (leave empty for Docker Hub): ');
-  const dockerRegistry = registryAnswer.trim();
-
-  let registryUser = '';
-  let registryPassword = '';
-
-  const loginRegistry = dockerRegistry || 'docker.io';
-
-  while (true) {
-    registryUser = (await askQuestion(`Enter username for ${loginRegistry}: `)).trim();
-    if (!registryUser) {
-      console.log('username is required');
-      continue;
-    }
-    registryPassword = (await askPassword(`enter password for ${loginRegistry}: `)).trim();
-
-    console.log();
-    console.log(`Loggining to ${loginRegistry} ...`);
-    try {
-      execFileSync('docker', ['login', loginRegistry, '-u', registryUser, '--password-stdin'], { input: registryPassword, stdio: ['pipe', 'inherit', 'inherit'] });
-      console.log();
-      break;
-    } catch (err) {
-      console.error();
-      console.error('Please try again.');
-      console.error();
-    }
-  }
-
-  const domainAnswer = await askQuestion('Enter project domain (press Enter to skip if you are not using one): ');
-  const domain = domainAnswer.trim();
-
-  let cloudflareApiToken = '';
-  let cloudflareZoneId = '';
-  if (domain) {
-    const useCloudflare = await askQuestion('Do you want to configure Cloudflare DNS for this domain automatically? [Y/n]: ');
-    if (isYes(useCloudflare)) {
-      cloudflareApiToken = (await askPassword('Enter Cloudflare API Token: ')).trim();
-      cloudflareZoneId = (await askQuestion('Enter Cloudflare Zone ID: ')).trim();
-    }
-  }
-  let projectName = path.basename(currentDir).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-  if (!projectName) projectName = 'flarops-project';
-  let awsCredentials = { accessKey: '', secretKey: '' };
-  const accessKeyInput = await askQuestion('Enter project AWS Access Key ID (press Enter to use your default credentials): ');
-
-  if (!accessKeyInput.trim()) {
-    const defaultCreds = getDefaultAWSCredentials();
-    if (defaultCreds) {
-      awsCredentials = defaultCreds;
-      console.log('Using default AWS credentials from ~/.aws/credentials');
-    } else {
-      console.error('Could not find default AWS credentials. Please provide them manually.');
-      process.exit(1);
-    }
-  } else {
-    awsCredentials.accessKey = accessKeyInput.trim();
-    const secretKeyInput = await askPassword('Enter project AWS Secret Access Key: ');
-    awsCredentials.secretKey = secretKeyInput.trim();
-  }
-
-  // One answer, one region. This value used to be hardcoded in three places
-  // that disagreed: the CI workflows and the S3 state bucket said us-west-2
-  // while Terraform's own aws_region variable defaulted to eu-central-1, so
-  // the infrastructure ran in a different region from its own state and from
-  // whatever the CI session was configured for. Everything downstream reads
-  // this one value.
-  const regionAnswer = await askQuestion('Enter AWS region (press Enter for us-west-2): ');
-  const awsRegion = regionAnswer.trim() || 'us-west-2';
-
-  const awsCmd = ensureAwsCli();
-  const defaultBucketName = `${projectName}-remote-state`;
-  const bucketResult = await handleS3Bucket(awsCmd, defaultBucketName, awsCredentials, askQuestion, awsRegion);
-  const remoteStateBucket = bucketResult.bucket;
-  let s3BucketWarning = bucketResult.warning;
+  const answers = await collectOperatorAnswers({
+    currentDir, askQuestion, askPassword, execFileSync,
+    ensureAwsCli, handleS3Bucket, getDefaultAWSCredentials,
+  });
+  const {
+    projectName, dockerRegistry, registryUser, registryPassword,
+    domain, cloudflareApiToken, cloudflareZoneId,
+    awsCredentials, awsRegion, remoteStateBucket,
+  } = answers;
+  // let, because it is cleared once printed at the end of the run.
+  let s3BucketWarning = answers.s3BucketWarning;
 
   const deployDir = path.join(currentDir, 'deploy');
   const terraformDir = path.join(deployDir, 'terraform');
@@ -577,438 +522,10 @@ module.exports = async function init() {
 
   ensureDir(deployDir, "Created deploy/ directory");
   ensureDir(terraformDir, "Created deploy/terraform/ directory");
-
-  const cloudflareProviderBlock = cloudflareApiToken && cloudflareZoneId ? `
-    cloudflare = {
-      source  = "cloudflare/cloudflare"
-      version = "~> 4.0"
-    }` : '';
-
-  const cloudflareProviderConfig = cloudflareApiToken && cloudflareZoneId ? `
-provider "cloudflare" {
-  api_token = var.cloudflare_api_token
-}
-` : '';
-
-  const mainTfContent = `terraform {
-  backend "s3" {
-    bucket = "${remoteStateBucket}"
-    key    = "terraform.tfstate"
-    region = "${awsRegion}"
-    # The state file contains the k3s join token and the deploy public key in
-    # clear text, so it is encrypted at rest. use_lockfile is S3-native state
-    # locking (Terraform 1.10+): without any lock, the three places that run
-    # "terraform apply" - a push to main, a PR capsule scaling up, and one
-    # scaling down - could interleave and corrupt the state.
-    encrypt      = true
-    use_lockfile = true
-  }
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-    cloudflare = {
-      source  = "cloudflare/cloudflare"
-      version = "~> 4.0"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.0"
-    }
-  }
-}
-
-provider "aws" {
-  region = var.aws_region
-}
-${cloudflareProviderConfig}
-
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  tags = {
-    Name = "\${var.instance_name}-vpc"
-  }
-}
-
-resource "aws_internet_gateway" "igw" {
-  vpc_id = aws_vpc.main.id
-}
-
-resource "aws_subnet" "public" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  map_public_ip_on_launch = true
-  availability_zone       = "\${var.aws_region}a"
-}
-
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.igw.id
-  }
-}
-
-resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
-  route_table_id = aws_route_table.public.id
-}
-
-resource "random_password" "k3s_token" {
-  length  = 32
-  special = false
-}
-
-resource "aws_security_group" "sg" {
-  name        = "\${var.instance_name}-sg"
-  description = "Allow SSH, HTTP, and Kubernetes API"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    description = "Intra-cluster communication"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    self        = true
-  }
-
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "Kubernetes API"
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-*-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
-resource "aws_instance" "server" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.sg.id]
-
-  root_block_device {
-    volume_size = var.volume_size
-    volume_type = "gp3"
-  }
-
-  # The instance metadata service hands out whatever is in user_data - which
-  # includes the k3s join token. With IMDSv1 any process that can make an
-  # outbound HTTP request could read it, so an SSRF in an application pod was
-  # enough to take over the cluster. Requiring a session token (IMDSv2) blocks
-  # the plain-GET SSRF shape, and a hop limit of 1 means the response never
-  # survives the extra network hop out of a container - only the host itself
-  # can reach it. Nothing in user_data queries the metadata service any more,
-  # so requiring tokens costs nothing.
-  metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 1
-    instance_metadata_tags      = "disabled"
-  }
-
-  user_data = sensitive(<<-EOF
-    #!/bin/bash
-    mkdir -p /home/ubuntu/.ssh
-    echo "\${var.ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
-    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
-    chmod 700 /home/ubuntu/.ssh
-    chmod 600 /home/ubuntu/.ssh/authorized_keys
-
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="\${var.k3s_version}" INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --token \${random_password.k3s_token.result} --tls-san \${aws_eip.eip.public_ip}" sh -
-  EOF
-  )
-
-  tags = {
-    Name = var.instance_name
-  }
-
-  lifecycle {
-    ignore_changes = [ami]
-  }
-}
-
-# The Elastic IP is allocated BEFORE the server so its address can be baked
-# into the API server certificate via --tls-san above. When the EIP was
-# instead declared with "instance = aws_instance.server.id", k3s booted first
-# and could only see the temporary auto-assigned public IP; the EIP attached
-# afterwards, and every later "terraform output public_ip" returned an address
-# the certificate did not cover, so kubectl failed with
-# "x509: certificate is valid for <old-ip>". Association is a separate
-# resource purely to keep the dependency pointing this way.
-resource "aws_eip" "eip" {
-  domain = "vpc"
-}
-
-resource "aws_eip_association" "eip_assoc" {
-  instance_id   = aws_instance.server.id
-  allocation_id = aws_eip.eip.id
-}
-
-resource "aws_instance" "worker" {
-  for_each               = toset([for slot in var.worker_slots : tostring(slot)])
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.sg.id]
-
-  root_block_device {
-    volume_size = var.volume_size
-    volume_type = "gp3"
-  }
-
-  # The instance metadata service hands out whatever is in user_data - which
-  # includes the k3s join token. With IMDSv1 any process that can make an
-  # outbound HTTP request could read it, so an SSRF in an application pod was
-  # enough to take over the cluster. Requiring a session token (IMDSv2) blocks
-  # the plain-GET SSRF shape, and a hop limit of 1 means the response never
-  # survives the extra network hop out of a container - only the host itself
-  # can reach it. Nothing in user_data queries the metadata service any more,
-  # so requiring tokens costs nothing.
-  metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 1
-    instance_metadata_tags      = "disabled"
-  }
-
-  user_data = sensitive(<<-EOF
-    #!/bin/bash
-    HOSTNAME="\${var.instance_name}-worker-\${each.key}"
-    hostnamectl set-hostname $HOSTNAME
-
-    mkdir -p /home/ubuntu/.ssh
-    echo "\${var.ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
-    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
-    chmod 700 /home/ubuntu/.ssh
-    chmod 600 /home/ubuntu/.ssh/authorized_keys
-
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="\${var.k3s_version}" INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" K3S_URL=https://\${aws_instance.server.private_ip}:6443 K3S_TOKEN=\${random_password.k3s_token.result} sh -
-  EOF
-  )
-
-  tags = {
-    Name = "\${var.instance_name}-worker-\${each.key}"
-    Role = "worker"
-  }
-
-  lifecycle {
-    ignore_changes = [ami]
-  }
-}
-`;
-
-  const cloudflareResourceBlock = cloudflareApiToken && cloudflareZoneId ? `
-resource "cloudflare_record" "domain" {
-  count   = var.cloudflare_zone_id != "" ? 1 : 0
-  zone_id = var.cloudflare_zone_id
-  name    = var.domain
-  value   = aws_eip.eip.public_ip
-  type    = "A"
-  proxied = true
-}
-
-resource "cloudflare_record" "wildcard" {
-  count   = var.cloudflare_zone_id != "" ? 1 : 0
-  zone_id = var.cloudflare_zone_id
-  name    = "*"
-  value   = aws_eip.eip.public_ip
-  type    = "A"
-  proxied = true
-}
-` : '';
-
-  const mainTfContentEnd = `
-output "public_ip" {
-  value = aws_eip.eip.public_ip
-}
-
-# The instance shape is declared once, in variables.tf, and read back out
-# here. CI feeds these outputs into the Helm values (see deploy.yml), which is
-# what the dashboard prices the fleet against - so changing the instance type
-# means editing exactly one line in variables.tf, not three files that can
-# silently disagree about what is actually running.
-# The slots currently provisioned. CI reads this instead of counting lines in
-# "terraform state list", so scaling decisions are made against a real value
-# Terraform itself reports rather than a grep over its output.
-# Node names are derived from this, so CI must read it rather than rebuild it
-# from the project name - they are only equal until someone edits the variable.
-output "instance_name" {
-  value = var.instance_name
-}
-
-output "worker_slots" {
-  # Numbers, not strings. Terraform's sort() only takes a list of strings and
-  # gives strings back, so sorting the numbers directly emitted ["1","3"] -
-  # and the CI arithmetic that picks the next free slot then compared integers
-  # against strings, found every slot "free", and handed back a number that
-  # collided with a running worker.
-  value = [for s in sort([for x in var.worker_slots : tostring(x)]) : tonumber(s)]
-}
-
-output "worker_nodes" {
-  description = "Kubernetes node names of the workers, derived from the same values that set their hostnames."
-  value       = sort([for slot in var.worker_slots : "\${var.instance_name}-worker-\${slot}"])
-}
-
-output "instance_type" {
-  value = var.instance_type
-}
-
-output "volume_size" {
-  value = var.volume_size
-}
-${cloudflareResourceBlock}`;
-
-  const finalMainTfContent = mainTfContent + mainTfContentEnd;
-
-  const cloudflareVarsBlock = cloudflareApiToken && cloudflareZoneId ? `
-variable "cloudflare_api_token" {
-  description = "Cloudflare API Token"
-  type        = string
-  sensitive   = true
-  default     = ""
-}
-
-variable "cloudflare_zone_id" {
-  description = "Cloudflare Zone ID"
-  type        = string
-  default     = ""
-}
-` : '';
-
-  const variablesTfContent = `variable "aws_region" {
-  description = "AWS region"
-  type        = string
-  default     = "${awsRegion}"
-}
-
-variable "instance_name" {
-  description = "Name tag for the EC2 instance"
-  type        = string
-  default     = "${projectName}-instance"
-}
-
-# Workers are addressed by SLOT, not by position in a list.
-#
-# With "count", Terraform identifies an instance by its index, so removing a
-# node in the middle renumbers every node above it - and reducing the count
-# destroys the highest index, whichever node that happens to be. Reclaiming an
-# idle worker while a busier one sits above it was therefore impossible, and
-# the PR-capsule teardown could only ever peel nodes off the top.
-#
-# A set of slot numbers makes each worker independently addressable:
-# dropping 2 from [1,2,3] destroys exactly worker 2 and leaves 1 and 3 alone.
-variable "worker_slots" {
-  description = "Slot numbers of the worker nodes to run, e.g. [1,3]. Each slot is one instance, addressable independently of the others."
-  type        = set(number)
-  default     = []
-}
-
-variable "instance_type" {
-  description = "Type of the instance"
-  type        = string
-  default     = "t3a.medium"
-}
-
-# Pinned on purpose. "curl https://get.k3s.io | sh" without a version installs
-# whatever is current the moment each node boots, so a fleet grown over weeks
-# ends up running different Kubernetes versions, and a compromise of the
-# install endpoint would land on every node that has yet to be created. Change
-# it here and nowhere else - both the server and the agents read this.
-variable "k3s_version" {
-  description = "k3s version installed on every node (see https://github.com/k3s-io/k3s/releases)"
-  type        = string
-  default     = "v1.36.4+k3s1"
-}
-
-variable "volume_size" {
-  description = "Size of the root volume in GB"
-  type        = number
-  default     = 40
-}
-
-variable "ssh_public_key" {
-  description = "Public SSH key for EC2 instance"
-  type        = string
-  default     = "${hclEscapeString(publicKey)}"
-  sensitive   = true
-}
-${cloudflareVarsBlock}
-variable "domain" {
-  description = "Domain Name"
-  type        = string
-  default     = "${hclEscapeString(domain)}"
-}
-`;
-
-  const mainTfFile = path.join(terraformDir, 'main.tf');
-  writeFileIfNotExists(mainTfFile, finalMainTfContent, "Created deploy/terraform/main.tf", "deploy/terraform/main.tf already exists and is not empty");
-
-  const variablesTfFile = path.join(terraformDir, 'variables.tf');
-  const variablesTfExisted = fs.existsSync(variablesTfFile) && fs.readFileSync(variablesTfFile, 'utf8').trim() !== '';
-  writeFileIfNotExists(variablesTfFile, variablesTfContent, "Created deploy/terraform/variables.tf", "deploy/terraform/variables.tf already exists");
-
-  // variables.tf is deliberately preserved across re-runs so hand-tuned
-  // instance_type/volume_size/aws_region survive - but "domain" is not a
-  // tuning knob, it's the answer to a prompt this run just asked again.
-  // Leaving the old value behind while values.yaml and both workflows get
-  // the new one splits the stack in half: the Ingress serves the new host
-  // while Cloudflare's DNS record still points the old one at the cluster,
-  // which surfaces only as a 404 from an otherwise healthy deployment.
-  if (variablesTfExisted) {
-    try {
-      const existing = fs.readFileSync(variablesTfFile, 'utf8');
-      const domainVarRegex = /(variable\s+"domain"\s*\{[\s\S]*?default\s*=\s*")([^"]*)(")/;
-      const found = existing.match(domainVarRegex);
-      if (found && found[2] !== domain) {
-        fs.writeFileSync(variablesTfFile, existing.replace(domainVarRegex, `$1${hclEscapeString(domain)}$3`));
-        console.log(`\x1b[34mINFO: Updated domain in deploy/terraform/variables.tf ("${found[2]}" -> "${domain}"). Re-run the deploy workflow so the DNS record is recreated for the new domain.\x1b[0m`);
-      }
-    } catch (e) {
-      console.warn(`\x1b[33mWARNING: Could not update the domain in deploy/terraform/variables.tf - check its "domain" variable still matches "${domain}".\x1b[0m`);
-    }
-  }
+  writeTerraform({
+    projectName, domain, publicKey, awsRegion, remoteStateBucket, terraformDir,
+    cloudflareApiToken, cloudflareZoneId, writeFileIfNotExists,
+  });
 
   // Shares the ecosystem ignore list with the analyzers so the two can't
   // drift apart (this walk used to have its own, much shorter, list).
@@ -1081,7 +598,27 @@ variable "domain" {
     frontendInfo.usedEnvVars = await extractUsedEnvVars(frontendInfo.frontendPath, excludesFor(frontendInfo.frontendPath));
   }
 
-  let additionalServices = await analyzeAdditionalServices(currentDir, knownPaths);
+  // The compose keys already generated as the primary backend/frontend. Passed
+  // so a second service sharing their build context is still discovered, while
+  // the service that IS the backend is not generated twice.
+  const claimedComposeNames = new Set();
+  try {
+    const { findBuildableComposeServices } = require('../../utils/analyzer');
+    const builds = await findBuildableComposeServices(currentDir);
+    for (const [composeName, info] of Object.entries(builds)) {
+      for (const claimedPath of knownPaths.filter(Boolean)) {
+        if (path.resolve(info.context) === path.resolve(claimedPath)) {
+          // The first compose service over a claimed context is the one that
+          // became it; any further ones are separate services.
+          if (!claimedComposeNames.size || claimedComposeNames.has(composeName)) claimedComposeNames.add(composeName);
+          else if (![...claimedComposeNames].some(n => builds[n] && path.resolve(builds[n].context) === path.resolve(info.context))) claimedComposeNames.add(composeName);
+          break;
+        }
+      }
+    }
+  } catch (e) { /* no compose - nothing is claimed by key */ }
+
+  let additionalServices = await analyzeAdditionalServices(currentDir, knownPaths, claimedComposeNames);
 
   // Resolve naming conflicts
   const usedNames = new Set(['api', 'frontend', 'db', 'database', 'dashboard']);
@@ -1095,19 +632,6 @@ variable "domain" {
     }
     s.name = finalName;
     usedNames.add(finalName);
-  }
-
-  // Initialize env for additional services
-  for (const s of additionalServices) {
-    s.env = {};
-    s.secretKeys = [];
-    // s.secretKeys gets fully REASSIGNED later, from a usedEnvVars filter
-    // computed only after the whole compose scan finishes - anything pushed
-    // onto it during the scan itself (tryWireSharedCredential's direct-push
-    // branch, the compose-declaration force-wire) would otherwise be
-    // silently discarded the moment that reassignment runs. Collected here
-    // instead and merged back in once the reassignment has happened.
-    s.forcedSecretKeys = new Set();
   }
 
 
@@ -1157,6 +681,108 @@ variable "domain" {
   // both need to recognize the exact same set of "this is a DB connection
   // string" key names, whichever file they're declared in.
   const dbUrlKeyRegex = /^(DATABASE_URL|DB_URL|MONGO_URI|MONGO_URL|POSTGRES_URL|MYSQL_URL)$/;
+  const CREDENTIAL_OWNER_ENV_KEYS = new Set([
+    'POSTGRES_PASSWORD', 'MYSQL_ROOT_PASSWORD', 'MARIADB_ROOT_PASSWORD',
+    'MONGO_INITDB_ROOT_PASSWORD', 'RABBITMQ_DEFAULT_PASS', 'KC_BOOTSTRAP_ADMIN_PASSWORD',
+  ]);
+
+  // The compose file is read here because the shared-credential discovery
+  // below needs it, and that in turn has to run before the .env scan.
+  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  let composeContent = null;
+  for (const cf of composeFiles) {
+    try {
+      composeContent = fs.readFileSync(path.join(currentDir, cf), 'utf8');
+      break;
+    } catch (e) { /* not this name - try the next */ }
+  }
+
+  // Runs BEFORE the .env scan below, which calls tryWireSharedCredential.
+  // It used to sit after it: the function is hoisted so the call resolved,
+  // but sharedCredentialSecrets is a const declared here, so any .env with a
+  // sensitive key whose value is a bare ${VAR} reference threw
+  // "Cannot access 'sharedCredentialSecrets' before initialization" and
+  // aborted the whole run.
+  // compose variable name (e.g. "RABBITMQ_PASSWORD") -> { secretKey, value }.
+  // secretKey is the canonical name this credential is stored and referenced
+  // under everywhere: in deploy/.env, as a GitHub secret, and as the key
+  // inside the project's Kubernetes Secret.
+  const sharedCredentialSecrets = new Map();
+  // Consumers discovered during the compose scan, before apiSecretKeys/
+  // frontendSecretKeys exist yet (they are computed later from usedEnvVars,
+  // which would never catch a name Spring's relaxed binding invents purely
+  // by convention and never spells out anywhere in source).
+  const apiForcedSecretKeys = new Set();
+  const frontendForcedSecretKeys = new Set();
+  let apiExtraSecretEnvMappings = [];
+  let frontendExtraSecretEnvMappings = [];
+
+  function registerSharedCredential(varName, secretKeyName) {
+    if (sharedCredentialSecrets.has(varName)) return sharedCredentialSecrets.get(varName);
+    const entry = { secretKey: secretKeyName, value: crypto.randomBytes(16).toString('hex') };
+    sharedCredentialSecrets.set(varName, entry);
+    return entry;
+  }
+
+  // Runs once, before any service's environment is scanned - a consumer can
+  // appear earlier in docker-compose.yml than the component whose credential
+  // it reads (compose imposes no such ordering), so every owner has to be
+  // known up front rather than discovered opportunistically while services
+  // are processed in file order.
+  async function discoverSharedCredentials() {
+    if (!composeContent) return;
+    const composeServicesAll = await parseComposeServices(currentDir);
+    for (const svc of Object.values(composeServicesAll)) {
+      if (!svc.block) continue;
+      for (const ownerKey of CREDENTIAL_OWNER_ENV_KEYS) {
+        const m = svc.block.match(new RegExp(`^\\s*${ownerKey}:\\s*(.+)$`, 'm'));
+        if (!m) continue;
+        const bareVar = extractBareVarRef(m[1]);
+        if (bareVar) registerSharedCredential(bareVar, ownerKey);
+      }
+      // Redis has no fixed credential-declaring env var of its own - the
+      // password is set via a --requirepass CLI argument instead. The
+      // variable's own name becomes the canonical secret key, since there is
+      // no engine-provided convention to use instead.
+      const cmdMatch = svc.block.match(/--requirepass["',\s]*\$\{?([A-Za-z_][A-Za-z0-9_]*)/);
+      if (cmdMatch) registerSharedCredential(cmdMatch[1], cmdMatch[1]);
+    }
+  }
+  await discoverSharedCredentials();
+
+  // Short-circuits the generic env-handling path (processEnvVariable) for a
+  // key whose value is a bare reference to an already-discovered shared
+  // credential - wiring it straight to that credential's real, generated
+  // value instead of leaving "${VAR}" as an unresolved placeholder (or, for
+  // a name no source-scanning heuristic would ever recognize as sensitive,
+  // not wiring it into the container's environment at all).
+  // Returns true when the key/value pair was fully handled here.
+  function tryWireSharedCredential(key, rawVal, isBackend, isFrontend, matchedAdditionalServices) {
+    if (!isSensitiveKey(key)) return false;
+    const bareVar = extractBareVarRef(rawVal);
+    if (!bareVar || !sharedCredentialSecrets.has(bareVar)) return false;
+    const { secretKey } = sharedCredentialSecrets.get(bareVar);
+
+    if (isBackend) {
+      if (key === secretKey) apiForcedSecretKeys.add(key);
+      else if (!apiExtraSecretEnvMappings.some(m => m.envName === key)) apiExtraSecretEnvMappings.push({ envName: key, secretKey });
+    }
+    if (isFrontend) {
+      if (key === secretKey) frontendForcedSecretKeys.add(key);
+      else if (!frontendExtraSecretEnvMappings.some(m => m.envName === key)) frontendExtraSecretEnvMappings.push({ envName: key, secretKey });
+    }
+    if (matchedAdditionalServices && matchedAdditionalServices.length > 0) {
+      for (const s of matchedAdditionalServices) {
+        if (key === secretKey) {
+          s.forcedSecretKeys.add(key);
+        } else {
+          if (!s.extraSecretEnvMappings.some(m => m.envName === key)) s.extraSecretEnvMappings.push({ envName: key, secretKey });
+        }
+      }
+    }
+    return true;
+  }
+
 
   // Within one directory a real .env always beats an example file, so sort by
   // the precedence list and let the first file that declares a key win.
@@ -1247,7 +873,10 @@ variable "domain" {
         const handledServices = typeof matchedAdditionalServices !== 'undefined' ? matchedAdditionalServices : [];
         if (!tryWireSharedCredential(key, val, isBackend, isFrontend, handledServices)) {
           let sensitiveContext = { content: sensitiveEnvContent };
-          processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext, handledServices);
+          processEnvVariable(key, val, {
+                isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv,
+                sensitiveContext, matchedAdditionalServices: handledServices,
+              });
           sensitiveEnvContent = sensitiveContext.content;
         }
       }
@@ -1256,16 +885,6 @@ variable "domain" {
 
   if (refactoredEnvKey) {
     frontendEnv[refactoredEnvKey] = '';
-  }
-
-  // Parse docker-compose.yml environment blocks
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
-  let composeContent = null;
-  for (const cf of composeFiles) {
-    try {
-      composeContent = fs.readFileSync(path.join(currentDir, cf), 'utf8');
-      break;
-    } catch (e) { }
   }
 
   // A compose file's OWN infrastructure services - a message broker, a
@@ -1289,90 +908,6 @@ variable "domain" {
   // a password, Flarops has no free literal to give it that is guaranteed to
   // be a valid identifier for every engine, so it stays a placeholder with a
   // warning that every reference to it must be set to the same value.
-  const CREDENTIAL_OWNER_ENV_KEYS = new Set([
-    'POSTGRES_PASSWORD', 'MYSQL_ROOT_PASSWORD', 'MARIADB_ROOT_PASSWORD',
-    'MONGO_INITDB_ROOT_PASSWORD', 'RABBITMQ_DEFAULT_PASS', 'KC_BOOTSTRAP_ADMIN_PASSWORD',
-  ]);
-  // compose variable name (e.g. "RABBITMQ_PASSWORD") -> { secretKey, value }.
-  // secretKey is the canonical name this credential is stored and referenced
-  // under everywhere: in deploy/.env, as a GitHub secret, and as the key
-  // inside the project's Kubernetes Secret.
-  const sharedCredentialSecrets = new Map();
-  // Consumers discovered during the compose scan, before apiSecretKeys/
-  // frontendSecretKeys exist yet (they are computed later from usedEnvVars,
-  // which would never catch a name Spring's relaxed binding invents purely
-  // by convention and never spells out anywhere in source).
-  const apiForcedSecretKeys = new Set();
-  const frontendForcedSecretKeys = new Set();
-  let apiExtraSecretEnvMappings = [];
-  let frontendExtraSecretEnvMappings = [];
-
-  function registerSharedCredential(varName, secretKeyName) {
-    if (sharedCredentialSecrets.has(varName)) return sharedCredentialSecrets.get(varName);
-    const entry = { secretKey: secretKeyName, value: crypto.randomBytes(16).toString('hex') };
-    sharedCredentialSecrets.set(varName, entry);
-    return entry;
-  }
-
-  // Runs once, before any service's environment is scanned - a consumer can
-  // appear earlier in docker-compose.yml than the component whose credential
-  // it reads (compose imposes no such ordering), so every owner has to be
-  // known up front rather than discovered opportunistically while services
-  // are processed in file order.
-  async function discoverSharedCredentials() {
-    if (!composeContent) return;
-    const composeServicesAll = await parseComposeServices(currentDir);
-    for (const svc of Object.values(composeServicesAll)) {
-      if (!svc.block) continue;
-      for (const ownerKey of CREDENTIAL_OWNER_ENV_KEYS) {
-        const m = svc.block.match(new RegExp(`^\\s*${ownerKey}:\\s*(.+)$`, 'm'));
-        if (!m) continue;
-        const bareVar = extractBareVarRef(m[1]);
-        if (bareVar) registerSharedCredential(bareVar, ownerKey);
-      }
-      // Redis has no fixed credential-declaring env var of its own - the
-      // password is set via a --requirepass CLI argument instead. The
-      // variable's own name becomes the canonical secret key, since there is
-      // no engine-provided convention to use instead.
-      const cmdMatch = svc.block.match(/--requirepass["',\s]*\$\{?([A-Za-z_][A-Za-z0-9_]*)/);
-      if (cmdMatch) registerSharedCredential(cmdMatch[1], cmdMatch[1]);
-    }
-  }
-  await discoverSharedCredentials();
-
-  // Short-circuits the generic env-handling path (processEnvVariable) for a
-  // key whose value is a bare reference to an already-discovered shared
-  // credential - wiring it straight to that credential's real, generated
-  // value instead of leaving "${VAR}" as an unresolved placeholder (or, for
-  // a name no source-scanning heuristic would ever recognize as sensitive,
-  // not wiring it into the container's environment at all).
-  // Returns true when the key/value pair was fully handled here.
-  function tryWireSharedCredential(key, rawVal, isBackend, isFrontend, matchedAdditionalServices) {
-    if (!isSensitiveKey(key)) return false;
-    const bareVar = extractBareVarRef(rawVal);
-    if (!bareVar || !sharedCredentialSecrets.has(bareVar)) return false;
-    const { secretKey } = sharedCredentialSecrets.get(bareVar);
-
-    if (isBackend) {
-      if (key === secretKey) apiForcedSecretKeys.add(key);
-      else if (!apiExtraSecretEnvMappings.some(m => m.envName === key)) apiExtraSecretEnvMappings.push({ envName: key, secretKey });
-    }
-    if (isFrontend) {
-      if (key === secretKey) frontendForcedSecretKeys.add(key);
-      else if (!frontendExtraSecretEnvMappings.some(m => m.envName === key)) frontendExtraSecretEnvMappings.push({ envName: key, secretKey });
-    }
-    if (matchedAdditionalServices && matchedAdditionalServices.length > 0) {
-      for (const s of matchedAdditionalServices) {
-        if (key === secretKey) {
-          (s.forcedSecretKeys || (s.forcedSecretKeys = new Set())).add(key);
-        } else {
-          s.extraSecretEnvMappings = s.extraSecretEnvMappings || [];
-          if (!s.extraSecretEnvMappings.some(m => m.envName === key)) s.extraSecretEnvMappings.push({ envName: key, secretKey });
-        }
-      }
-    }
-    return true;
-  }
 
   // Maps a docker-compose service key (e.g. "goodreads-config") to the k8s
   // Service name Flarops actually generates for it (e.g. "config-server") -
@@ -1393,17 +928,17 @@ variable "domain" {
   const composeSupportCandidates = new Map();
 
   if (composeContent) {
-    const serviceRegex = /^  ([a-zA-Z0-9_-]+):/gm;
-    let match;
-    const services = [];
-    while ((match = serviceRegex.exec(composeContent)) !== null) {
-      services.push({ name: match[1], index: match.index });
-    }
+    // parseComposeServices anchors service blocks to the indentation the file
+    // actually uses. The hand-rolled regex this replaces hardcoded two spaces,
+    // so a perfectly valid four-space compose file matched NOTHING: the whole
+    // block below - env scan, build args, command:, container_name mapping,
+    // db-URL registration - silently did nothing, the run still exited 0, and
+    // the chart came out missing everything compose declared.
+    const composeBlocks = await parseComposeServices(currentDir);
+    const services = Object.keys(composeBlocks).map(name => ({ name }));
 
     for (let i = 0; i < services.length; i++) {
-      const start = services[i].index;
-      const end = i + 1 < services.length ? services[i + 1].index : composeContent.length;
-      const block = composeContent.substring(start, end);
+      const block = composeBlocks[services[i].name].block;
 
       // A compose service's key often diverges from its source directory name
       // (e.g. "goodreads-svc2" for a directory actually named "service2"),
@@ -1413,6 +948,15 @@ variable "domain" {
       // alternate identity to match against directory names.
       const buildDirMatch = block.match(/^\s*#?\s*build:\s*\.?\/?([a-zA-Z0-9_-]+)\s*$/m) || block.match(/^\s*#?\s*context:\s*\.?\/?([a-zA-Z0-9_-]+)\s*$/m);
       const buildDirName = buildDirMatch ? buildDirMatch[1] : null;
+
+      // "context: ." / "build: ." - the repository root. Neither pattern above
+      // matches it (both require at least one name character), and the root's
+      // basename is the REPOSITORY's name, not the compose key - so a service
+      // built from the root matched nothing, was treated as neither backend
+      // nor frontend nor an additionalService, and its entire environment:
+      // block was skipped. It is the backend whenever the detected backend
+      // path IS the repository root.
+      const buildsFromRoot = /^\s*#?\s*(?:build|context):\s*\.\/?\s*$/m.test(block);
 
       // On compose's default network a container answers to BOTH its service
       // key and its container_name, and projects routinely connect using the
@@ -1424,8 +968,10 @@ variable "domain" {
       const containerNameMatch = block.match(/^\s*container_name:\s*["']?([a-zA-Z0-9_.-]+)["']?\s*$/m);
       if (containerNameMatch) composeContainerNames.set(containerNameMatch[1], services[i].name);
 
-      let isBackend = ['api', 'backend', 'server'].includes(services[i].name) || (backendInfo.backendPath && (path.basename(backendInfo.backendPath) === services[i].name || (buildDirName && path.basename(backendInfo.backendPath) === buildDirName)));
-      let isFrontend = ['frontend', 'client', 'ui', 'web'].includes(services[i].name) || (frontendInfo.frontendPath && (path.basename(frontendInfo.frontendPath) === services[i].name || (buildDirName && path.basename(frontendInfo.frontendPath) === buildDirName)));
+      const backendIsRoot = backendInfo.backendPath && path.resolve(backendInfo.backendPath) === path.resolve(currentDir);
+      const frontendIsRoot = frontendInfo.frontendPath && path.resolve(frontendInfo.frontendPath) === path.resolve(currentDir);
+      let isBackend = ['api', 'backend', 'server'].includes(services[i].name) || (buildsFromRoot && backendIsRoot) || (backendInfo.backendPath && (path.basename(backendInfo.backendPath) === services[i].name || (buildDirName && path.basename(backendInfo.backendPath) === buildDirName)));
+      let isFrontend = ['frontend', 'client', 'ui', 'web'].includes(services[i].name) || (buildsFromRoot && frontendIsRoot && !isBackend) || (frontendInfo.frontendPath && (path.basename(frontendInfo.frontendPath) === services[i].name || (buildDirName && path.basename(frontendInfo.frontendPath) === buildDirName)));
       // Match on the sanitized k8s name AND the original directory spelling:
       // init.js rewrites "My_Service" to "my-service" for k8s, so comparing
       // only the sanitized name against a raw compose key never matched and
@@ -1536,7 +1082,7 @@ variable "domain" {
             if (isBackend) apiForcedSecretKeys.add(secretKey);
             if (isFrontend) frontendForcedSecretKeys.add(secretKey);
             for (const s of matchedAdditionalServices) {
-              (s.forcedSecretKeys || (s.forcedSecretKeys = new Set())).add(secretKey);
+              s.forcedSecretKeys.add(secretKey);
             }
           }
           if (isBackend && !apiCommand) apiCommand = commandArgs;
@@ -1622,7 +1168,6 @@ variable "domain" {
                 ownDbName = urlObj.pathname ? urlObj.pathname.replace(/^\//, '') : null;
               } catch (e) { }
               for (const s of matchedAdditionalServices) {
-                s.dbUrlVars = s.dbUrlVars || [];
                 if (!s.dbUrlVars.some(v => v.key === key)) {
                   s.dbUrlVars.push({ key, dbName: ownDbName });
                 }
@@ -1632,7 +1177,10 @@ variable "domain" {
             const handledServices = typeof matchedAdditionalServices !== 'undefined' ? matchedAdditionalServices : [];
             if (!tryWireSharedCredential(key, val, isBackend, isFrontend, handledServices)) {
               let sensitiveContext = { content: sensitiveEnvContent };
-              processEnvVariable(key, val, isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv, sensitiveContext, handledServices);
+              processEnvVariable(key, val, {
+                isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv,
+                sensitiveContext, matchedAdditionalServices: handledServices,
+              });
               sensitiveEnvContent = sensitiveContext.content;
 
               // docker-compose's OWN declaration of a sensitive key for THIS
@@ -1651,7 +1199,7 @@ variable "domain" {
                 if (isBackend) apiForcedSecretKeys.add(key);
                 if (isFrontend) frontendForcedSecretKeys.add(key);
                 for (const s of handledServices) {
-                  (s.forcedSecretKeys || (s.forcedSecretKeys = new Set())).add(key);
+                  s.forcedSecretKeys.add(key);
                 }
               }
             }
@@ -1851,7 +1399,7 @@ variable "domain" {
       console.log(`\x1b[34mINFO: Analyzed backend code and found expected database host key: ${inferredKeys.hostKey}\x1b[0m`);
     }
     if (inferredKeys.userKey && !apiEnv[inferredKeys.userKey]) {
-      apiEnv[inferredKeys.userKey] = dbInfo.dbUser || (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql' ? 'postgres' : 'root');
+      apiEnv[inferredKeys.userKey] = dbInfo.dbUser || defaultUserFor(dbInfo.dbType);
       console.log(`\x1b[34mINFO: Analyzed backend code and found expected database user key: ${inferredKeys.userKey}\x1b[0m`);
     }
     if (inferredKeys.nameKey && !apiEnv[inferredKeys.nameKey]) {
@@ -1993,6 +1541,18 @@ REGISTRY_PASSWORD="${registryPassword}"
     if (finalDbPassword && !new RegExp('^' + escapeRegex(finalDbPasswordKey) + '=', 'm').test(existingEnv)) {
       fs.appendFileSync(envFile, `\n${finalDbPasswordKey}="${finalDbPassword}"\n`);
       console.log(`Appended fallback ${finalDbPasswordKey} to deploy/.env`);
+      appended = true;
+    }
+
+    // The dashboard hash lives outside sensitiveEnvContent (it is generated,
+    // not extracted), so it needs its own append here. Without this, deleting
+    // the line and re-running - which is exactly what the CLI tells you to do
+    // to reissue the password - printed a new password and wrote the hash
+    // nowhere: CI then set DASHBOARD_PASSWORD_HASH to empty, the dashboard
+    // refused to start, and with it every PR capsule deploy that asks its
+    // capacity oracle.
+    if (dashboardEnvContent && !/^DASHBOARD_PASSWORD_HASH=/m.test(existingEnv)) {
+      fs.appendFileSync(envFile, `\n# Generated by Flarops for the deployment dashboard - not taken from your project\n${dashboardEnvContent}`);
       appended = true;
     }
 
@@ -2376,13 +1936,43 @@ AWS_REGION=${awsRegion}
   // frontendSecretKeys - Spring's relaxed environment-variable binding in
   // particular means the key is never spelled out anywhere in source for
   // that check to find, yet the running container still needs it declared.
-  for (const k of apiForcedSecretKeys) if (!apiSecretKeys.includes(k)) apiSecretKeys.push(k);
-  for (const k of frontendForcedSecretKeys) if (!frontendSecretKeys.includes(k)) frontendSecretKeys.push(k);
+  // A key rendered as a secretKeyRef must ALSO be something CI puts in the
+  // Secret, or the pod cannot start. The Secret is filled from .Values.env,
+  // which the workflow fills from SECRET_ENV_*, which comes from
+  // envKeysToPass - so a key that reaches secretKeys without reaching
+  // envKeysToPass produces a reference to a key that will never exist, and
+  // the container sits in CreateContainerConfigError. That was the single
+  // most common way a generated deployment failed to come up.
+  const registerSecretKeyForCI = (key) => {
+    if (!key) return;
+    if (!envKeysToPass.includes(key)) envKeysToPass.push(key);
+    // deploy/.env is the operator's list of what to put in GitHub Secrets, so
+    // it has to carry the key too - with whatever value was discovered for it,
+    // or empty when there is none to discover.
+    const existing = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
+    if (!new RegExp('^' + escapeRegex(key) + '=', 'm').test(existing)) {
+      const known = sharedCredentialSecrets.get(key);
+      const value = known ? known.value : (apiEnv[key] || frontendEnv[key] || '');
+      fs.appendFileSync(envFile, `${key}="${String(value).replace(/"/g, '\\"')}"\n`);
+    }
+  };
+
+  for (const k of apiForcedSecretKeys) {
+    if (!apiSecretKeys.includes(k)) apiSecretKeys.push(k);
+    registerSecretKeyForCI(k);
+  }
+  for (const k of frontendForcedSecretKeys) {
+    if (!frontendSecretKeys.includes(k)) frontendSecretKeys.push(k);
+    registerSecretKeyForCI(k);
+  }
 
   for (const s of additionalServices) {
     s.secretKeys = sensitiveKeys.filter(k => s.usedEnvVars && s.usedEnvVars.includes(k));
-    for (const k of s.forcedSecretKeys || []) if (!s.secretKeys.includes(k)) s.secretKeys.push(k);
-    s.relativePath = path.relative(currentDir, s.path);
+    for (const k of s.forcedSecretKeys || []) {
+      if (!s.secretKeys.includes(k)) s.secretKeys.push(k);
+      registerSecretKeyForCI(k);
+    }
+    // relativePath is set by makeServiceEntry at discovery time.
     // Wire the DB password secret into this service's container only if its own
     // source code actually reads it - otherwise every additional service would
     // silently get DB credentials it never asked for.
@@ -2402,12 +1992,8 @@ AWS_REGION=${awsRegion}
     if (!isDistinctDb) continue;
 
     const serviceUpper = s.name.toUpperCase().replace(/[^A-Z0-9]/g, '_');
-    let passwordKeyBase = 'DATABASE_PASSWORD';
-    let defaultUser = 'postgres';
-    if (serviceDb.dbType === 'postgres' || serviceDb.dbType === 'postgresql') { passwordKeyBase = 'POSTGRES_PASSWORD'; defaultUser = 'postgres'; }
-    else if (serviceDb.dbType === 'mysql') { passwordKeyBase = 'MYSQL_ROOT_PASSWORD'; defaultUser = 'root'; }
-    else if (serviceDb.dbType === 'mariadb') { passwordKeyBase = 'MARIADB_ROOT_PASSWORD'; defaultUser = 'root'; }
-    else if (serviceDb.dbType === 'mongodb') { passwordKeyBase = 'MONGO_INITDB_ROOT_PASSWORD'; defaultUser = 'root'; }
+    const passwordKeyBase = passwordKeyFor(serviceDb.dbType);
+    const defaultUser = defaultUserFor(serviceDb.dbType);
     const passwordKey = `${serviceUpper}_${passwordKeyBase}`;
     const password = crypto.randomBytes(16).toString('hex');
 
@@ -2439,7 +2025,6 @@ AWS_REGION=${awsRegion}
     const isSpringMongo = await detectSpringDataMongoConfig(s.path);
     if (isSpringMongo && serviceDb.dbType === 'mongodb') {
       delete s.env['SPRING_DATA_MONGODB_URI'];
-      s.dbUrlVars = s.dbUrlVars || [];
       if (!s.dbUrlVars.some(v => v.key === 'SPRING_DATA_MONGODB_URI')) {
         s.dbUrlVars.push({ key: 'SPRING_DATA_MONGODB_URI', dbName: s.db.name });
       }
@@ -2493,8 +2078,7 @@ AWS_REGION=${awsRegion}
       // mechanism already used for the primary backend.
       const dbUrlRefactorResult = await refactorBackendDbUrl(s.path, true);
       if (dbUrlRefactorResult && dbUrlRefactorResult.discoveredVars.length > 0) {
-        s.dbUrlVars = s.dbUrlVars || [];
-        for (const key of dbUrlRefactorResult.discoveredVars) {
+          for (const key of dbUrlRefactorResult.discoveredVars) {
           if (!s.dbUrlVars.some(v => v.key === key)) s.dbUrlVars.push({ key });
         }
       }
@@ -2520,7 +2104,7 @@ AWS_REGION=${awsRegion}
         type: dbInfo.dbType,
         image: dbInfo.image,
         port: dbInfo.port,
-        user: dbInfo.dbUser || (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql' ? 'postgres' : 'root'),
+        user: dbInfo.dbUser || defaultUserFor(dbInfo.dbType),
         name: null, // each dbUrlVars entry below carries its own db name
         passwordKey: finalDbPasswordKey,
         shared: true,
@@ -2554,7 +2138,7 @@ AWS_REGION=${awsRegion}
         s.env[svcKeys.hostKey] = 'database';
       }
       if (isUpper(svcKeys.userKey) && !s.env[svcKeys.userKey]) {
-        s.env[svcKeys.userKey] = dbInfo.dbUser || (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql' ? 'postgres' : 'root');
+        s.env[svcKeys.userKey] = dbInfo.dbUser || defaultUserFor(dbInfo.dbType);
       }
       if (isUpper(svcKeys.passwordKey) && finalDbPasswordKey) {
         if (svcKeys.passwordKey === finalDbPasswordKey) {
@@ -2564,8 +2148,7 @@ AWS_REGION=${awsRegion}
           // secret's key name - map one to the other directly instead of
           // renaming either (a secretKeyRef's container-side name and its
           // key in the Secret are independent).
-          s.extraSecretEnvMappings = s.extraSecretEnvMappings || [];
-          if (!s.extraSecretEnvMappings.some(m => m.envName === svcKeys.passwordKey)) {
+              if (!s.extraSecretEnvMappings.some(m => m.envName === svcKeys.passwordKey)) {
             s.extraSecretEnvMappings.push({ envName: svcKeys.passwordKey, secretKey: finalDbPasswordKey });
           }
         }
@@ -2999,11 +2582,9 @@ appVersion: "1.0.0"
 `;
   fs.writeFileSync(path.join(helmDir, 'Chart.yaml'), chartYaml);
 
-  let defaultDbUser = 'postgres';
-  if (config.dbType === 'mysql') defaultDbUser = 'mysql';
-  else if (config.dbType === 'mongodb') defaultDbUser = 'root';
-
-  const finalDbUser = config.dbUser || defaultDbUser;
+  // MySQL resolved to "mysql" here and to "root" everywhere else, so the chart
+  // created one user and told the API about another. One table now answers.
+  const finalDbUser = config.dbUser || defaultUserFor(config.dbType);
   const finalDbName = config.dbName || 'appdb';
 
   // Every consumer must resolve the DB user identically. values.yaml resolved
@@ -3030,13 +2611,16 @@ appVersion: "1.0.0"
     }
   }
 
-  let hasLocalhostWarnings = false;
-  let contextObj = { hasLocalhostWarnings };
+  // One variable, not two. A local copy was taken here and the shared box kept
+  // being written for hundreds of lines afterwards - the additionalServices and
+  // supportServices env blocks are rendered further down - so a "localhost"
+  // value in one of those got the "change this" comment written into
+  // values.yaml while the CLI never printed the ATTENTION block telling anyone
+  // to look.
+  const contextObj = { hasLocalhostWarnings: false };
 
   let apiEnvString = generateEnvString(apiEnv, contextObj);
   let frontendEnvString = generateEnvString(frontendEnv, contextObj);
-
-  hasLocalhostWarnings = contextObj.hasLocalhostWarnings;
 
   if (unresolvedPlaceholderKeys.size > 0) {
     console.warn(`\x1b[33mWARNING: These variables still reference a value this repository never defines, so they were left as-is instead of being given an invented one: ${Array.from(unresolvedPlaceholderKeys).join(', ')}. Set their real values (in GitHub Secrets if they are secret, in deploy/helm/values.yaml otherwise) before deploying.\x1b[0m`);
@@ -3059,12 +2643,21 @@ appVersion: "1.0.0"
     for (const r of config.apiRoutes) (routeOwners[r] = routeOwners[r] || []).push('api');
   }
   for (const s of config.additionalServices) {
+    // A service kept off the Ingress on purpose - because it sits behind this
+    // project's own API gateway - is not competing for anything. Counting it
+    // as a claimant made every gateway-fronted route look like an N-way
+    // conflict, and the rule that resolves a conflict by dropping it from
+    // EVERY claimant then stripped those routes from the gateway itself. A
+    // microservice mesh ended up with no exposed route at all, which renders
+    // as "paths: null" and is rejected outright by the API server.
+    if (s.suppressDirectIngress) continue;
     for (const r of (s.exposedRoutes || [])) (routeOwners[r] = routeOwners[r] || []).push(s.name);
   }
   const conflictingRoutes = Object.entries(routeOwners).filter(([, owners]) => owners.length > 1);
   if (conflictingRoutes.length > 0) {
     for (const s of config.additionalServices) {
-      s.exposedRoutes = (s.exposedRoutes || []).filter(r => !routeOwners[r] || routeOwners[r].length === 1);
+      if (s.suppressDirectIngress) continue;
+      s.exposedRoutes = s.exposedRoutes.filter(r => !routeOwners[r] || routeOwners[r].length === 1);
     }
     // The warning below says a conflicting path was dropped for every listed
     // owner, including "api" when it's one of them - but api's routes are
@@ -3097,7 +2690,7 @@ ${s.ports.map(p => '      - ' + p).join('\n')}
     healthPort: ${s.healthPort || 'null'}
     exposedRoutes: ${s.exposedRoutes && s.exposedRoutes.length > 0 ? '[' + s.exposedRoutes.map(r => '"' + r + '"').join(', ') + ']' : '[]'}
     # false when this project's own API gateway already covers these routes
-    # (see detectApiIsGateway) - set to true to also expose them directly,
+    # (see detectServiceIsGateway) - set to true to also expose them directly,
     # bypassing the gateway.
     exposeDirectly: ${s.suppressDirectIngress ? 'false' : 'true'}
 ${s.command ? `    command:\n${s.command.map(a => '      - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}${(s.db && !s.db.shared) ? `    db:
@@ -3295,12 +2888,19 @@ dataNodeSelector: {}
     // project being generated) - copying it committed a ~60MB stale
     // executable into the user's repository and shipped it into the Docker
     // build context. Test files are development artifacts of this repo too.
+    //
+    // The same applies to the dashboard's own runtime state: running it once
+    // in this checkout leaves a flarops_metrics.db (plus SQLite's -wal/-shm
+    // side files) holding whatever that instance recorded. Copying it put one
+    // developer's local metrics into every generated repository and shipped
+    // them, growing without bound, into the image.
     fs.cpSync(dashboardSourceDir, dashboardDestDir, {
       recursive: true,
       filter: (src) => {
         const base = path.basename(src);
         if (base === 'dashboard' && src !== dashboardSourceDir && !fs.statSync(src).isDirectory()) return false;
         if (base.endsWith('_test.go')) return false;
+        if (/\.db(-wal|-shm)?$/.test(base)) return false;
         return true;
       },
     });
@@ -3322,6 +2922,18 @@ dataNodeSelector: {}
     console.log("    delete that line and re-run init to issue a new one.");
     console.log("");
   }
+
+  // Deleting files is not something init does on its own (see
+  // bin/commands/sync.js), but leaving the operator to discover a chart that
+  // cannot render is worse than telling them.
+  try {
+    const { findOrphanTemplates } = require('./sync.js');
+    const found = findOrphanTemplates(currentDir);
+    if (found && found.orphans.length > 0) {
+      console.warn(`\x1b[33mWARNING: deploy/helm/templates still holds ${found.orphans.length} template(s) for services this project no longer has: ${found.orphans.join(', ')}. They reference values that are gone, and Helm aborts the WHOLE chart on one of them - run "flarops sync" to remove them.\x1b[0m`);
+      console.log("");
+    }
+  } catch (e) { /* best effort - never block a successful generation */ }
 
   console.log("");
   console.log("#############################################################################################");
@@ -3350,7 +2962,7 @@ dataNodeSelector: {}
     }
   }
 
-  if (hasLocalhostWarnings) {
+  if (contextObj.hasLocalhostWarnings) {
     console.log(`\x1b[36mATTENTION: We found "localhost" references in your environment variables.\x1b[0m`);
     console.log(`\x1b[36mPlease open deploy/helm/values.yaml and change "localhost" to the appropriate service name (e.g. "api", "frontend", or "database") so containers can communicate properly in Kubernetes!\x1b[0m`);
     console.log("");

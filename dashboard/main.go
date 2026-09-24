@@ -27,6 +27,11 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	conn *websocket.Conn
 	send chan []byte
+	// The session this socket was opened with. requireAuth only runs on the
+	// handshake, so without re-checking it a token used once yielded an
+	// unbounded feed of the entire cluster state that logging out could not
+	// revoke - destroySession deletes the row, and the socket kept streaming.
+	sessionToken string
 }
 
 type Hub struct {
@@ -56,6 +61,14 @@ func (h *Hub) run() {
 			}
 		case message := <-h.broadcast:
 			for client := range h.clients {
+				// Checked on every frame rather than only at the handshake, so
+				// a logout or an expired session closes the stream within one
+				// collection interval instead of never.
+				if !sessionIsValid(client.sessionToken) {
+					close(client.send)
+					delete(h.clients, client)
+					continue
+				}
 				select {
 				case client.send <- message:
 				default:
@@ -73,8 +86,20 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		log.Println("upgrade err:", err)
 		return
 	}
-	client := &Client{conn: conn, send: make(chan []byte, 256)}
+	client := &Client{
+		conn:         conn,
+		send:         make(chan []byte, 256),
+		sessionToken: cookieValue(r, auth.sessionCookieName()),
+	}
 	hub.register <- client
+
+	// Bound what a client can send and how long it may sit idle. Neither was
+	// limited before, so a socket neither aged out nor capped its input.
+	conn.SetReadLimit(4 << 10)
+	_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	})
 
 	go func() {
 		defer func() {
@@ -93,11 +118,18 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	go func() {
+		ping := time.NewTicker(30 * time.Second)
 		defer func() {
+			ping.Stop()
 			conn.Close()
 		}()
 		for {
 			select {
+			case <-ping.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
 			case message, ok := <-client.send:
 				if !ok {
 					conn.WriteMessage(websocket.CloseMessage, []byte{})
@@ -117,6 +149,15 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// The same binary ships as the DaemonSet that reports node disk usage.
+	// It shares nothing with the dashboard: no database, no Kubernetes client,
+	// no ServiceAccount token. See nodeagent.go for why that separation is the
+	// point rather than an economy.
+	if os.Getenv("FLAROPS_NODE_AGENT") == "1" {
+		runNodeAgent()
+		return
+	}
+
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
 		dbPath = "flarops_metrics.db"

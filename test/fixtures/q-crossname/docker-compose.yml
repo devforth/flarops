@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: shared
+  api:
+    build: ./backend
+    ports: ["3000:3000"]
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASS}
+      DB_HOST: db
+    depends_on: [db]
+  worker:
+    build: ./worker
+    environment:
+      PG_PASSWORD: ${DB_PASS}
+      DB_HOST: db
+    depends_on: [db]
+  reporting:
+    build: ./reporting
+    ports: ["4100:4100"]
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASS}
+      DB_HOST: db
+    depends_on: [db]

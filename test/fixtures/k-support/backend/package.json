@@ -1,0 +1,1 @@
+{"name":"k","dependencies":{"express":"^4","amqplib":"^0.10","redis":"^4"}}

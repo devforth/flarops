@@ -1,0 +1,20 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_PASS: rabbitpw
+      RABBITMQ_DEFAULT_USER: app
+    volumes:
+      - ./config/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+  cache:
+    image: redis:7
+    volumes:
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+  api:
+    build: ./backend
+    ports: ["3000:3000"]
+    environment:
+      AMQP_URL: amqp://app:rabbitpw@rabbitmq:5672
+      REDIS_HOST: cache
+    depends_on: [rabbitmq, cache]
