@@ -29,14 +29,23 @@ async function analyzeFrontendRoutes(frontendDir) {
   };
 
   const httpCallRegex = /(?:fetch|axios|(?:\0)http|client|request|api)(?:\s*\.\s*[a-zA-Z]+)?\s*\(\s*.{0,200}?['"`}]((?:https?:\/\/[^\/\s'"`}]+)?\/[a-zA-Z0-9_\-\/]+)(?:\?|['"`\s])/gims;
-  const envUrlRegex = /^(?:VITE_|REACT_APP_|NEXT_PUBLIC_|NUXT_|VUE_APP_)?[A-Z0-9_]*(?:URL|API|ENDPOINT)\s*=\s*['"`]?((?:https?:\/\/[^\/]+)?\/[a-zA-Z0-9_\-\/]+)/gim;
+  // The host part excludes whitespace, quotes and line breaks, not just "/".
+  // A bare [^/] also matches a newline - character classes ignore the /s flag -
+  // so on a .env file whose URL has no path ("VITE_SUPABASE_URL=https://xyz
+  // .supabase.co") the "host" ran on across the following LINES until it found
+  // a "/" in some later URL, and the path captured after it was a piece of
+  // that unrelated line. A Supabase project id became an Ingress rule routing
+  // /<project-id> to the backend.
+  const envUrlRegex = /^(?:VITE_|REACT_APP_|NEXT_PUBLIC_|NUXT_|VUE_APP_)?[A-Z0-9_]*(?:URL|API|ENDPOINT)\s*=\s*['"`]?((?:https?:\/\/[^\/\s'"`]+)?\/[a-zA-Z0-9_\-\/]+)/gim;
 
   // Proxy configs often have '/api': { target: ... } or location /api/ { proxy_pass ... }
   const proxyRegex = /['"`](\/[a-zA-Z0-9_\-\/]+)['"`]\s*:\s*\{\s*target\s*:/gim;
   const nginxLocationRegex = /location\s+(\/[a-zA-Z0-9_\-\/]+)\/?\s*\{[^}]*proxy_pass/gim;
   
   // CRA simple string proxy
-  const craProxyRegex = /"proxy"\s*:\s*"https?:\/\/[^\/]+(\/[a-zA-Z0-9_\-\/]+)/gim;
+  // Same hazard as envUrlRegex above: the host must not be allowed to run past
+  // the end of the line.
+  const craProxyRegex = /"proxy"\s*:\s*"https?:\/\/[^\/\s'"`]+(\/[a-zA-Z0-9_\-\/]+)/gim;
 
   // RTK Query and the same shape in other data layers. Endpoints are declared
   // as a "query"/"queryFn"/"url" that RETURNS the path rather than calling

@@ -32,11 +32,13 @@ const ANSWERS = {
   'want to use it': 'y',
 };
 
-function installStubs() {
+function installStubs(extraAnswers) {
   readline.createInterface = () => ({
     question(q, cb) {
       let answer = '';
-      for (const [needle, value] of Object.entries(ANSWERS)) {
+      // A per-run override, so a test can answer one question differently
+      // without every fixture inheriting that answer.
+      for (const [needle, value] of Object.entries({ ...ANSWERS, ...(extraAnswers || {}) })) {
         if (q.includes(needle)) { answer = value; break; }
       }
       setImmediate(() => cb(answer));
@@ -66,7 +68,7 @@ function installStubs() {
 
 // Copies a fixture to a scratch directory, makes it a git repo (init requires
 // one) and runs the generator in it. Returns { dir, log, ok }.
-async function generate(fixtureDir) {
+async function generate(fixtureDir, extraAnswers) {
   // The working directory's BASENAME becomes projectName, which appears in the
   // chart, the workflows and the state bucket name - so a random mkdtemp name
   // would make every generated file differ between runs and snapshots
@@ -79,7 +81,10 @@ async function generate(fixtureDir) {
   child_process.execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'fixture'],
     { cwd: work, stdio: 'ignore' });
 
-  installStubs();
+  installStubs(extraAnswers);
+  // Module-level state in the generator that would otherwise carry from one
+  // generation to the next.
+  require(path.join(REPO, 'utils/composeFiles.js')).approveVariantComposeFile(null);
 
   const lines = [];
   const capture = (stream) => {

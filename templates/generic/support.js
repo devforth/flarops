@@ -7,6 +7,8 @@
 // the compose file rather than something werf builds, and the object is named
 // after the compose service so every hostname the application already carries
 // resolves without rewriting anything.
+const { renderVolumes } = require('./volumes.js');
+
 module.exports = (service) => {
   const idx = `(index .Values.supportServices (index .Values.supportServicesIndices "${service.name}" | int))`;
   const hasVolumes = Array.isArray(service.volumes) && service.volumes.length > 0;
@@ -102,36 +104,14 @@ data:
     }
   }
 
-  let pvcs = '';
-  let volumeMounts = '';
-  let volumes = '';
-  if (hasVolumes) {
-    for (const v of service.volumes) {
-      const claimName = `${service.name}-${v.name}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-      pvcs += `
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ${claimName}
-  labels:
-    app: {{ .Values.projectName }}
-    component: ${service.name}
-spec:
-  accessModes: [ "ReadWriteOnce" ]
-  resources:
-    requests:
-      storage: {{ ${idx}.storage | default "5Gi" }}
-`;
-      volumeMounts += `
-            - name: ${claimName}
-              mountPath: ${v.target}`;
-      volumes += `
-        - name: ${claimName}
-          persistentVolumeClaim:
-            claimName: ${claimName}`;
-    }
-  }
+  // A volume declared in flarops.yaml carries its own size; one carried over
+  // from docker-compose has none, and falls back to the chart value that used
+  // to be the only source.
+  const { pvcs, volumeMounts, volumes } = renderVolumes(service, {
+    mountIndent: 12,
+    volumeIndent: 8,
+    fallbackSize: null,
+  });
 
   const portsBlock = (service.ports || []).length > 0 ? `
 spec:

@@ -1,0 +1,2 @@
+reading docker-compose-dev.yaml as this project's docker-compose file
+build from a context OUTSIDE this repository and were skipped: legacy

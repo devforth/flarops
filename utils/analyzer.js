@@ -1,5 +1,6 @@
 const fs = require('fs').promises;
 const path = require('path');
+const { listComposeFiles, composeBaseDir } = require('./composeFiles');
 const { walkDir, logDebug } = require('./fsHelper');
 const { SERVICE_SCAN_IGNORED_DIRS } = require('./constants');
 
@@ -92,7 +93,7 @@ function splitComposeServiceBlocks(content) {
 }
 
 async function findPortsInCompose(baseDir, possibleServiceNames) {
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  const composeFiles = listComposeFiles(baseDir);
   const ports = new Set();
   for (const file of composeFiles) {
     try {
@@ -142,7 +143,7 @@ async function findPortsInCompose(baseDir, possibleServiceNames) {
 // unambiguously, which one IS "the api" service. That's a stronger signal
 // than any directory-name heuristic and should be checked first.
 async function findServiceContextFromCompose(baseDir, serviceNames) {
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  const composeFiles = listComposeFiles(baseDir);
   for (const file of composeFiles) {
     let content;
     try {
@@ -159,7 +160,9 @@ async function findServiceContextFromCompose(baseDir, serviceNames) {
         block.match(/build:\s*["']?(\.[^\s"'#{][^\s"'#]*)["']?\s*$/m);
       if (!contextMatch) continue;
 
-      const contextPath = path.join(baseDir, contextMatch[1]);
+      // Relative to the compose file's own directory - see the note in
+      // findBuildableComposeServices.
+      const contextPath = path.resolve(composeBaseDir(baseDir, file), contextMatch[1]);
       try {
         const stat = await fs.stat(contextPath);
         if (stat.isDirectory()) return contextPath;
@@ -186,7 +189,7 @@ async function findServiceContextFromCompose(baseDir, serviceNames) {
 // Returns { <compose service name>: { context: <abs path>, dockerfile } } for
 // every service that declares a build context.
 async function findBuildableComposeServices(baseDir) {
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  const composeFiles = listComposeFiles(baseDir);
   for (const file of composeFiles) {
     let content;
     try {
@@ -205,7 +208,12 @@ async function findBuildableComposeServices(baseDir) {
 
       const dfMatch = block.match(/^\s*dockerfile:\s*["']?([^\s"'#]+)["']?/m);
       out[name] = {
-        context: path.resolve(baseDir, rawContext),
+        // Relative to the COMPOSE FILE, not the repository root - that is how
+        // docker-compose reads it, and a file kept in deploy/ says "../api"
+        // for the repository's own api/. Resolving against the root instead
+        // sent every context one level too high, outside the repository, and
+        // every service in the file was silently skipped as unbuildable.
+        context: path.resolve(composeBaseDir(baseDir, file), rawContext),
         dockerfile: dfMatch ? dfMatch[1] : null,
       };
     }
@@ -484,7 +492,7 @@ function findHealthCheckInComposeBlock(serviceBlock) {
 }
 
 async function findHealthCheckFromCompose(baseDir, serviceNames) {
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  const composeFiles = listComposeFiles(baseDir);
   for (const file of composeFiles) {
     let content;
     try {
@@ -1206,6 +1214,8 @@ async function rootContextExcludes(baseDir, claimedPaths = []) {
  *
  * -- deployment (bin/commands/init.js) --
  * @property {string}            relativePath   context relative to the repo root, for werf.yaml.
+ * @property {number}            replicas       pod count; 1 unless flarops.yaml says otherwise.
+ * @property {boolean}           oneShot        a task that runs to completion; rendered as a Job, not a Deployment.
  * @property {Object}            env            plain config, rendered into values.yaml in the clear.
  * @property {string[]}          secretKeys     Secret keys mounted under their own names.
  * @property {Set<string>}       forcedSecretKeys keys wired during the compose
@@ -1234,6 +1244,8 @@ async function rootContextExcludes(baseDir, claimedPaths = []) {
 function makeServiceEntry(discovered) {
   return {
     ...discovered,
+    replicas: 1,
+    oneShot: false,
     env: {},
     secretKeys: [],
     forcedSecretKeys: new Set(),

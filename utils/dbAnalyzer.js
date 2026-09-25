@@ -1,72 +1,20 @@
 const fs = require('fs').promises;
 const path = require('path');
-const https = require('https');
+const { listComposeFiles } = require('./composeFiles');
 const { walkDir, logDebug } = require('./fsHelper');
-const { DB_PORTS } = require('./constants');
-
-function fetchDockerTags(image) {
-  return new Promise((resolve) => {
-    https.get(`https://registry.hub.docker.com/v2/repositories/library/${image}/tags/?page_size=100`, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          resolve(parsed.results ? parsed.results.map(t => t.name) : []);
-        } catch (e) {
-          resolve([]);
-        }
-      });
-    }).on('error', () => resolve([]));
-  });
-}
-
-async function getLatestDbImage(dbType) {
-  let image = 'postgres';
-  if (dbType === 'mysql') image = 'mysql';
-  else if (dbType === 'mariadb') image = 'mariadb';
-  else if (dbType === 'mongodb') image = 'mongo';
-  else return null;
-
-  const tags = await fetchDockerTags(image);
-  let validTags = tags.filter(t => /^\d+(\.\d+)*$/.test(t));
-
-  if (dbType === 'postgres') {
-    const alpineTags = tags.filter(t => /^\d+(\.\d+)*-alpine$/.test(t));
-    if (alpineTags.length > 0) validTags = alpineTags;
-  }
-  
-  if (validTags.length === 0) {
-    if (dbType === 'postgres') return 'postgres:15-alpine';
-    if (dbType === 'mysql') return 'mysql:8';
-    if (dbType === 'mariadb') return 'mariadb:10';
-    if (dbType === 'mongodb') return 'mongo:latest';
-  }
-
-  validTags.sort((a, b) => {
-    const vA = a.replace('-alpine', '').split('.').map(Number);
-    const vB = b.replace('-alpine', '').split('.').map(Number);
-    for (let i = 0; i < Math.max(vA.length, vB.length); i++) {
-      const numA = vA[i] || 0;
-      const numB = vB[i] || 0;
-      if (numA !== numB) return numB - numA;
-    }
-    return 0;
-  });
-
-  return `${image}:${validTags[0]}`;
-}
+const { DB_PORTS, IGNORED_DIRS } = require('./constants');
+const { defaultImageFor } = require('./dbDefaults');
 
 // If the project's own docker-compose.yml pins a specific image/tag for the
-// database (e.g. "image: mysql:5.6"), prefer that over auto-fetching the
-// latest tag from Docker Hub. The project's application code (driver
-// versions, auth plugin assumptions, SQL dialect quirks) was written and
-// tested against whatever version the author actually pinned - silently
-// upgrading to "latest" can break compatibility outright (e.g. an old
-// mysql-connector-java client that can't speak MySQL 8's default
-// caching_sha2_password auth plugin / TLS requirements).
+// database (e.g. "image: mysql:5.6"), that wins over the version pinned in
+// utils/dbDefaults.js. The project's application code (driver versions, auth
+// plugin assumptions, SQL dialect quirks) was written and tested against
+// whatever version the author actually pinned - replacing it with a newer one
+// can break compatibility outright (e.g. an old mysql-connector-java client
+// that can't speak MySQL 8's default caching_sha2_password auth plugin / TLS
+// requirements).
 async function findPinnedDbImageTag(baseDir, dbType) {
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  const composeFiles = listComposeFiles(baseDir);
   const engineNames = {
     postgres: 'postgres(?:ql)?',
     mysql: 'mysql',
@@ -480,7 +428,7 @@ async function findComposeDatabaseCandidates(baseDir, backendPath) {
 }
 
 async function checkDockerCompose(baseDir) {
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  const composeFiles = listComposeFiles(baseDir);
   // Match "image: postgres:15" as well as an org-prefixed/forked image like
   // "image: jmreif/mongodb" - the DB engine name doesn't have to be the first
   // path segment of the image reference.
@@ -497,6 +445,61 @@ async function checkDockerCompose(baseDir) {
         return { hasDb: true, dbType: 'mongodb', port: DB_PORTS.mongodb };
       }
     } catch(e) { logDebug(e); }
+  }
+  return null;
+}
+
+// Finds a Dockerfile that BUILDS a database, by reading what it is built FROM.
+//
+// The search below this one looks for conventional directory names ("db/",
+// "postgres/", anything whose own name contains an engine keyword). That misses
+// any layout nobody thought of - "inventory/postgres/Dockerfile" has the
+// keyword one level too deep, under a parent that carries none - and the cost
+// of missing it is not a missing feature but two databases: the project gets a
+// stock image it never asked for as its database, AND the directory is picked
+// up separately by the service scan and deployed a second time as an ordinary
+// web service, on port 80, with no credentials and no volume.
+//
+// "FROM postgres:17" is not a hint about where the file sits; it is the file
+// stating what it builds. It also names the ENGINE, which is the same evidence
+// a compose "image:" line gives and is trusted the same way.
+async function findDbDockerfileByBaseImage(baseDir) {
+  const dockerfileIn = async (dir) => {
+    try {
+      const files = await fs.readdir(dir);
+      return files.find(f => f.toLowerCase() === 'dockerfile' || f.toLowerCase().startsWith('dockerfile.'));
+    } catch (e) { return null; }
+  };
+
+  // Exactly the directories analyzeAdditionalServices scans, so anything it
+  // could turn into a service is examined here first.
+  const candidates = [];
+  try {
+    for (const entry of await fs.readdir(baseDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith('.') || IGNORED_DIRS.has(entry.name)) continue;
+      candidates.push(entry.name);
+      try {
+        for (const child of await fs.readdir(path.join(baseDir, entry.name), { withFileTypes: true })) {
+          if (!child.isDirectory() || child.name.startsWith('.') || IGNORED_DIRS.has(child.name)) continue;
+          candidates.push(path.join(entry.name, child.name));
+        }
+      } catch (e) { logDebug(e); }
+    }
+  } catch (e) { logDebug(e); }
+
+  for (const rel of candidates) {
+    const dir = path.join(baseDir, rel);
+    const dockerfile = await dockerfileIn(dir);
+    if (!dockerfile) continue;
+    let content;
+    try { content = await fs.readFile(path.join(dir, dockerfile), 'utf8'); } catch (e) { continue; }
+    // The first FROM is the base; a later one would be a build stage, and a
+    // multi-stage build whose FINAL stage is a database is vanishingly rare
+    // next to the cost of guessing wrong on a builder stage.
+    const from = content.match(/^\s*FROM\s+([^\s]+)/im);
+    if (!from) continue;
+    const engine = composeImageDbType(from[1]);
+    if (engine) return { dockerfile: path.join(rel, dockerfile), engine };
   }
   return null;
 }
@@ -601,7 +604,7 @@ function extractDependsOn(block) {
 }
 
 async function parseComposeServices(baseDir) {
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  const composeFiles = listComposeFiles(baseDir);
   for (const file of composeFiles) {
     let content;
     try {
@@ -850,6 +853,39 @@ async function analyzeDatabase(baseDir, backendPath) {
   }
 
   if (result) {
+    // A driver library names a WIRE PROTOCOL, not a server. mysql2 is the
+    // correct client for MariaDB as well as MySQL, so a backend depending on
+    // it says nothing about which of the two actually runs - yet the
+    // dependency scan above settles the engine before docker-compose, which
+    // states it outright, is ever consulted. A project running "mariadb:11"
+    // was therefore generated as MySQL: the pinned-image lookup then failed to
+    // match (it searches for the engine it was told), the newest numeric tag
+    // was fetched from Docker Hub instead, and the chart pulled a nonexistent
+    // mysql tag. The readiness probe and the PR-capsule clone commands, which
+    // branch on the engine, were wrong for the same reason.
+    //
+    // Only applied when the compose file is unanimous: several engines side by
+    // side say nothing about which one this result refers to, and a result
+    // that already carries its own image came from compose to begin with.
+    if (!result.image) {
+      const forEngine = composeCandidates || await findComposeDatabaseCandidates(baseDir, backendPath);
+      if (forEngine) {
+        const engines = new Set(
+          (forEngine.dbServices || [])
+            .map(n => composeImageDbType(forEngine.services[n].image))
+            .filter(Boolean)
+        );
+        if (engines.size === 1) {
+          const declared = [...engines][0];
+          if (declared !== result.dbType) {
+            logDebug(`docker-compose declares ${declared}; overriding ${result.dbType} inferred from dependencies`);
+            result.dbType = declared;
+            result.port = DB_PORTS[declared];
+          }
+        }
+      }
+    }
+
     // init.js needs to know WHICH compose service became the primary database,
     // so it can rewrite hostnames pointing at that one service (and only that
     // one) to the generated "database" Service.
@@ -873,9 +909,23 @@ async function analyzeDatabase(baseDir, backendPath) {
     result.dbUser = ownCreds.user || creds.user;
     result.dbName = ownCreds.name || creds.name;
     const pinnedImage = await findPinnedDbImageTag(baseDir, result.dbType);
-    result.image = pinnedImage || await getLatestDbImage(result.dbType);
+    // The project's own pin wins; otherwise the version pinned in
+    // utils/dbDefaults.js. Nothing is looked up over the network - see the
+    // note on ENGINES there.
+    // Kept apart from the resolved image: only a tag the PROJECT pinned is
+    // something the operator chose, and only that is worth telling them about
+    // when a locally-built image supersedes it.
+    result.pinnedImage = pinnedImage || null;
+    result.image = pinnedImage || defaultImageFor(result.dbType);
     
-    const localDbDockerfile = await checkLocalDbDockerfile(baseDir);
+    // What a Dockerfile is built FROM beats where it happens to sit.
+    const byBaseImage = await findDbDockerfileByBaseImage(baseDir);
+    const localDbDockerfile = byBaseImage ? byBaseImage.dockerfile : await checkLocalDbDockerfile(baseDir);
+    if (byBaseImage && byBaseImage.engine !== result.dbType) {
+      logDebug(`${byBaseImage.dockerfile} builds ${byBaseImage.engine}; overriding ${result.dbType}`);
+      result.dbType = byBaseImage.engine;
+      result.port = DB_PORTS[byBaseImage.engine];
+    }
     if (localDbDockerfile) {
       result.hasLocalDockerfile = true;
       result.localDbDockerfile = path.basename(localDbDockerfile);

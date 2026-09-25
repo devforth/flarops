@@ -42,7 +42,14 @@ function scrub(text) {
     .replace(/[A-Za-z0-9+/=]{20,}\$[A-Za-z0-9+/=]{20,}/g, '<PBKDF2>')
     // Generated passwords: long hex or base64 runs on the right of an
     // assignment or a YAML key. Anchored so ordinary words are left alone.
-    .replace(/([A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|KEY|HASH)[A-Z0-9_]*\s*[:=]\s*"?)[A-Za-z0-9+/=_-]{16,}("?)/g, '$1<SECRET>$2')
+    //
+    // A value that is itself a SCREAMING_SNAKE identifier is NOT a secret - it
+    // is the NAME of one, which is exactly what a secretEnvs mapping
+    // ("PG_PASSWORD: POSTGRES_PASSWORD") and a Secret key reference are made
+    // of. Scrubbing those hid a duplicate-key bug in generated output behind
+    // two identical <SECRET> placeholders.
+    .replace(/([A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|KEY|HASH)[A-Z0-9_]*\s*[:=]\s*"?)([A-Za-z0-9+/=_-]{16,})("?)/g,
+      (all, lead, value, tail) => /^[A-Z][A-Z0-9_]*$/.test(value) ? all : `${lead}<SECRET>${tail}`)
     .replace(/(:\/\/[^:@\s"]+:)[A-Za-z0-9+/=_-]{16,}(@)/g, '$1<SECRET>$2');
 }
 

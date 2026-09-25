@@ -10,12 +10,23 @@ const { DB_PORTS } = require('./constants');
 
 // Canonical per-engine facts, keyed by the dbType strings the analyzers emit.
 // "postgresql" is an alias the analyzer also produces.
+// The image tag is PINNED here, not looked up. It used to be resolved by
+// asking Docker Hub for the tag list and taking the highest number, which made
+// generation depend on the day it ran: the same repository produced a
+// different deployment each time a registry published something, the test
+// suite's output snapshots moved with it, and the newest number is not
+// necessarily a version the project's own code can run against.
+//
+// Pinned to the current newest major, at the major level so patch releases
+// still flow in without regenerating anything - which is how a compose file
+// would normally pin it too. Raising one of these is an edit here, made
+// deliberately.
 const ENGINES = {
-  postgres:   { user: 'postgres', passwordKey: 'POSTGRES_PASSWORD',        port: DB_PORTS.postgres },
-  postgresql: { user: 'postgres', passwordKey: 'POSTGRES_PASSWORD',        port: DB_PORTS.postgres },
-  mysql:      { user: 'root',     passwordKey: 'MYSQL_ROOT_PASSWORD',      port: DB_PORTS.mysql },
-  mariadb:    { user: 'root',     passwordKey: 'MARIADB_ROOT_PASSWORD',    port: DB_PORTS.mariadb },
-  mongodb:    { user: 'root',     passwordKey: 'MONGO_INITDB_ROOT_PASSWORD', port: DB_PORTS.mongodb },
+  postgres:   { user: 'postgres', passwordKey: 'POSTGRES_PASSWORD',          port: DB_PORTS.postgres, image: 'postgres:18-alpine' },
+  postgresql: { user: 'postgres', passwordKey: 'POSTGRES_PASSWORD',          port: DB_PORTS.postgres, image: 'postgres:18-alpine' },
+  mysql:      { user: 'root',     passwordKey: 'MYSQL_ROOT_PASSWORD',        port: DB_PORTS.mysql,    image: 'mysql:26' },
+  mariadb:    { user: 'root',     passwordKey: 'MARIADB_ROOT_PASSWORD',      port: DB_PORTS.mariadb,  image: 'mariadb:13' },
+  mongodb:    { user: 'root',     passwordKey: 'MONGO_INITDB_ROOT_PASSWORD', port: DB_PORTS.mongodb,  image: 'mongo:8' },
 };
 
 // Postgres is the fallback because it is also the image init.js falls back to
@@ -28,7 +39,9 @@ function engineOf(dbType) {
 }
 
 function defaultUserFor(dbType) { return engineOf(dbType).user; }
+function defaultImageFor(dbType) { return engineOf(dbType).image; }
 function defaultPortFor(dbType) { return engineOf(dbType).port; }
 function passwordKeyFor(dbType) { return engineOf(dbType).passwordKey; }
 
-module.exports = { defaultUserFor, defaultPortFor, passwordKeyFor, ENGINES };
+module.exports = {
+  defaultImageFor, defaultUserFor, defaultPortFor, passwordKeyFor, ENGINES };

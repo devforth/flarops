@@ -1,11 +1,39 @@
+const { renderVolumes } = require('./volumes.js');
+
+// Percent-encodes a value that is spliced into a URL at GENERATION time. The
+// password cannot be done here - it is only a name until the container starts -
+// and is handled by flarops.urlencode in the chart instead.
+const urlComponent = (value) => encodeURIComponent(String(value === undefined || value === null ? '' : value));
+
 module.exports = (service) => {
+  // A service this repository builds could not ask for storage at all - not in
+  // the chart and not in flarops.yaml - while a support service pulled from a
+  // registry could. Nothing about being built from source makes a workload
+  // stateless.
+  const { pvcs, volumeMounts, volumes } = renderVolumes(service, { mountIndent: 12, volumeIndent: 8 });
+  // A pod holding a ReadWriteOnce claim must be gone before its replacement
+  // can bind the same volume, so the default rolling update deadlocks: the new
+  // pod waits for a volume the old one still holds.
+  const strategyBlock = volumes ? `
+  strategy:
+    type: Recreate` : '';
+
   // Same pitfall as api/deployment.js: when this service's own source code
   // reads the DB password under a name that also independently qualifies as
   // "sensitive" (so it's already in service.secretKeys), adding this block
   // unconditionally on top would emit that env var name twice in the same
   // container - which Kubernetes' server-side apply rejects outright.
-  const dbPasswordAlreadyInSecretKeys = Array.isArray(service.secretKeys) && service.secretKeys.includes(service.dbPasswordKey);
-  const dbPasswordBlock = (service.dbPasswordKey && !dbPasswordAlreadyInSecretKeys) ? `
+  // "Already emitted" means under this container-side NAME, by any of the
+  // mechanisms that write into the same env list - the generic secretKeys
+  // loop, or an explicit mapping whose envName happens to be this one. The
+  // check used to look at secretKeys alone, so a shared credential recorded
+  // as a mapping (DB_PASSWORD -> POSTGRES_PASSWORD) was emitted here a second
+  // time under its own name, and the API server rejects the Deployment for
+  // the duplicate.
+  const dbPasswordAlreadyEmitted =
+    (Array.isArray(service.secretKeys) && service.secretKeys.includes(service.dbPasswordKey)) ||
+    (service.extraSecretEnvMappings || []).some(m => m.envName === service.dbPasswordKey);
+  const dbPasswordBlock = (service.dbPasswordKey && !dbPasswordAlreadyEmitted) ? `
             - name: ${service.dbPasswordKey}
               valueFrom:
                 secretKeyRef:
@@ -39,14 +67,29 @@ module.exports = (service) => {
     if (db.type === 'mysql' || db.type === 'mariadb') scheme = 'mysql';
     else if (db.type === 'mongodb') scheme = 'mongodb';
     const authSuffix = scheme === 'mongodb' ? '?authSource=admin' : '';
+    // The percent-encoded twin of the password, declared BEFORE the URLs that
+    // splice it in: Kubernetes expands "$(VAR)" only against variables already
+    // listed above it. Splicing the raw password is what produced "invalid
+    // port number in database URL" when it held a ":" or a "/".
+    if (db.passwordKey) {
+      ownDbUrlBlock += `
+            - name: ${db.passwordKey}_URLENCODED
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: ${db.passwordKey}_URLENCODED`;
+    }
     for (const urlVar of service.dbUrlVars) {
       // A shared database has no single fixed name of its own - each
       // service using it declared its own db name in docker-compose (see the
       // compose environment: scan in init.js), captured per-var here.
       const dbName = urlVar.dbName || db.name;
+      // The user and database name are known here, at generation time, so
+      // they are encoded here by the same rule the chart applies to the
+      // password.
       ownDbUrlBlock += `
             - name: ${urlVar.key}
-              value: "${scheme}://${db.user}:$(${db.passwordKey})@${dbHost}:${db.port}/${dbName}${authSuffix}"`;
+              value: "${scheme}://${urlComponent(db.user)}:$(${db.passwordKey}_URLENCODED)@${dbHost}:${db.port}/${urlComponent(dbName)}${authSuffix}"`;
     }
   }
 
@@ -77,8 +120,7 @@ module.exports = (service) => {
     service.springDatasourcePasswordSecretKey,
   ].filter(Boolean).map(k => JSON.stringify(k)).join(' ');
 
-  return `
-apiVersion: apps/v1
+  return `${pvcs}apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ${service.name}
@@ -86,7 +128,7 @@ metadata:
     app: {{ .Values.projectName }}
     component: ${service.name}
 spec:
-  replicas: {{ include "flarops.replicas" (index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}" | int)).replicas }}
+  replicas: {{ include "flarops.replicas" (index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}" | int)).replicas }}${strategyBlock}
   selector:
     matchLabels:
       app: {{ .Values.projectName }}
@@ -175,6 +217,8 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
-{{- end }}
+{{- end }}${volumeMounts ? `
+          volumeMounts:${volumeMounts}` : ''}${volumes ? `
+      volumes:${volumes}` : ''}
 `.trim();
 };

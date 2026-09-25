@@ -5,9 +5,13 @@ const { execFileSync } = require('child_process');
 const { getDefaultAWSCredentials, ensureAwsCli, handleS3Bucket } = require('../../utils/awsHelper.js');
 const { SENSITIVE_REGEX, DB_PASSWORD_REGEX, IGNORED_DIRS } = require('../../utils/constants.js');
 const { parseSupportService, extractBuildArgs, materializeBindMounts } = require('../../utils/composeSupport.js');
+const { generateFlaropsYaml } = require('../../utils/flaropsYaml.js');
 const writeTerraform = require('../../templates/terraform.js');
 const collectOperatorAnswers = require('./prompts.js');
-const { defaultUserFor, passwordKeyFor } = require('../../utils/dbDefaults.js');
+const { defaultUserFor, passwordKeyFor, defaultImageFor } = require('../../utils/dbDefaults.js');
+const { yamlEscapeDoubleQuoted, generateEnvString } = require('../../utils/yamlWrite.js');
+const { listComposeFiles, isVariantComposeFile, approveVariantComposeFile, composeBaseDir } = require('../../utils/composeFiles.js');
+const { normalizeRoutes } = require('../../utils/routes.js');
 const isYes = collectOperatorAnswers.isYes;
 const hclEscapeString = writeTerraform.hclEscapeString;
 
@@ -350,38 +354,32 @@ function processEnvVariable(key, rawVal, targets) {
 }
 
 
-// Values here come straight out of the scanned repository, so they can hold a
-// quote, a backslash or a newline. Interpolating them raw produced broken (or
-// attacker-shaped) YAML - the HCL side already had hclEscapeString for exactly
-// this, the YAML side did not. A double-quoted YAML scalar takes the same
-// escapes as JSON, so this is the full set that matters here.
-function yamlEscapeDoubleQuoted(value) {
-  return String(value)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n')
-    .replace(/\t/g, '\\t');
-}
-
-function generateEnvString(envObj, context, indent = '    ') {
-  if (Object.keys(envObj).length === 0) return `${indent}# KEY: "VALUE"`;
-  return Object.entries(envObj).map(([k, v]) => {
-    let line = `${indent}${k}: "${yamlEscapeDoubleQuoted(v)}"`;
-    if (String(v).toLowerCase().includes('localhost')) {
-      context.hasLocalhostWarnings = true;
-      line += ` # Change "localhost" to your endpoint service name (api, frontend or db)`;
-    }
-    return line;
-  }).join('\n');
-}
-
 module.exports = async function init() {
   const currentDir = process.cwd();
   const gitDir = path.join(currentDir, '.git');
 
   if (!fs.existsSync(gitDir)) {
     console.error("not a root of git repositoty");
+    process.exit(1);
+  }
+
+  // flarops.yaml is written at the end of a successful init, so its presence
+  // means this project has already been initialized. Running init again is
+  // never what someone wants at that point: it re-prompts for the registry
+  // password, mints a fresh deploy key and dashboard password, and rewrites
+  // every generated file from a fresh analysis of the repository - silently
+  // discarding whatever the operator has edited in flarops.yaml, values.yaml
+  // and the chart since. The file is the declarative source of truth; changes
+  // belong there, not in a second generation pass.
+  const flaropsYamlFile = path.join(currentDir, 'flarops.yaml');
+  if (fs.existsSync(flaropsYamlFile)) {
+    console.error("\x1b[31mflarops.yaml already exists - this project is already initialized.\x1b[0m");
+    console.error("");
+    console.error("  To change what is deployed, edit flarops.yaml.");
+    console.error("  To drop chart templates that no longer match any service, run: flarops sync");
+    console.error("  To generate everything again from scratch, delete flarops.yaml first.");
+    console.error("  Note that a fresh init issues a new deploy key and dashboard password,");
+    console.error("  and overwrites the generated chart, Terraform and workflows.");
     process.exit(1);
   }
 
@@ -574,6 +572,25 @@ module.exports = async function init() {
   const { analyzeFrontendRoutes } = require('../../utils/routeAnalyzer');
   const { refactorFrontendEnv, refactorBackendDbUrl, refactorNginxConf, refactorLowercaseEnvVars } = require('../../utils/envRefactor');
 
+  // A compose file that is not conventionally named is very often a LOCAL
+  // stack - docker-compose-dev.yaml, compose.override.yml - describing how
+  // someone runs the project on their laptop: different images, mounted
+  // source, seeded test data, a proxy that only exists there. Generating a
+  // production deployment from it silently would carry all of that into the
+  // cluster. Reading it is still far better than reading nothing, which is
+  // why it is offered rather than ignored - but it is the operator's call.
+  {
+    const candidates = listComposeFiles(currentDir);
+    if (candidates.length > 0 && isVariantComposeFile(candidates[0])) {
+      const answer = await askQuestion(`\x1b[36m? \x1b[0mThis project has no docker-compose.yml, but it does have "${candidates[0]}". Base the deployment on it? [Y/n] `);
+      const approved = isYes(answer);
+      approveVariantComposeFile(approved);
+      if (!approved) {
+        console.log(`\x1b[33mSkipping ${candidates[0]}. Services will be discovered from the repository layout alone - anything only that file declares will be missing, and can be added to flarops.yaml afterwards.\x1b[0m`);
+      }
+    }
+  }
+
   const backendInfo = await analyzeBackend(currentDir);
   const [frontendInfo, dbInfo] = await Promise.all([
     analyzeFrontend(currentDir, backendInfo.backendPath),
@@ -598,6 +615,24 @@ module.exports = async function init() {
     frontendInfo.usedEnvVars = await extractUsedEnvVars(frontendInfo.frontendPath, excludesFor(frontendInfo.frontendPath));
   }
 
+  // A database this repository BUILDS is already generated - as the database,
+  // with its credentials, its volume and its port. Without claiming its
+  // directory the service scan finds the same Dockerfile again and deploys it
+  // a second time as an ordinary web service: two databases, one of them on
+  // port 80 with no password and nowhere to store anything.
+  if (dbInfo.hasDb && dbInfo.hasLocalDockerfile && dbInfo.dbContext) {
+    knownPaths.push(path.join(currentDir, dbInfo.dbContext));
+    // A repository that builds its own database image built it for a reason -
+    // an extension, an init script, a tuned config - so that image wins over
+    // any tag docker-compose pins for the same service. Everything else the
+    // compose declaration states (the database name, the user, which key holds
+    // the password) is still used. Said out loud because the pin was a
+    // deliberate choice and it is now being superseded.
+    if (dbInfo.pinnedImage) {
+      console.log(`\x1b[34mINFO: docker-compose pins ${dbInfo.pinnedImage} for the database, but ${path.join(dbInfo.dbContext, dbInfo.localDbDockerfile || 'Dockerfile')} builds one in this repository - building that instead. Its credentials and database name still come from the compose declaration.\x1b[0m`);
+    }
+  }
+
   // The compose keys already generated as the primary backend/frontend. Passed
   // so a second service sharing their build context is still discovered, while
   // the service that IS the backend is not generated twice.
@@ -617,6 +652,31 @@ module.exports = async function init() {
       }
     }
   } catch (e) { /* no compose - nothing is claimed by key */ }
+
+  // A build context that resolves outside the repository cannot be built from
+  // it, so the service is dropped - and a compose file written to live one
+  // directory down ("context: ../api") makes EVERY context escape at once.
+  // The result is a deployment missing most of the stack, produced without a
+  // word. Nothing here can fix the paths; saying which ones escaped, and what
+  // they would have been, is what lets someone fix them in a minute.
+  try {
+    const { findBuildableComposeServices } = require('../../utils/analyzer');
+    const builds = await findBuildableComposeServices(currentDir);
+    const escaped = [];
+    for (const [composeName, info] of Object.entries(builds)) {
+      const resolved = path.resolve(info.context);
+      const inside = resolved === path.resolve(currentDir)
+        || resolved.startsWith(path.resolve(currentDir) + path.sep);
+      if (!inside) escaped.push(`${composeName} (context: ${path.relative(currentDir, resolved) || info.context})`);
+    }
+    if (escaped.length > 0) {
+      console.warn(`\x1b[33mWARNING: ${escaped.length} docker-compose service(s) build from a context OUTSIDE this repository and were skipped: ${escaped.join(', ')}. A compose file meant to sit one directory down ("context: ../api") does this to every service at once. Fix the paths so they are relative to the repository root, or declare those services in flarops.yaml and run "flarops sync".\x1b[0m`);
+      console.log("");
+    }
+  } catch (e) { /* best effort */ }
+
+  // The same for a compose-declared database: its key is spoken for.
+  if (dbInfo.hasDb && dbInfo.composeServiceName) claimedComposeNames.add(dbInfo.composeServiceName);
 
   let additionalServices = await analyzeAdditionalServices(currentDir, knownPaths, claimedComposeNames);
 
@@ -688,11 +748,21 @@ module.exports = async function init() {
 
   // The compose file is read here because the shared-credential discovery
   // below needs it, and that in turn has to run before the .env scan.
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+  const composeFiles = listComposeFiles(currentDir);
   let composeContent = null;
+  // Relative paths inside a compose file - build contexts, bind mount sources -
+  // resolve against the file's OWN directory, which is not the repository root
+  // when the file is kept in deploy/ or docker/.
+  let composeDir = currentDir;
   for (const cf of composeFiles) {
     try {
       composeContent = fs.readFileSync(path.join(currentDir, cf), 'utf8');
+      composeDir = composeBaseDir(currentDir, cf);
+      // A project whose compose file is not conventionally named would
+      // otherwise have every service in it silently ignored.
+      if (isVariantComposeFile(cf)) {
+        console.log(`\x1b[34mINFO: reading ${cf} as this project's docker-compose file - it is the only one here.\x1b[0m`);
+      }
       break;
     } catch (e) { /* not this name - try the next */ }
   }
@@ -729,9 +799,13 @@ module.exports = async function init() {
   // it reads (compose imposes no such ordering), so every owner has to be
   // known up front rather than discovered opportunistically while services
   // are processed in file order.
+  // Kept so the database-password decision below can ask which variable the
+  // primary database's own block names, without re-parsing.
+  let composeServicesForCredentials = {};
   async function discoverSharedCredentials() {
     if (!composeContent) return;
     const composeServicesAll = await parseComposeServices(currentDir);
+    composeServicesForCredentials = composeServicesAll;
     for (const svc of Object.values(composeServicesAll)) {
       if (!svc.block) continue;
       for (const ownerKey of CREDENTIAL_OWNER_ENV_KEYS) {
@@ -1459,6 +1533,44 @@ module.exports = async function init() {
     console.log(`\x1b[34mINFO: No database password found in .env files. Generated a secure random fallback password for ${finalDbPasswordKey}\x1b[0m`);
   }
 
+  // When the primary database's own compose block takes its password from a
+  // shared variable ("POSTGRES_PASSWORD: ${DB_PASS}"), that variable already
+  // has a canonical Secret key - chosen once, in discoverSharedCredentials,
+  // and used to wire every OTHER consumer of the same value. The decision
+  // above ignored it and picked a key of its own from the backend's source,
+  // so one password ended up travelling under two names: the API read
+  // DB_PASSWORD from the Secret key POSTGRES_PASSWORD, while the database
+  // read POSTGRES_PASSWORD from the Secret key DB_PASSWORD. Both had to be
+  // set, by hand, to the same value - and the day they differed, the API
+  // could no longer authenticate against its own database.
+  //
+  // The shared credential wins because it is the one already wired everywhere
+  // else; the container-side name the backend expects is preserved as a
+  // mapping, which is what extraSecretEnvMappings exists for.
+  const primaryDbBlock = dbInfo.composeServiceName
+    && composeServicesForCredentials[dbInfo.composeServiceName]
+    && composeServicesForCredentials[dbInfo.composeServiceName].block;
+  if (primaryDbBlock) {
+    for (const ownerKey of CREDENTIAL_OWNER_ENV_KEYS) {
+      const m = primaryDbBlock.match(new RegExp(`^\\s*${ownerKey}:\\s*(.+)$`, 'm'));
+      if (!m) continue;
+      const bareVar = extractBareVarRef(m[1]);
+      if (!bareVar || !sharedCredentialSecrets.has(bareVar)) continue;
+      const shared = sharedCredentialSecrets.get(bareVar);
+      if (shared.secretKey !== finalDbPasswordKey) {
+        console.log(`\x1b[34mINFO: the database password is the shared variable \${${'${bareVar}'}}, already wired as ${'${shared.secretKey}'} - using that key for the database too instead of a second secret named ${'${finalDbPasswordKey}'}.\x1b[0m`);
+        if (finalDbPasswordKey && finalDbPasswordKey !== shared.secretKey) {
+          apiExtraSecretEnvMappings = apiExtraSecretEnvMappings
+            .filter(mp => mp.envName !== finalDbPasswordKey)
+            .concat([{ envName: finalDbPasswordKey, secretKey: shared.secretKey }]);
+        }
+        finalDbPasswordKey = shared.secretKey;
+      }
+      finalDbPassword = shared.value;
+      break;
+    }
+  }
+
   // The dashboard publishes the whole cluster's shape - nodes, pods,
   // namespaces, PVCs and the project's running spend - on a public hostname,
   // so it ships with a login. Only the PBKDF2 hash is persisted anywhere:
@@ -1503,10 +1615,25 @@ module.exports = async function init() {
     }
   }
 
-  let envContent = `# These secrets must be saved in Github repository secrets with the same name
+  // The file is a CHECKLIST, so it is written to be read. Two things used to
+  // stop it being one: the SSH key put forty-odd lines of base64 between the
+  // first entry and the rest, so nobody scrolled past it; and the heading said
+  // only "save these", leaving where to save them to be guessed.
+  let envContent = `# ============================================================================
+# Every NAME below must be created as a GitHub repository secret with the same
+# name and the value shown, or the deployment will not come up:
+#
+#   your repository -> Settings -> Secrets and variables -> Actions
+#                   -> New repository secret
+#
+# This file is NOT committed (deploy/.env is gitignored) and is not read at
+# deploy time - it exists so you know what to create. The sections say where
+# each value came from.
+# ============================================================================
+
+# --- Created by Flarops for the infrastructure it provisions -----------------
 AWS_ACCESS_KEY_ID="${awsCredentials.accessKey}"
 AWS_SECRET_ACCESS_KEY="${awsCredentials.secretKey}"
-SSH_PRIVATE_KEY="${privateKey}"
 REGISTRY_PASSWORD="${registryPassword}"
 `;
 
@@ -1516,7 +1643,7 @@ REGISTRY_PASSWORD="${registryPassword}"
   }
 
   if (sensitiveEnvContent && sensitiveEnvContent.trim()) {
-    envContent += `\n# Extracted sensitive variables from project .env files\n${sensitiveEnvContent}`;
+    envContent += `\n# --- Found in your project's own .env files ---------------------------------\n${sensitiveEnvContent}`;
   }
 
   if (finalDbPassword && !new RegExp('^' + escapeRegex(finalDbPasswordKey) + '=', 'm').test(envContent)) {
@@ -1527,8 +1654,16 @@ REGISTRY_PASSWORD="${registryPassword}"
   // the database password did, which read as though Flarops had generated a
   // dashboard credential for the application's database.
   if (dashboardEnvContent) {
-    envContent += `\n# Generated by Flarops for the deployment dashboard - not taken from your project\n${dashboardEnvContent}`;
+    envContent += `\n# --- Generated by Flarops for the deployment dashboard ----------------------\n${dashboardEnvContent}`;
   }
+
+  // Last of all: one value, dozens of lines. Anything appended after it would
+  // sit below a wall of base64 nobody scrolls past.
+  envContent += `
+# --- The deploy key Flarops generated for this repository -------------------
+# One value on one very long line. Copy it whole, including both -----markers.
+SSH_PRIVATE_KEY="${privateKey}"
+`;
 
   const envFile = path.join(deployDir, '.env');
   if (!fs.existsSync(envFile)) {
@@ -1790,7 +1925,7 @@ AWS_REGION=${awsRegion}
         // on a first boot against an empty data directory.
         const initMounts = bindMounts.filter(m => /^\/docker-entrypoint-initdb\.d(\/|$)/.test(String(m.target || '')));
         if (initMounts.length > 0) {
-          const carried = materializeBindMounts(fs, path, currentDir, initMounts);
+          const carried = materializeBindMounts(fs, path, composeDir, initMounts);
           if (carried.data) dbInitFiles = carried.data;
           for (const u of carried.unresolved) {
             dbInitWarnings.push(`${u.source} -> ${u.target} (${u.reason})`);
@@ -1924,8 +2059,19 @@ AWS_REGION=${awsRegion}
   // run either way.
   if (!envKeysToPass.includes('DASHBOARD_PASSWORD_HASH')) envKeysToPass.push('DASHBOARD_PASSWORD_HASH');
 
-  const sensitiveKeys = sensitiveEnvContent.split('\n').map(l => l.split('=')[0]).filter(k => k && k.trim());
-  if (finalDbPasswordKey && finalDbPassword) sensitiveKeys.push(finalDbPasswordKey);
+  // Deduplicated. The database password key is routinely ALSO one of the keys
+  // already extracted into sensitiveEnvContent (a compose file declaring
+  // "POSTGRES_PASSWORD: ${DB_PASS}" puts it there), and pushing it again left
+  // the same name twice in this list. Every per-service secretKeys list is a
+  // filter over it, so the duplicate survived into values.yaml, and the
+  // chart's `range` over that emitted two identical `- name:` entries in one
+  // container's env list - which the API server rejects outright ("duplicate
+  // entries for key"). `helm template` renders it happily, so the failure
+  // only appeared at apply time.
+  const sensitiveKeys = [...new Set([
+    ...sensitiveEnvContent.split('\n').map(l => l.split('=')[0]).filter(k => k && k.trim()),
+    ...(finalDbPasswordKey && finalDbPassword ? [finalDbPasswordKey] : []),
+  ])];
 
   const apiSecretKeys = sensitiveKeys.filter(k => backendInfo.usedEnvVars && backendInfo.usedEnvVars.includes(k));
   const frontendSecretKeys = sensitiveKeys.filter(k => frontendInfo.usedEnvVars && frontendInfo.usedEnvVars.includes(k));
@@ -1943,6 +2089,10 @@ AWS_REGION=${awsRegion}
   // envKeysToPass produces a reference to a key that will never exist, and
   // the container sits in CreateContainerConfigError. That was the single
   // most common way a generated deployment failed to come up.
+  // Keys discovered after the file was written, so the operator can be told
+  // about them in the same place as everything else.
+  let lateSectionWritten = false;
+  const lateSecretKeys = [];
   const registerSecretKeyForCI = (key) => {
     if (!key) return;
     if (!envKeysToPass.includes(key)) envKeysToPass.push(key);
@@ -1953,6 +2103,15 @@ AWS_REGION=${awsRegion}
     if (!new RegExp('^' + escapeRegex(key) + '=', 'm').test(existing)) {
       const known = sharedCredentialSecrets.get(key);
       const value = known ? known.value : (apiEnv[key] || frontendEnv[key] || '');
+      // Under a heading of their own. Appended bare they landed under
+      // whichever section happened to be last - which said "generated for the
+      // deployment dashboard", so a database password read as a dashboard
+      // credential.
+      if (!lateSectionWritten) {
+        fs.appendFileSync(envFile, `\n# --- Required because a service in your stack reads them ---------------------\n# Values shown as \${OTHER_KEY} must be given the SAME value as that key.\n`);
+        lateSectionWritten = true;
+      }
+      lateSecretKeys.push(key);
       fs.appendFileSync(envFile, `${key}="${String(value).replace(/"/g, '\\"')}"\n`);
     }
   };
@@ -2404,7 +2563,7 @@ AWS_REGION=${awsRegion}
         // the project's API gateway came up with none of its routes - a
         // perfectly healthy pod serving the stock welcome page.
         if (parsed.bindMounts.length > 0) {
-          const carried = materializeBindMounts(fs, path, currentDir, parsed.bindMounts);
+          const carried = materializeBindMounts(fs, path, composeDir, parsed.bindMounts);
           if (carried.data) {
             parsed.configMapData = carried.data;
             parsed.configFileMounts = carried.fileMounts;
@@ -2499,10 +2658,39 @@ AWS_REGION=${awsRegion}
       if (Object.prototype.hasOwnProperty.call(envObj, key)) delete envObj[key];
     }
   };
-  dedupeEnvAgainstSecrets(apiEnv, apiSecretKeys);
-  dedupeEnvAgainstSecrets(frontendEnv, frontendSecretKeys);
+
+  // The same invariant, one level in: a container env name carried by an
+  // explicit mapping must not ALSO be in secretKeys, which would emit it a
+  // second time from the generic loop.
+  //
+  // The two do not even agree on where the value comes from. A shared
+  // credential declared as "DB_PASSWORD: ${DB_PASS}" next to a postgres
+  // service is recorded as the mapping DB_PASSWORD -> POSTGRES_PASSWORD, the
+  // canonical key that actually holds the value; but DB_PASSWORD also reads
+  // as sensitive on its own, so it lands in secretKeys as DB_PASSWORD ->
+  // DB_PASSWORD, a second GitHub secret holding a copy of the same password
+  // and free to drift from it. The mapping is the deliberate, more specific
+  // statement, so it wins and the generic entry goes.
+  const dropMappedKeysFromSecretKeys = (secretKeys, mappings) => {
+    const mapped = new Set((mappings || []).map(m => m.envName));
+    for (let i = secretKeys.length - 1; i >= 0; i--) {
+      if (mapped.has(secretKeys[i])) secretKeys.splice(i, 1);
+    }
+  };
+
+  // Plain env is cleaned against BOTH sources of secret-ness before secretKeys
+  // is thinned, or a key whose only remaining route is the mapping would be
+  // left behind in values.yaml in the clear.
+  const secretEnvNames = (secretKeys, mappings) =>
+    [...secretKeys, ...(mappings || []).map(m => m.envName)];
+
+  dedupeEnvAgainstSecrets(apiEnv, secretEnvNames(apiSecretKeys, apiExtraSecretEnvMappings));
+  dedupeEnvAgainstSecrets(frontendEnv, secretEnvNames(frontendSecretKeys, frontendExtraSecretEnvMappings));
+  dropMappedKeysFromSecretKeys(apiSecretKeys, apiExtraSecretEnvMappings);
+  dropMappedKeysFromSecretKeys(frontendSecretKeys, frontendExtraSecretEnvMappings);
   for (const s of additionalServices) {
-    dedupeEnvAgainstSecrets(s.env, s.secretKeys);
+    dedupeEnvAgainstSecrets(s.env, secretEnvNames(s.secretKeys, s.extraSecretEnvMappings));
+    dropMappedKeysFromSecretKeys(s.secretKeys, s.extraSecretEnvMappings);
   }
 
   var config = {
@@ -2537,6 +2725,11 @@ AWS_REGION=${awsRegion}
 
     additionalServices,
     supportServices,
+    // The plain (non-secret) env each of the two primary services carries.
+    // values.yaml renders these, and until it was extracted they reached it as
+    // free locals rather than through config.
+    apiEnv,
+    frontendEnv,
     apiSecretKeys,
     frontendSecretKeys,
     apiExtraSecretEnvMappings,
@@ -2544,7 +2737,7 @@ AWS_REGION=${awsRegion}
 
     images: {
       api: 'api:latest',
-      db: dbInfo.hasDb && dbInfo.hasLocalDockerfile ? 'db:latest' : (dbInfo.hasDb && dbInfo.image ? dbInfo.image : 'postgres:15-alpine'),
+      db: dbInfo.hasDb && dbInfo.hasLocalDockerfile ? 'db:latest' : (dbInfo.hasDb && dbInfo.image ? dbInfo.image : defaultImageFor(dbInfo.dbType)),
       frontend: 'frontend:latest'
     },
     dbCloneSource: '', // Can be updated or prompted in the future
@@ -2619,8 +2812,6 @@ appVersion: "1.0.0"
   // to look.
   const contextObj = { hasLocalhostWarnings: false };
 
-  let apiEnvString = generateEnvString(apiEnv, contextObj);
-  let frontendEnvString = generateEnvString(frontendEnv, contextObj);
 
   if (unresolvedPlaceholderKeys.size > 0) {
     console.warn(`\x1b[33mWARNING: These variables still reference a value this repository never defines, so they were left as-is instead of being given an invented one: ${Array.from(unresolvedPlaceholderKeys).join(', ')}. Set their real values (in GitHub Secrets if they are secret, in deploy/helm/values.yaml otherwise) before deploying.\x1b[0m`);
@@ -2638,6 +2829,40 @@ appVersion: "1.0.0"
   // them to that one path is ambiguous - Traefik would pick one arbitrarily.
   // Drop the conflicting prefix from every claimant rather than silently
   // generating an Ingress with duplicate, undefined-priority rules.
+  // Several compose services routinely share ONE build context: the same image
+  // started with a different command - a queue consumer, a dispatcher, a cron
+  // runner beside the API that serves HTTP. Routes are discovered by scanning
+  // that context, so every one of them comes back carrying the API's entire
+  // route list, having never served a request.
+  //
+  // Counted as claimants they turn each of those routes into an N-way conflict,
+  // and the rule that resolves a conflict by dropping the route from every
+  // claimant then strips the API's own routes as well. A project with three
+  // workers beside its backend ended up with an Ingress exposing nothing.
+  //
+  // The evidence belongs to the context, not to each service that happens to
+  // build from it. Whoever owns the context keeps the routes: the backend when
+  // it is the same context, otherwise the first service declared over it.
+  {
+    const contextOf = (service) => path.resolve(currentDir, service.relativePath || '.');
+    const backendContext = config.hasBackend && config.backendPath
+      ? path.resolve(currentDir, config.backendPath)
+      : null;
+    const keeper = new Map();
+    for (const s of config.additionalServices) {
+      const key = contextOf(s);
+      if (!keeper.has(key)) keeper.set(key, s.name);
+    }
+    for (const s of config.additionalServices) {
+      if (!(s.exposedRoutes || []).length) continue;
+      const key = contextOf(s);
+      const ownedByBackend = backendContext && key === backendContext;
+      if (ownedByBackend || keeper.get(key) !== s.name) {
+        s.exposedRoutes = [];
+      }
+    }
+  }
+
   const routeOwners = {};
   if (config.hasBackend) {
     for (const r of config.apiRoutes) (routeOwners[r] = routeOwners[r] || []).push('api');
@@ -2671,197 +2896,48 @@ appVersion: "1.0.0"
     console.warn(`\x1b[33mWARNING: Multiple services expose the same Ingress path prefix, which would route ambiguously: ${conflictingRoutes.map(([r, owners]) => `${r} (${owners.join(', ')})`).join('; ')}. These paths were NOT added to the Ingress for the conflicting services - add explicit routing manually if you need them exposed.\x1b[0m`);
   }
 
+  // Routes become objects once every string-based decision above - ownership,
+  // conflict resolution, the gateway checks - has been made. From here on a
+  // route may carry a transformation, and everything downstream reads .path.
+  config.apiRoutes = normalizeRoutes(config.apiRoutes);
+  for (const s of config.additionalServices || []) {
+    s.exposedRoutes = normalizeRoutes(s.exposedRoutes);
+  }
+
   // Write values.yaml
 
-  let additionalServicesYaml = '';
-  if (config.additionalServices && config.additionalServices.length > 0) {
-    additionalServicesYaml = 'additionalServices:\n';
-    for (const s of config.additionalServices) {
-      additionalServicesYaml += `  - name: ${s.name}
-    image: ${s.name}:latest
-    env:
-${generateEnvString(s.env, contextObj, '      ')}
-    secretKeys:
-${s.secretKeys.map(k => '      - ' + k).join('\n')}
-    ports:
-${s.ports.map(p => '      - ' + p).join('\n')}
-    replicas: 1
-    healthRoute: ${s.healthRoute ? '"' + s.healthRoute + '"' : 'null'}
-    healthPort: ${s.healthPort || 'null'}
-    exposedRoutes: ${s.exposedRoutes && s.exposedRoutes.length > 0 ? '[' + s.exposedRoutes.map(r => '"' + r + '"').join(', ') + ']' : '[]'}
-    # false when this project's own API gateway already covers these routes
-    # (see detectServiceIsGateway) - set to true to also expose them directly,
-    # bypassing the gateway.
-    exposeDirectly: ${s.suppressDirectIngress ? 'false' : 'true'}
-${s.command ? `    command:\n${s.command.map(a => '      - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}${(s.db && !s.db.shared) ? `    db:
-      type: "${yamlEscapeDoubleQuoted(s.db.type)}"
-      image: "${yamlEscapeDoubleQuoted(s.db.image)}"
-      port: ${s.db.port}
-      user: "${yamlEscapeDoubleQuoted(s.db.user)}"
-      name: "${yamlEscapeDoubleQuoted(s.db.name)}"
-      replicas: 1
-      storage: "10Gi"
-` : ''}`;
-    }
-  }
-
-  // Supporting services (see utils/composeSupport.js) carry a literal image
-  // from docker-compose rather than one werf builds, so the image belongs in
-  // values.yaml where it can be re-pinned without regenerating anything.
-  let supportServicesYaml = '';
-  if (config.supportServices && config.supportServices.length > 0) {
-    supportServicesYaml = '\n# Third-party components declared in docker-compose that the application\n' +
-      '# references but this repository does not build. Images are pinned exactly as\n' +
-      '# docker-compose declared them.\nsupportServices:\n';
-    for (const s of config.supportServices) {
-      supportServicesYaml += `  - name: ${s.name}
-    image: "${yamlEscapeDoubleQuoted(s.image)}"
-    replicas: 1
-    env:
-${generateEnvString(s.env, contextObj, '      ')}
-    secretKeys:
-${(s.secretKeys || []).map(k => '      - ' + k).join('\n')}
-    ports:
-${(s.ports || []).map(p => '      - ' + p).join('\n')}
-${(s.volumes && s.volumes.length > 0) ? `    storage: "5Gi"\n` : ''}${s.command ? `    command:\n${s.command.map(a => '      - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}`;
-    }
-    supportServicesYaml += 'supportServicesIndices:\n';
-    for (let i = 0; i < config.supportServices.length; i++) {
-      supportServicesYaml += `  ${config.supportServices[i].name}: ${i}\n`;
-    }
-  }
-
-  let valuesYaml = `projectName: ${projectName}
-domain: "${domain}"
-hasBackend: ${config.hasBackend}
-hasFrontend: ${config.hasFrontend}
-apiServesFrontend: ${!!config.apiServesFrontend}
-images:
-${config.hasBackend ? `  api: ${config.images.api}` : ''}
-  db: ${config.images.db}
-${config.hasFrontend ? `  frontend: ${config.images.frontend}` : ''}
-dbCloneSource: "${config.dbCloneSource}"
-dbType: ${config.dbType ? '"' + config.dbType + '"' : 'null'}
-dbPort: ${config.dbPort || 'null'}
-database:
-  user: "${yamlEscapeDoubleQuoted(finalDbUser)}"
-  password: null
-  name: "${yamlEscapeDoubleQuoted(finalDbName)}"
-  replicas: 1
-  storage: "10Gi"
-  env:
-    # KEY: "VALUE"
-${config.hasBackend ? `api:
-  replicas: 1
-  healthRoute: ${config.apiHealthRoute ? '"' + config.apiHealthRoute + '"' : 'null'}
-  healthPort: ${config.apiHealthPort || 'null'}
-  secretKeys:
-${config.apiSecretKeys.map(k => '    - ' + k).join('\n')}
-  env:
-${apiEnvString}
-${config.apiCommand ? `  command:\n${config.apiCommand.map(a => '    - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}apiPorts:
-${config.apiPorts.map(p => '  - ' + p).join('\n')}` : ''}
-${config.hasFrontend ? `frontend:
-  replicas: 1
-  secretKeys:
-${config.frontendSecretKeys.map(k => '    - ' + k).join('\n')}
-  env:
-${frontendEnvString}
-${config.frontendCommand ? `  command:\n${config.frontendCommand.map(a => '    - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}frontendPorts:
-${config.frontendPorts.map(p => '  - ' + p).join('\n')}` : ''}
-${additionalServicesYaml}${supportServicesYaml}
-apiRoutes:
-${config.apiRoutes.map(p => '  - "' + p + '"').join('\n')}
-
-# instanceType and volumeSize are deliberately NOT set here. They are declared
-# once, in deploy/terraform/variables.tf, and CI reads them back out of
-# Terraform's outputs into these keys at deploy time (see the workflow's
-# buildValuesScript). Writing them here as well would mean three copies of the
-# same fact - chart, Terraform and dashboard - that drift the first time
-# someone resizes the fleet and only edits one of them.
-#
-# region is the exception: Terraform cannot be its source, because the region
-# has to be known before Terraform can initialise its own S3 backend.
-aws:
-  region: "${yamlEscapeDoubleQuoted(awsRegion)}"
-  instanceType: null
-  volumeSize: null
-dashboard:
-  replicas: 1
-  storage: "1Gi"
-# Populated by CI from the registry credentials (see the workflow's
-# buildValuesScript) so private images can be pulled. Left null here on
-# purpose - nothing secret belongs in a committed file.
-imagePullSecret: null
-# Set by the PR-capsule workflow to the node the dashboard's capacity oracle
-# picked. Only the STATEFUL workloads read it: their volumes come from k3s's
-# local-path provisioner and live on one node's disk, so a database pod that
-# moves can never reach its data again. Stateless workloads are deliberately
-# left to the scheduler, so a capsule can use room spread across the fleet.
-dataNodeSelector: {}
-`;
-
-  if (config.additionalServices && config.additionalServices.length > 0) {
-    valuesYaml += 'additionalServicesIndices:\n';
-    for (let i = 0; i < config.additionalServices.length; i++) {
-      valuesYaml += `  ${config.additionalServices[i].name}: ${i}\n`;
-    }
-  }
-
+  const valuesYaml = require('../../templates/values.yaml.js')(config, contextObj);
   fs.writeFileSync(path.join(helmDir, 'values.yaml'), valuesYaml);
 
+  // The analysis behind this deployment, kept so `flarops sync` can apply
+  // flarops.yaml to it instead of re-deriving it.
+  //
+  // flarops.yaml is deliberately not a full description of the deployment -
+  // it is the part a person edits. Everything init worked out by reading the
+  // repository and cannot be asked to guess again (the DB URLs it rewrites
+  // into each container, a detected migration step, init-SQL, whether a
+  // Dockerfile needs the repo root as its build context) has no place in a
+  // hand-edited file, and regenerating from flarops.yaml alone would silently
+  // drop all of it. Holding the analysis here makes sync a merge - declared
+  // values over discovered ones - rather than a second, poorer analysis.
+  //
+  // Nothing secret goes in: config carries key NAMES, never their values.
+  require('../../utils/state.js').writeState(currentDir, config);
 
-  const ingressTemplate = require('../../templates/01-ingress.js');
-  const secretTemplate = require('../../templates/secret.js');
-  const dbDeploymentTemplate = require('../../templates/database/deployment.js');
-  const dbServiceTemplate = require('../../templates/database/service.js');
-  const apiDeploymentTemplate = require('../../templates/api/deployment.js');
-  const apiServiceTemplate = require('../../templates/api/service.js');
-  const frontendDeploymentTemplate = require('../../templates/frontend/deployment.js');
-  const frontendServiceTemplate = require('../../templates/frontend/service.js');
-  const dashboardYamlTemplate = require('../../templates/dashboard.yaml.js');
-
-
-  const genericDeploymentTemplate = require('../../templates/generic/deployment.js');
-  const genericServiceTemplate = require('../../templates/generic/service.js');
-  const genericDatabaseTemplate = require('../../templates/generic/database.js');
-  const supportServiceTemplate = require('../../templates/generic/support.js');
-
-  const templatesToGenerate = [
-    { file: path.join(helmTemplatesDir, '01-ingress.yaml'), content: ingressTemplate(config) },
-    { file: path.join(helmTemplatesDir, '_helpers.tpl'), content: require('../../templates/helpers.tpl.js')() },
-    { file: path.join(helmTemplatesDir, 'secret.yaml'), content: secretTemplate() },
-    { file: path.join(helmTemplatesDir, 'registry-secret.yaml'), content: require('../../templates/registry-secret.js')(config) },
-    { file: path.join(helmTemplatesDir, 'dashboard.yaml'), content: dashboardYamlTemplate(config) }
-  ];
-
-  if (config.hasBackend) {
-    templatesToGenerate.push({ file: path.join(helmTemplatesDir, 'api.yaml'), content: apiServiceTemplate() + '\n---\n' + apiDeploymentTemplate(config) });
-  }
-  if (config.hasFrontend) {
-    templatesToGenerate.push({ file: path.join(helmTemplatesDir, 'frontend.yaml'), content: frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate(config) });
-  }
-
-  if (config.supportServices && config.supportServices.length > 0) {
-    for (const s of config.supportServices) {
-      templatesToGenerate.push({ file: path.join(helmTemplatesDir, `support-${s.name}.yaml`), content: supportServiceTemplate(s) });
-    }
-  }
-
-  if (config.additionalServices && config.additionalServices.length > 0) {
-    for (const s of config.additionalServices) {
-      let serviceContent = genericServiceTemplate(s) + '\n---\n' + genericDeploymentTemplate(s);
-      templatesToGenerate.push({ file: path.join(helmTemplatesDir, `${s.name}.yaml`), content: serviceContent });
-      if (s.db && !s.db.shared) {
-        templatesToGenerate.push({ file: path.join(helmTemplatesDir, `${s.name}-db.yaml`), content: genericDatabaseTemplate(s) });
-      }
-    }
-  }
+  // Write flarops.yaml - the declarative source of truth for every service.
+  const flaropsYamlContent = generateFlaropsYaml(config, {
+    apiEnv, frontendEnv, apiSecretKeys, frontendSecretKeys,
+    apiExtraSecretEnvMappings, frontendExtraSecretEnvMappings,
+    apiBuildArgs, frontendBuildArgs, apiCommand, frontendCommand,
+  });
+  fs.writeFileSync(path.join(currentDir, 'flarops.yaml'), flaropsYamlContent);
+  console.log('Created flarops.yaml');
 
 
-  if (config.dbType) {
-    templatesToGenerate.push({ file: path.join(helmTemplatesDir, 'database.yaml'), content: dbServiceTemplate(config) + '\n---\n' + dbDeploymentTemplate(config) });
-  }
+  // Which templates this config implies is decided in templates/chart.js, the
+  // same list `flarops sync` renders from when it applies flarops.yaml.
+  const templatesToGenerate = require('../../templates/chart.js')
+    .renderChartTemplates(config, helmTemplatesDir);
 
   templatesToGenerate.forEach(t => fs.writeFileSync(t.file, t.content));
 
@@ -2934,6 +3010,49 @@ dataNodeSelector: {}
       console.log("");
     }
   } catch (e) { /* best effort - never block a successful generation */ }
+
+  // The secrets are the one part of this that a person has to act on by hand,
+  // and until now the only record of them was a file with a forty-line key in
+  // the middle. Printed last, where it is still on screen when the command
+  // ends.
+  {
+    const placeholder = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+    const finalEnv = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
+    const valueOf = (key) => {
+      const m = finalEnv.match(new RegExp('^' + escapeRegex(key) + '=(.*)$', 'm'));
+      return m ? m[1].replace(/^["']|["']$/g, '') : '';
+    };
+    // The infrastructure secrets are read by the workflow directly, so they
+    // never pass through envKeysToPass - but they are just as required, and a
+    // list that leaves them out gives a count the operator will act on and
+    // find short.
+    const infrastructureKeys = [
+      'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'SSH_PRIVATE_KEY', 'REGISTRY_PASSWORD',
+      ...(cloudflareApiToken && cloudflareZoneId ? ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ZONE_ID'] : []),
+    ];
+    const needed = [...infrastructureKeys, ...envKeysToPass.filter(Boolean)]
+      .filter((key, i, all) => all.indexOf(key) === i);
+    if (needed.length > 0) {
+      console.log("");
+      console.log(`\x1b[36mCreate these ${needed.length} GitHub repository secrets before the first deploy\x1b[0m`);
+      console.log(`\x1b[36m(Settings -> Secrets and variables -> Actions). Values are in deploy/.env:\x1b[0m`);
+      for (const key of needed) {
+        const value = valueOf(key);
+        const sameAs = placeholder.exec(value);
+        // A value that is still a reference is an instruction, not a secret:
+        // docker-compose read one credential into several names, and they have
+        // to be given the same value or the services cannot authenticate.
+        if (sameAs) console.log(`  ${key}  \x1b[33m<- give it the SAME value as ${sameAs[1]}\x1b[0m`);
+        else if (infrastructureKeys.includes(key)) console.log(`  ${key}  \x1b[90m(infrastructure)\x1b[0m`);
+        else if (!value) console.log(`  ${key}  \x1b[33m<- no value found; you must supply one\x1b[0m`);
+        else console.log(`  ${key}`);
+      }
+      if (lateSecretKeys.length > 0) {
+        console.log(`\x1b[36mOf those, ${lateSecretKeys.join(', ')} were added because a service in your stack reads them.\x1b[0m`);
+      }
+      console.log("");
+    }
+  }
 
   console.log("");
   console.log("#############################################################################################");

@@ -23,6 +23,10 @@ module.exports = (config) => {
   const apiExtraKeyList = quoteKeys([
     ...(config.apiExtraSecretEnvMappings || []).map(m => m.secretKey),
     config.dbPasswordKey,
+    // Rendered straight into the manifest like the mappings above, so it is
+    // invisible to the checksum unless named: rotating the password must roll
+    // this pod, and the encoded twin is what it actually reads.
+    (config.dbUrlVars || []).length > 0 && config.dbPasswordKey ? `${config.dbPasswordKey}_URLENCODED` : null,
   ]);
 
 
@@ -44,15 +48,29 @@ module.exports = (config) => {
 
     if (config.dbPort) defaultPort = config.dbPort;
 
+    // The percent-encoded twin of the password, declared BEFORE the URLs that
+    // splice it in: Kubernetes expands "$(VAR)" only against variables already
+    // listed above it in the same container. Splicing the raw password here is
+    // what produced "invalid port number in database URL" - see
+    // flarops.urlencode in _helpers.tpl.
+    dbUrlEnvBlock += `
+            - name: ${config.dbPasswordKey}_URLENCODED
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: ${config.dbPasswordKey}_URLENCODED`;
+
     for (const urlVar of config.dbUrlVars) {
       let query = urlVar.query || '';
       if (scheme === 'mongodb' && !query.includes('authSource')) {
         query += (query ? '&' : '') + mongoAuth;
       }
 
+      // The user and database name are Helm values, so they are encoded here,
+      // at render time, by the same rule.
       dbUrlEnvBlock += `
             - name: ${urlVar.key}
-              value: "${scheme}://{{ .Values.database.user }}:$(${config.dbPasswordKey})@database:{{ .Values.dbPort | default ${defaultPort} }}/{{ .Values.database.name }}${query}"`;
+              value: "${scheme}://{{ include "flarops.urlencode" .Values.database.user }}:$(${config.dbPasswordKey}_URLENCODED)@database:{{ .Values.dbPort | default ${defaultPort} }}/{{ include "flarops.urlencode" .Values.database.name }}${query}"`;
     }
   }
 
@@ -72,8 +90,17 @@ module.exports = (config) => {
   // in the same container's env list, which Kubernetes' server-side apply
   // rejects outright ("duplicate entries for key").
   const hasDbPassword = !!config.hasDbPassword;
-  const dbPasswordAlreadyInSecretKeys = Array.isArray(config.apiSecretKeys) && config.apiSecretKeys.includes(config.dbPasswordKey);
-  const dbPasswordBlock = (hasDbPassword && !dbPasswordAlreadyInSecretKeys) ? `
+  // "Already emitted" means under this container-side NAME, by any of the
+  // mechanisms that write into the same env list - the generic secretKeys
+  // loop, or an explicit mapping whose envName happens to be this one. The
+  // check used to look at secretKeys alone, so a shared credential recorded
+  // as a mapping (DB_PASSWORD -> POSTGRES_PASSWORD) was emitted here a second
+  // time under its own name, and the API server rejects the Deployment for
+  // the duplicate.
+  const dbPasswordAlreadyEmitted =
+    (Array.isArray(config.apiSecretKeys) && config.apiSecretKeys.includes(config.dbPasswordKey)) ||
+    (config.apiExtraSecretEnvMappings || []).some(m => m.envName === config.dbPasswordKey);
+  const dbPasswordBlock = (hasDbPassword && !dbPasswordAlreadyEmitted) ? `
             - name: {{ "${config.dbPasswordKey}" }}
               valueFrom:
                 secretKeyRef:

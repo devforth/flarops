@@ -14,9 +14,12 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { execFileSync } = require('child_process');
 const { generate } = require('./harness');
 const { capture, firstDifference } = require('./snapshot');
+const syncTests = require('./sync');
+const yamlTests = require('./yaml');
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 const SNAPSHOTS = path.join(__dirname, 'snapshots');
@@ -80,6 +83,10 @@ function secretRefsWithoutSource(dir) {
   const wf = fs.readFileSync(path.join(dir, '.github/workflows/deploy.yml'), 'utf8');
   const provided = new Set([...wf.matchAll(/SECRET_ENV_([A-Z0-9_]+):/g)].map(m => m[1]));
   provided.add('DB_PASSWORD'); // carried by its own SECRET_DB_PASSWORD line
+  // The Secret derives a percent-encoded twin of any key a database URL is
+  // built from, so CI never passes it by name - it exists exactly when the key
+  // it is derived from does.
+  for (const key of [...provided]) provided.add(`${key}_URLENCODED`);
   const missing = new Set();
   for (const file of fs.readdirSync(templatesDir)) {
     if (!file.endsWith('.yaml')) continue;
@@ -99,12 +106,40 @@ function helmRenders(dir) {
   const tmp = path.join(dir, '.ci-values.json');
   fs.writeFileSync(tmp, JSON.stringify(values));
   try {
-    execFileSync('helm', ['template', 't', chart, '-f', tmp], { stdio: 'pipe' });
+    const rendered = execFileSync('helm', ['template', 't', chart, '-f', tmp], { stdio: 'pipe' }).toString();
+    fs.writeFileSync(path.join(dir, '.rendered.yaml'), rendered);
     execFileSync('helm', ['lint', chart, '-f', tmp], { stdio: 'pipe' });
     return null;
   } catch (e) {
     return (e.stderr || e.stdout || Buffer.from('')).toString();
   }
+}
+
+// A container may not list the same env name twice. The API server rejects it
+// ("duplicate entries for key [name=...]"), but `helm template` and `helm
+// lint` both render it without complaint - so this only ever showed up at
+// apply time, against a cluster, after everything else had succeeded. Two
+// separate mechanisms have produced it: the DB password arriving both through
+// secretKeys and through its own block, and the same key appearing twice in
+// secretKeys itself.
+function duplicateEnvNames(dir) {
+  const script = `
+import sys, yaml
+bad = []
+for doc in yaml.safe_load_all(open(sys.argv[1])):
+    if not doc: continue
+    spec = (doc.get('spec') or {}).get('template', {}).get('spec') or {}
+    for c in (spec.get('containers') or []) + (spec.get('initContainers') or []):
+        names = [e.get('name') for e in (c.get('env') or [])]
+        dups = sorted({n for n in names if names.count(n) > 1})
+        if dups:
+            bad.append(doc.get('metadata',{}).get('name','?') + '/' + c.get('name','?') + ': ' + ', '.join(dups))
+print('\\n'.join(bad))
+`;
+  try {
+    const out = execFileSync('python3', ['-c', script, path.join(dir, '.rendered.yaml')], { stdio: 'pipe' }).toString().trim();
+    return out || null;
+  } catch (e) { return (e.stderr || Buffer.from('')).toString(); }
 }
 
 // Builds the values file CI would write: one image per werf image, plus the
@@ -151,6 +186,199 @@ print('\\n'.join(bad))
   } catch (e) { return (e.stderr || Buffer.from('')).toString(); }
 }
 
+// An already-initialized project must be refused before init touches anything.
+// Run the real CLI in a child process: the guard exits the process, which
+// inside this runner would take the whole suite with it.
+function refusesSecondInit() {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-guard-'));
+  const dir = path.join(parent, 'already-initialized');
+  try {
+    fs.mkdirSync(dir);
+    execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'pipe' });
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), 'api:\n  replicas: 1\n');
+
+    let status = 0;
+    let stderr = '';
+    try {
+      execFileSync('node', [path.join(__dirname, '..', 'bin', 'index.js'), 'init'],
+        { cwd: dir, stdio: 'pipe' });
+    } catch (e) {
+      status = e.status;
+      stderr = (e.stderr || Buffer.from('')).toString();
+    }
+
+    check('second init exits non-zero', status === 1, `exit status ${status}`);
+    check('second init says why', /already initialized/.test(stderr), stderr.slice(0, 200));
+    // The guard is only worth anything if it fires BEFORE the first write.
+    for (const rel of ['deploy', '.keys', 'werf.yaml', '.github']) {
+      check(`second init writes no ${rel}`, !fs.existsSync(path.join(dir, rel)));
+    }
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+}
+
+// flarops.yaml claims to be the declarative description of every service, so
+// it is only worth anything while it agrees with what actually gets deployed.
+// Both halves of a secret mapping are checked - the container-side env name
+// AND the Secret key behind it - because they are independent, and a file that
+// names the right variable against the wrong key reads as correct.
+//
+// It is also loaded with duplicate mapping keys made fatal. flarops.yaml
+// renders secretEnvs as a YAML mapping, where a repeated key is not a
+// duplicate but a silently discarded entry; PyYAML's default loader keeps the
+// last one without a word, so the plain "parses as YAML" check above cannot
+// see it.
+function flaropsYamlMatchesChart(dir) {
+  const script = `
+import sys, yaml, json
+class Strict(yaml.SafeLoader): pass
+def nodup(loader, node, deep=False):
+    out, dups = {}, []
+    for k, v in node.value:
+        key = loader.construct_object(k, deep=deep)
+        if key in out: dups.append(str(key))
+        out[key] = loader.construct_object(v, deep=deep)
+    if dups: raise yaml.YAMLError('duplicate keys: ' + ', '.join(dups))
+    return out
+Strict.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, nodup)
+
+try:
+    declared = yaml.load(open(sys.argv[1]), Strict) or {}
+except yaml.YAMLError as e:
+    print('flarops.yaml: ' + str(e)); raise SystemExit(0)
+
+# A per-service database is declared as a nested db: block; the chart names
+# that workload <owner>-db.
+blocks = dict(declared)
+for name, b in declared.items():
+    if isinstance(b, dict) and isinstance(b.get('db'), dict):
+        blocks[name + '-db'] = {'secretEnvs': b['db'].get('secretEnvs') or {}}
+
+bad = []
+for doc in yaml.safe_load_all(open(sys.argv[2])):
+    if not doc: continue
+    name = (doc.get('metadata') or {}).get('name')
+    # Flarops' own dashboard is infrastructure, not a service the operator
+    # declares, so it is deliberately absent from flarops.yaml.
+    if name == 'flarops-dashboard': continue
+    spec = (doc.get('spec') or {}).get('template', {}).get('spec') or {}
+    refs = {}
+    for c in (spec.get('containers') or []):
+        for e in (c.get('env') or []):
+            key = ((e.get('valueFrom') or {}).get('secretKeyRef') or {}).get('key')
+            if key: refs[e['name']] = key
+    if not refs: continue
+    block = blocks.get(name)
+    if not isinstance(block, dict):
+        bad.append(name + ': deployed with secrets, absent from flarops.yaml'); continue
+    got = block.get('secretEnvs') or {}
+    for env, key in refs.items():
+        # A "<KEY>_URLENCODED" pair is machinery, not a declaration: the chart
+        # derives it from the declared key so a password holding ":" or "/"
+        # cannot break the database URL it is spliced into. Requiring the
+        # operator to write it in flarops.yaml would be asking them to declare
+        # an implementation detail they cannot usefully change - but the key it
+        # derives FROM still has to be declared, which is what this checks.
+        if env.endswith('_URLENCODED') and env == key:
+            base = env[:-len('_URLENCODED')]
+            if base not in got: bad.append(name + ': derives ' + env + ' from ' + base + ', which is not declared')
+            continue
+        if env not in got: bad.append(name + ': chart mounts ' + env + ' <- ' + key + ', not declared')
+        elif got[env] != key: bad.append(name + ': ' + env + ' <- chart "' + key + '", flarops.yaml "' + str(got[env]) + '"')
+    for env in got:
+        if env not in refs: bad.append(name + ': flarops.yaml declares ' + env + ', chart does not mount it')
+print('\\n'.join(bad))
+`;
+  try {
+    const out = execFileSync('python3', ['-c', script,
+      path.join(dir, 'flarops.yaml'), path.join(dir, '.rendered.yaml')], { stdio: 'pipe' }).toString().trim();
+    return out || null;
+  } catch (e) { return (e.stderr || Buffer.from('')).toString(); }
+}
+
+// Declining the variant compose file must actually skip it - everywhere.
+// The question is asked once, but eight different analyzers resolve the
+// compose file independently, so the failure this guards against is one of
+// them reading the file anyway and quietly generating from a local dev stack
+// the operator just said no to.
+async function declinedVariantComposeIsSkipped() {
+  const approved = await generate(path.join(FIXTURES, 'u-variantcompose'));
+  const declined = await generate(path.join(FIXTURES, 'u-variantcompose'),
+    { 'Base the deployment on it?': 'n' });
+  try {
+    if (!check('declining generates without throwing', declined.ok, declined.error && declined.error.stack)) return;
+    check('declining says so', /Skipping docker-compose-dev\.yaml/.test(declined.log),
+      declined.log.split('\n').filter(l => /Skipping|compose/.test(l)).join('\n').slice(0, 300));
+
+    const templates = (dir) => fs.readdirSync(path.join(dir, 'deploy/helm/templates')).sort();
+    const withCompose = templates(approved.dir);
+    const without = templates(declined.dir);
+    // The support service exists ONLY in the compose file, so it is the proof
+    // that nothing read it.
+    check('a service only the compose file declares is gone',
+      withCompose.includes('support-cache.yaml') && !without.includes('support-cache.yaml'),
+      `approved: ${withCompose.join(' ')} | declined: ${without.join(' ')}`);
+    // The worker has a directory of its own, so the layout scan still finds
+    // it - declining drops the compose file, not the repository.
+    check('a service with a directory of its own survives', without.includes('worker.yaml'), without.join(' '));
+    check('the compose file is not read for anything else',
+      !fs.readFileSync(path.join(declined.dir, 'deploy/helm/values.yaml'), 'utf8').includes('redis:7'),
+      'the redis image from the declined compose file reached values.yaml');
+  } finally {
+    fs.rmSync(approved.parent, { recursive: true, force: true });
+    fs.rmSync(declined.parent, { recursive: true, force: true });
+  }
+}
+
+// A database password is spliced into DATABASE_URL by Kubernetes at container
+// start, which copies the bytes verbatim. A password holding ":" or "/" then
+// ends the URL early and the driver reports "invalid port number in database
+// URL" - the password is right, the URL is not. This renders the chart with a
+// password made of exactly those characters and checks the URL a driver would
+// actually receive.
+async function urlBreakingPasswordSurvives() {
+  // A password containing every character that changes how a URL parses,
+  // including a literal "%" - which must be encoded FIRST or it would corrupt
+  // the escapes introduced for the others.
+  const PASSWORD = 'p@ss:w/rd?#%25 x&+';
+  const result = await generate(path.join(FIXTURES, 'g-mysql'));
+  try {
+    if (!check('url-password fixture generates', result.ok, result.error && result.error.stack)) return;
+
+    const werf = fs.readFileSync(path.join(result.dir, 'werf.yaml'), 'utf8');
+    const images = Object.fromEntries([...werf.matchAll(/^image:\s*(\S+)\s*$/gm)].map(m => [m[1], 'example.test/img:test']));
+    const wf = fs.readFileSync(path.join(result.dir, '.github/workflows/deploy.yml'), 'utf8');
+    const env = Object.fromEntries([...wf.matchAll(/SECRET_ENV_([A-Z0-9_]+):/g)]
+      .map(m => [m[1], m[1].includes('PASSWORD') ? PASSWORD : 'test-value']));
+    const valuesFile = path.join(result.dir, '.url-values.json');
+    fs.writeFileSync(valuesFile, JSON.stringify({ werf: { env: 'production', image: images }, env, database: { password: PASSWORD } }));
+
+    const rendered = execFileSync('helm', ['template', 't', path.join(result.dir, 'deploy/helm'), '-f', valuesFile], { stdio: 'pipe' }).toString();
+
+    const twin = rendered.match(/^\s*[A-Z_]*PASSWORD_URLENCODED:\s*"(.*)"$/m);
+    if (!check('the Secret carries an encoded twin of the password', !!twin, rendered.slice(0, 300))) return;
+    check('the twin decodes back to the original password',
+      decodeURIComponent(twin[1]) === PASSWORD, `${twin[1]} -> ${decodeURIComponent(twin[1])}`);
+
+    const urlLine = rendered.match(/name: DATABASE_URL\n\s*value:\s*"(.*)"$/m);
+    if (!check('a DATABASE_URL is built', !!urlLine)) return;
+    check('the URL splices the twin, not the raw password',
+      /\$\([A-Z_]*PASSWORD_URLENCODED\)/.test(urlLine[1]), urlLine[1]);
+
+    // What the driver actually gets once Kubernetes has substituted.
+    const substituted = urlLine[1].replace(/\$\([A-Z_]*PASSWORD_URLENCODED\)/, twin[1]);
+    let parsed = null;
+    try { parsed = new URL(substituted); } catch (e) { /* reported below */ }
+    if (!check('the substituted URL parses at all', !!parsed, substituted)) return;
+    check('the port survives the password', parsed.port === '3306', `port=${parsed.port} in ${substituted}`);
+    check('the password survives the URL', decodeURIComponent(parsed.password) === PASSWORD,
+      decodeURIComponent(parsed.password));
+  } finally {
+    fs.rmSync(result.parent, { recursive: true, force: true });
+  }
+}
+
 // --- runner ----------------------------------------------------------------
 
 (async () => {
@@ -164,14 +392,27 @@ print('\\n'.join(bad))
     const result = await generate(path.join(FIXTURES, name));
     if (!check('generates without throwing', result.ok, result.error && result.error.stack)) continue;
 
+    // A fixture may state lines the generation must PRINT. Some of what the
+    // generator decides is visible nowhere else: a compose file it chose to
+    // read, or services it deliberately skipped. Dropping those silently is
+    // the failure mode this catches - the files it writes look fine either
+    // way.
+    const expectedLog = path.join(FIXTURES, name, 'expected-log.txt');
+    if (fs.existsSync(expectedLog)) {
+      for (const line of fs.readFileSync(expectedLog, 'utf8').split('\n').map(l => l.trim()).filter(Boolean)) {
+        check(`says: ${line.slice(0, 60)}`, result.log.includes(line),
+          result.log.split('\n').filter(l => /WARNING|INFO/.test(l)).join('\n').slice(0, 400));
+      }
+    }
+
     const expect = ['deploy/helm/values.yaml', 'deploy/.env', 'werf.yaml',
-      '.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml'];
+      '.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml', 'flarops.yaml'];
     for (const rel of expect) {
       check(`writes ${rel}`, fs.existsSync(path.join(result.dir, rel)));
     }
     if (!fs.existsSync(path.join(result.dir, 'deploy/helm/values.yaml'))) continue;
 
-    for (const rel of ['deploy/helm/values.yaml', 'werf.yaml', '.github/workflows/deploy.yml']) {
+    for (const rel of ['deploy/helm/values.yaml', 'werf.yaml', '.github/workflows/deploy.yml', 'flarops.yaml']) {
       const bad = noUnexpandedJs(result.dir, rel);
       check(`${rel} has no unexpanded interpolation`, bad.length === 0, bad.join(', '));
     }
@@ -183,7 +424,7 @@ print('\\n'.join(bad))
     check('every secretKeyRef has a key CI provides', orphanRefs.length === 0, orphanRefs.join('\n'));
 
     if (HAS_PY) {
-      for (const rel of ['deploy/helm/values.yaml', '.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml']) {
+      for (const rel of ['deploy/helm/values.yaml', '.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml', 'flarops.yaml']) {
         check(`${rel} parses as YAML`, yamlParses(result.dir, rel) === null, yamlParses(result.dir, rel));
       }
       for (const rel of ['.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml']) {
@@ -212,10 +453,47 @@ print('\\n'.join(bad))
       writeTestValues(result.dir);
       const err = helmRenders(result.dir);
       check('chart renders and lints', err === null, err);
+      if (err === null && HAS_PY) {
+        const dups = duplicateEnvNames(result.dir);
+        check('no container lists an env name twice', !dups, dups);
+        const drift = flaropsYamlMatchesChart(result.dir);
+        check('flarops.yaml matches the deployed chart', !drift, drift);
+      }
     }
 
     fs.rmSync(result.parent, { recursive: true, force: true });
   }
+
+  if (HAS_HELM) {
+    console.log('\n  a password that would break a database URL');
+    await urlBreakingPasswordSurvives();
+  }
+
+  console.log('\n  declined variant compose file');
+  await declinedVariantComposeIsSkipped();
+
+  console.log('\n  flarops.yaml reader');
+  yamlTests.run(check);
+
+  console.log('\n  already-initialized project');
+  refusesSecondInit();
+
+  // Sync is driven against a real generated project rather than a fixture of
+  // its own: its whole job is to edit one, and a hand-written stand-in would
+  // not have the recorded state it merges into.
+  console.log('\n  flarops sync');
+  const syncResult = await generate(path.join(FIXTURES, 'a-full'));
+  if (check('sync fixture generates', syncResult.ok, syncResult.error && syncResult.error.stack)) {
+    syncTests.run(check, syncResult.dir, HAS_HELM && HAS_PY ? (dir) => {
+      writeTestValues(dir);
+      const err = helmRenders(dir);
+      // The drift check reads spec.template.spec.containers, which a Job has
+      // as much as a Deployment - but nothing verified that until a one-shot
+      // task existed to try it on.
+      return err || flaropsYamlMatchesChart(dir);
+    } : null);
+  }
+  fs.rmSync(syncResult.parent, { recursive: true, force: true });
 
   console.log(`\n${checks - failures}/${checks} checks passed`);
   if (failures > 0) { console.log(`${failures} FAILED`); process.exit(1); }

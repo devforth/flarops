@@ -36,6 +36,29 @@ flarops init
 
 Flarops analyzes the repository, asks for the credentials it cannot discover, and writes the deployment files. Follow `FLAROPS.md`, which it generates, to deploy for the first time.
 
+### `flarops sync`
+
+After `init`, `flarops.yaml` is the file you edit. `flarops sync` applies it:
+
+| You do | Sync does |
+| --- | --- |
+| Change a parameter (`replicas`, `env`, `ports`, `secretEnvs`, `command`, build `args`, `exposedRoutes`, `healthRoute`) | Updates that object in `deploy/helm/values.yaml` and re-renders its chart template |
+| Add a service block | Creates it from the same templates a discovered service uses, with defaults for everything you left out, and teaches `werf.yaml` to build it |
+| Remove a service block | Deletes its chart template and drops it from the values |
+
+A service block takes `replicas`, `ports`, `env`, `secretEnvs` (container env name → GitHub Secret name), `command` (the container's command line — it becomes the pod's `args`, replacing the image's CMD and keeping its ENTRYPOINT, exactly as docker-compose's `command:` does), `buildArgs` (passed to `docker build --build-arg`; older files spell this `args` and are still read), `healthRoute`, `healthPort`, `exposedRoutes`, `volumes` and `db`.
+
+Two of those are worth spelling out:
+
+- **`volumes`** give a service persistent storage, one claim each: `- name: data` / `path: /var/lib/service` / `size: 20Gi` (5Gi by default). A volume forces `strategy: Recreate`, because a pod holding a ReadWriteOnce claim has to be gone before its replacement can bind it.
+- **`oneShot: true`** marks a task rather than a service — creating topics, seeding a store. It replaces `replicas` and is rendered as a Job that re-runs on every deploy, so the command must be safe to repeat (`--if-not-exists`, an upsert). Without it such a task becomes a Deployment, which is a promise that one copy is always running: the container exits, Kubernetes restarts it, and it sits in CrashLoopBackOff redoing its work on every loop. A task has no Service, so it cannot own `exposedRoutes`.
+
+Sync is a merge, not a regeneration. `deploy/.flarops-state.json` (written by `init`, meant to be committed) holds what init worked out by reading your repository — the database URLs it rewrites into each container, a detected migration step, init-SQL, whether a Dockerfile needs the repo root as its build context. None of that belongs in a hand-edited file, so declared values are laid over it rather than replacing it. Where both describe the same thing, `flarops.yaml` wins.
+
+Sync prints every change before writing, and refuses rather than guessing: a duplicate key or unreadable YAML is reported with its line number and nothing is written; an empty `flarops.yaml` is treated as a truncated file, not as a request to delete the deployment. It does not touch the workflows or Terraform — if you declare a secret CI does not pass yet, it says which one and leaves you to add it.
+
+`init` runs once. It finishes by writing `flarops.yaml` — the declarative description of every service it manages — and refuses to run again while that file exists, because a second pass would issue a new deploy key and dashboard password and overwrite the chart, Terraform and workflows from a fresh analysis, discarding anything edited since. To change what is deployed, edit `flarops.yaml`; to drop chart templates that no longer match any service, run `flarops sync`; to start over, delete `flarops.yaml` first.
+
 ## What `flarops init` asks you
 
 ### Values it collects

@@ -1,0 +1,1 @@
+Create these 7 GitHub repository secrets before the first deploy

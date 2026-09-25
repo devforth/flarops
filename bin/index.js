@@ -6,7 +6,7 @@ function showHelp() {
   console.log(
     "Available commands:\n" +
     "  init         Analyze this repository and generate the deployment stack\n" +
-    "  sync         Remove generated chart templates that no longer match any service\n"
+    "  sync         Apply flarops.yaml to the generated deployment\n"
   );
 }
 

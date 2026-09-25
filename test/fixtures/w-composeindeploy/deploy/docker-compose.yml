@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: pw
+      POSTGRES_DB: shopdb
+  api:
+    build:
+      context: ../api
+    ports: ["3000:3000"]
+    environment:
+      DB_HOST: db
+    depends_on: [db]
+  front:
+    build:
+      context: ../front
+    ports: ["8080:8080"]
+  worker:
+    build:
+      context: ../api
+    command: ["node", "worker.js"]
+    depends_on: [db]
+  cron:
+    build:
+      context: ../api
+    command: ["node", "cron.js"]
+    depends_on: [db]
