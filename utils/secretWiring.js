@@ -56,4 +56,57 @@ class SecretWiring {
   }
 }
 
-module.exports = { SecretWiring };
+// Every Secret key some workload actually mounts, derived the same way the
+// templates derive it.
+//
+// The counterpart to "is this key something CI provides?": a key CI passes
+// that NOTHING reads is not harmless. It is a secret the operator was told to
+// create, which does nothing - and, more to the point, it is what a
+// half-applied change looks like. A key added to the workflow but never wired
+// into a workload reaches the cluster's Secret and never reaches a pod, which
+// from the outside is indistinguishable from the secret "not working".
+//
+// The dashboard's own key is included because dashboard.yaml mounts it, and a
+// database password because the database template and the api's dedicated
+// block both do - neither goes through a secretKeys list.
+function mountedSecretKeys(config) {
+  const keys = new Set();
+  const add = (key) => { if (key) keys.add(key); };
+  const addAll = (list) => { for (const k of list || []) add(k); };
+  const addMappings = (list) => { for (const m of list || []) add(m.secretKey); };
+
+  // Flarops' own dashboard.
+  add('DASHBOARD_PASSWORD_HASH');
+
+  if (config.hasBackend) {
+    addAll(config.apiSecretKeys);
+    addMappings(config.apiExtraSecretEnvMappings);
+  }
+  if (config.hasFrontend) {
+    addAll(config.frontendSecretKeys);
+    addMappings(config.frontendExtraSecretEnvMappings);
+  }
+  if (config.hasDbPassword) add(config.dbPasswordKey);
+
+  for (const service of config.additionalServices || []) {
+    addAll(service.secretKeys);
+    addMappings(service.extraSecretEnvMappings);
+    add(service.dbPasswordKey);
+    add(service.springDatasourcePasswordSecretKey);
+    if (service.db) add(service.db.passwordKey);
+  }
+  for (const service of config.supportServices || []) {
+    addAll(service.secretKeys);
+    addMappings(service.extraSecretEnvMappings);
+  }
+
+  return keys;
+}
+
+// Keys CI is told to pass that no workload reads.
+function unmountedSecretKeys(config) {
+  const mounted = mountedSecretKeys(config);
+  return (config.envKeysToPass || []).filter(key => key && !mounted.has(key));
+}
+
+module.exports = { SecretWiring, mountedSecretKeys, unmountedSecretKeys };

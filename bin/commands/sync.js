@@ -26,6 +26,7 @@ const { parse, YamlError } = require('../../utils/yamlLite.js');
 const { readState, writeState, STATE_FILE } = require('../../utils/state.js');
 const { makeServiceEntry } = require('../../utils/analyzer.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
+const { unmountedSecretKeys } = require('../../utils/secretWiring.js');
 const { renderChartTemplates } = require('../../templates/chart.js');
 const renderValues = require('../../templates/values.yaml.js');
 const renderWerf = require('../../templates/werf.yaml.js');
@@ -197,10 +198,39 @@ function applyDatabase(config, decl, set) {
   if (decl.port) set(config, 'dbPort', Number(decl.port), 'database.port');
   if (decl.user) set(config, 'dbUser', String(decl.user), 'database.user');
   if (decl.name) set(config, 'dbName', String(decl.name), 'database.name');
-  // Every env the database container takes the password under points at the
-  // same Secret key; the chart only needs the key.
-  const keys = Object.values(decl.secretEnvs || {});
-  if (keys.length > 0) set(config, 'dbPasswordKey', String(keys[0]), 'database.secretEnvs');
+  // The database container takes its password under a name its IMAGE dictates
+  // (POSTGRES_PASSWORD, MONGO_INITDB_ROOT_PASSWORD, ...), and every one of
+  // those names points at the same Secret key - so the chart needs the key,
+  // not the names.
+  //
+  // It has no generic secretKeys loop, which means a key added here that is
+  // NOT that password cannot be mounted anywhere. Until now the extra entries
+  // were dropped in silence while still being collected into the list CI
+  // passes: the key reached the cluster's Secret and no container, which from
+  // the outside is indistinguishable from the secret not working.
+  // A database image takes its password under one or more names of its own
+  // choosing - mysql with a non-root user reads MYSQL_ROOT_PASSWORD *and*
+  // MYSQL_PASSWORD - but every one of them refers to the SAME Secret key. The
+  // chart has no generic secretKeys loop here, so a SECOND key cannot be
+  // mounted: it would be collected into the list CI passes, reach the
+  // cluster's Secret, and reach no container.
+  //
+  // The constraint is therefore one distinct KEY, not one entry. Counting
+  // entries instead rejected Flarops' own output, which writes two names for
+  // exactly that mysql case.
+  // A database image takes its password under one or more names of its own
+  // choosing - mysql with a non-root user reads MYSQL_ROOT_PASSWORD *and*
+  // MYSQL_PASSWORD - but every one of them refers to the SAME Secret key, and
+  // that key is all the chart needs.
+  //
+  // A SECOND distinct key here cannot be mounted: the database template has no
+  // generic secretKeys loop, so it would reach the cluster's Secret and no
+  // container. That is not refused, though - it is the same fault the
+  // unmounted-keys check reports for every service, and refusing here would
+  // stop an otherwise correct file over one misplaced line. The warning names
+  // the key and which service reads it; the rest of the file still applies.
+  const distinctKeys = [...new Set(Object.values(decl.secretEnvs || {}).map(String))];
+  if (distinctKeys.length > 0) set(config, 'dbPasswordKey', distinctKeys[0], 'database.secretEnvs');
   set(config, 'hasDb', true, 'database present');
 }
 
@@ -448,7 +478,29 @@ module.exports = async function sync() {
     process.exit(1);
   }
 
-  const { config, changes } = applyDeclarations(state, declared);
+  // A declaration can be well-formed YAML and still describe something that
+  // cannot be built - a volume with no path, a task that owns routes, a
+  // database asked to carry a secret it has no way to read. Those refusals
+  // read as an error message, not as a stack trace.
+  let config, changes;
+  try {
+    ({ config, changes } = applyDeclarations(state, declared));
+  } catch (e) {
+    if (e instanceof YamlError) {
+      console.error(`\x1b[31mERROR: flarops.yaml cannot be applied - ${e.message}\x1b[0m`);
+      process.exit(1);
+    }
+    throw e;
+  }
+
+  // Checked BEFORE the no-change shortcut. A deployment can match flarops.yaml
+  // exactly and still be wrong in this one way, and that is the state nobody
+  // finds: sync says "nothing to do" while a key sits in the cluster's Secret
+  // that no container reads.
+  const unmounted = unmountedSecretKeys(config);
+  if (unmounted.length > 0) {
+    console.warn(`\x1b[33mWARNING: CI passes these Secret keys but no workload reads them: ${unmounted.join(', ')}. They reach the cluster's Secret and no container - which looks exactly like the secret not working. Declare each under the secretEnvs of the service that needs it in flarops.yaml and run sync again, or remove it if nothing needs it.\x1b[0m`);
+  }
 
   if (changes.length === 0) {
     console.log('Deployment already matches flarops.yaml - nothing to do.');
@@ -514,6 +566,7 @@ module.exports = async function sync() {
       console.warn(`\x1b[33mWARNING: these Secret keys are now referenced by the chart but not passed by .github/workflows/deploy.yml: ${missing.join(', ')}. Add a "SECRET_ENV_<KEY>: \${{ secrets.<KEY> }}" line for each under the deploy step's env:, and add the secret to the repository - without it those pods stay in CreateContainerConfigError.\x1b[0m`);
     }
   }
+
 
   if (context.hasLocalhostWarnings) {
     console.warn('\x1b[33mWARNING: some values still point at localhost, which inside a cluster reaches the pod itself. Change them to the service name in flarops.yaml.\x1b[0m');

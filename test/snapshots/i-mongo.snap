@@ -811,6 +811,8 @@ AWS_REGION=us-west-2
     "DATABASE_PORT": "27017"
   },
   "frontendEnv": {},
+  "apiUsedEnvVars": [],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [],
   "frontendSecretKeys": [],
   "apiExtraSecretEnvMappings": [],
@@ -824,7 +826,7 @@ AWS_REGION=us-west-2
   "dbInitFiles": null,
   "hasDb": true,
   "apiPorts": [
-    3000
+    5000
   ],
   "frontendPorts": [
     80
@@ -1671,7 +1673,7 @@ api:
   env:
     DATABASE_PORT: "27017"
 apiPorts:
-  - 3000
+  - 5000
 
 
 apiRoutes:
@@ -2091,7 +2093,7 @@ api:
   context: backend
   replicas: 1
   ports:
-    - 3000
+    - 5000
   env:
     DATABASE_PORT: "27017"
   secretEnvs:

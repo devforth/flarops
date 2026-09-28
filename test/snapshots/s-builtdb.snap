@@ -815,6 +815,10 @@ AWS_REGION=us-west-2
     "DATABASE_PORT": "5432"
   },
   "frontendEnv": {},
+  "apiUsedEnvVars": [
+    "DATABASE_PASSWORD"
+  ],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [
     "DATABASE_PASSWORD"
   ],

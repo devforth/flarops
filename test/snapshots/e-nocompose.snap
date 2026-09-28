@@ -761,6 +761,8 @@ AWS_REGION=us-west-2
   "supportServices": [],
   "apiEnv": {},
   "frontendEnv": {},
+  "apiUsedEnvVars": [],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [],
   "frontendSecretKeys": [],
   "apiExtraSecretEnvMappings": [],

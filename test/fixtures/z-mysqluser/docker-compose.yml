@@ -1,0 +1,14 @@
+services:
+  db:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppw
+      MYSQL_DATABASE: shopdb
+  api:
+    build: ./backend
+    ports: ["3000:3000"]
+    environment:
+      DB_HOST: db
+    depends_on: [db]

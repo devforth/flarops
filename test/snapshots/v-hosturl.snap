@@ -814,6 +814,8 @@ AWS_REGION=us-west-2
     "DB_PORT": "5432"
   },
   "frontendEnv": {},
+  "apiUsedEnvVars": [],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [],
   "frontendSecretKeys": [],
   "apiExtraSecretEnvMappings": [],
@@ -830,7 +832,8 @@ AWS_REGION=us-west-2
     3000
   ],
   "frontendPorts": [
-    5173
+    5173,
+    8080
   ],
   "dbType": "postgres",
   "dbPort": 5432,
@@ -1768,6 +1771,7 @@ frontend:
     # KEY: "VALUE"
 frontendPorts:
   - 5173
+  - 8080
 
 apiRoutes:
   - path: "/api"
@@ -2204,6 +2208,7 @@ frontend:
   replicas: 1
   ports:
     - 5173
+    - 8080
 
 database:
   image: "postgres:16"

@@ -813,6 +813,8 @@ AWS_REGION=us-west-2
     "DB_PORT": "3306"
   },
   "frontendEnv": {},
+  "apiUsedEnvVars": [],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [],
   "frontendSecretKeys": [],
   "apiExtraSecretEnvMappings": [],
@@ -826,7 +828,7 @@ AWS_REGION=us-west-2
   "dbInitFiles": null,
   "hasDb": true,
   "apiPorts": [
-    3000
+    8080
   ],
   "frontendPorts": [
     80
@@ -1667,7 +1669,7 @@ api:
     DB_NAME: "crmdb"
     DB_PORT: "3306"
 apiPorts:
-  - 3000
+  - 8080
 
 
 apiRoutes:
@@ -2088,7 +2090,7 @@ api:
   context: backend
   replicas: 1
   ports:
-    - 3000
+    - 8080
   env:
     DB_HOST: database
     DB_NAME: crmdb

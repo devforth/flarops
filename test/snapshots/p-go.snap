@@ -833,6 +833,8 @@ AWS_REGION=us-west-2
     "DATABASE_PORT": "5432"
   },
   "frontendEnv": {},
+  "apiUsedEnvVars": [],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [],
   "frontendSecretKeys": [],
   "apiExtraSecretEnvMappings": [],
@@ -846,7 +848,7 @@ AWS_REGION=us-west-2
   "dbInitFiles": null,
   "hasDb": true,
   "apiPorts": [
-    3000
+    8090
   ],
   "frontendPorts": [
     80
@@ -1683,7 +1685,7 @@ api:
     DB_NAME: "godb"
     DATABASE_PORT: "5432"
 apiPorts:
-  - 3000
+  - 8090
 
 
 apiRoutes:
@@ -2105,7 +2107,7 @@ api:
   context: backend
   replicas: 1
   ports:
-    - 3000
+    - 8090
   env:
     DB_NAME: godb
     DATABASE_PORT: "5432"

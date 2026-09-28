@@ -13,7 +13,7 @@ const { yamlEscapeDoubleQuoted, generateEnvString } = require('../../utils/yamlW
 const { listComposeFiles, isVariantComposeFile, approveVariantComposeFile, composeBaseDir } = require('../../utils/composeFiles.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
 const { EnvFile } = require('../../utils/envFile.js');
-const { SecretWiring } = require('../../utils/secretWiring.js');
+const { SecretWiring, unmountedSecretKeys } = require('../../utils/secretWiring.js');
 const isYes = collectOperatorAnswers.isYes;
 const hclEscapeString = writeTerraform.hclEscapeString;
 
@@ -2583,6 +2583,72 @@ AWS_REGION=${awsRegion}
     if (s.command) s.command = rewriteComposeHostnamesInList(s.command);
   }
 
+  // A loopback address inside a pod means the pod itself, so it is wrong
+  // everywhere - yet only build args were being rewritten, because those are
+  // compiled into the image and get no second chance. The result was one
+  // variable with two different values: VITE_API_URL reached the image build
+  // as https://<domain>/api and values.yaml as http://localhost:5000/api. The
+  // runtime copy had a warning attached, which is not the same as being right.
+  //
+  // What it should become is not one answer, because a loopback URL is two
+  // different things:
+  //
+  //  * read by a BROWSER (a framework's public prefix promises the value is
+  //    inlined into the bundle) - it has to be an address the browser can
+  //    reach, so the project's own domain;
+  //  * read by a POD talking to another pod - it should stay INSIDE the
+  //    cluster. Sending it out to the public domain would work and be wrong:
+  //    the request would leave the cluster, cross the ingress and come back,
+  //    depending on external DNS and TLS to reach a neighbour.
+  //
+  // The port says which: a loopback port that matches a service Flarops
+  // deploys is that service. A port that matches nothing is left alone - there
+  // is nothing to point it at, and the existing localhost warning covers it.
+  const loopbackServiceByPort = new Map();
+  {
+    const claim = (ports, name) => {
+      for (const p of ports || []) {
+        const port = Number(p);
+        if (port && !loopbackServiceByPort.has(port)) loopbackServiceByPort.set(port, name);
+      }
+    };
+    if (backendInfo.hasBackend) claim(backendInfo.ports, 'api');
+    if (frontendInfo.hasFrontend) claim(frontendInfo.ports, 'frontend');
+    for (const s of additionalServices) claim(s.ports, s.name);
+    for (const s of supportServices) claim(s.ports, s.name);
+    if (dbInfo.hasDb && dbInfo.port) claim([dbInfo.port], 'database');
+  }
+
+  const rewrittenRuntimeEnv = [];
+  const rewriteLoopbackIn = (envObj, label) => {
+    if (!envObj) return;
+    for (const key of Object.keys(envObj)) {
+      const before = String(envObj[key]);
+      LOOPBACK_URL_REGEX.lastIndex = 0;
+      if (!LOOPBACK_URL_REGEX.test(before)) continue;
+      LOOPBACK_URL_REGEX.lastIndex = 0;
+      const after = before.replace(LOOPBACK_URL_REGEX, (match) => {
+        if (PUBLIC_CLIENT_ENV_PREFIX_REGEX.test(key)) return domain ? `https://${domain}` : match;
+        const port = (match.match(/:(\d+)$/) || [])[1];
+        const service = port ? loopbackServiceByPort.get(Number(port)) : null;
+        if (service) return `http://${service}:${port}`;
+        return match;
+      });
+      if (after !== before) {
+        envObj[key] = after;
+        rewrittenRuntimeEnv.push(`${label}.${key} (${before} -> ${after})`);
+      }
+    }
+  };
+
+  rewriteLoopbackIn(apiEnv, 'api');
+  rewriteLoopbackIn(frontendEnv, 'frontend');
+  for (const s of additionalServices) rewriteLoopbackIn(s.env, s.name);
+  for (const s of supportServices) rewriteLoopbackIn(s.env, s.name);
+  if (rewrittenRuntimeEnv.length > 0) {
+    console.log(`\x1b[34mINFO: These environment variables pointed at a loopback address, which inside a pod means the pod itself - they were rewritten: ${rewrittenRuntimeEnv.join(', ')}.\x1b[0m`);
+  }
+
   // A command argument can carry an unresolved reference just as an env value
   // can ("--requirepass ${REDIS_PASSWORD}"), and it would otherwise be set to
   // that literal string inside the container with nothing to say so.
@@ -2710,6 +2776,12 @@ AWS_REGION=${awsRegion}
     // free locals rather than through config.
     apiEnv,
     frontendEnv,
+    // The env var names each primary service's SOURCE actually reads. Kept so
+    // `flarops sync` can say which service a misplaced secret belongs to
+    // instead of only saying that it is misplaced - the two additional-service
+    // lists already carry this on their own entries.
+    apiUsedEnvVars: backendInfo.usedEnvVars || [],
+    frontendUsedEnvVars: frontendInfo.usedEnvVars || [],
     apiSecretKeys,
     frontendSecretKeys,
     apiExtraSecretEnvMappings,
@@ -3012,6 +3084,7 @@ appVersion: "1.0.0"
     ];
     const needed = [...infrastructureKeys, ...envKeysToPass.filter(Boolean)]
       .filter((key, i, all) => all.indexOf(key) === i);
+    const unmounted = unmountedSecretKeys(config);
     if (needed.length > 0) {
       console.log("");
       console.log(`\x1b[36mCreate these ${needed.length} GitHub repository secrets before the first deploy\x1b[0m`);
@@ -3024,6 +3097,10 @@ appVersion: "1.0.0"
         // to be given the same value or the services cannot authenticate.
         if (sameAs) console.log(`  ${key}  \x1b[33m<- give it the SAME value as ${sameAs[1]}\x1b[0m`);
         else if (infrastructureKeys.includes(key)) console.log(`  ${key}  \x1b[90m(infrastructure)\x1b[0m`);
+        // A key CI passes that nothing mounts reaches the cluster's Secret and
+        // no container - which looks from the outside exactly like the secret
+        // not working. Said here rather than discovered in the cluster.
+        else if (unmounted.includes(key)) console.log(`  ${key}  \x1b[33m<- no service reads this; declare it under a service's secretEnvs in flarops.yaml\x1b[0m`);
         else if (!value) console.log(`  ${key}  \x1b[33m<- no value found; you must supply one\x1b[0m`);
         else console.log(`  ${key}`);
       }

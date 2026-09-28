@@ -763,7 +763,7 @@ AWS_REGION=us-west-2
       "originalName": "user-service",
       "composeName": "user-service",
       "ports": [
-        80
+        3000
       ],
       "healthRoute": null,
       "healthPort": null,
@@ -796,7 +796,7 @@ AWS_REGION=us-west-2
       "originalName": "order-service",
       "composeName": "order-service",
       "ports": [
-        80
+        3002
       ],
       "healthRoute": null,
       "healthPort": null,
@@ -829,7 +829,7 @@ AWS_REGION=us-west-2
       "originalName": "gateway-service",
       "composeName": "gateway-service",
       "ports": [
-        80
+        3003
       ],
       "healthRoute": null,
       "healthPort": null,
@@ -860,6 +860,8 @@ AWS_REGION=us-west-2
   "supportServices": [],
   "apiEnv": {},
   "frontendEnv": {},
+  "apiUsedEnvVars": [],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [],
   "frontendSecretKeys": [],
   "apiExtraSecretEnvMappings": [],
@@ -1785,7 +1787,7 @@ additionalServices:
     secretKeys:
 
     ports:
-      - 80
+      - 3000
     replicas: 1
     healthRoute: null
     healthPort: null
@@ -1802,7 +1804,7 @@ additionalServices:
     secretKeys:
 
     ports:
-      - 80
+      - 3002
     replicas: 1
     healthRoute: null
     healthPort: null
@@ -1819,7 +1821,7 @@ additionalServices:
     secretKeys:
 
     ports:
-      - 80
+      - 3003
     replicas: 1
     healthRoute: null
     healthPort: null
@@ -2250,7 +2252,7 @@ user-service:
   context: user-service
   replicas: 1
   ports:
-    - 80
+    - 3000
   exposedRoutes:
     - /users
 
@@ -2259,7 +2261,7 @@ order-service:
   context: order-service
   replicas: 1
   ports:
-    - 80
+    - 3002
   exposedRoutes:
     - /orders
 
@@ -2268,7 +2270,7 @@ gateway-service:
   context: gateway-service
   replicas: 1
   ports:
-    - 80
+    - 3003
   exposedRoutes:
     - /api
 

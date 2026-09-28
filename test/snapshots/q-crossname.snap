@@ -862,7 +862,7 @@ AWS_REGION=us-west-2
       "originalName": "reporting",
       "composeName": "reporting",
       "ports": [
-        80
+        4100
       ],
       "healthRoute": null,
       "healthPort": null,
@@ -905,6 +905,10 @@ AWS_REGION=us-west-2
     "DB_PORT": "5432"
   },
   "frontendEnv": {},
+  "apiUsedEnvVars": [
+    "POSTGRES_PASSWORD"
+  ],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [
     "POSTGRES_PASSWORD"
   ],
@@ -2016,7 +2020,7 @@ additionalServices:
     secretKeys:
       - POSTGRES_PASSWORD
     ports:
-      - 80
+      - 4100
     replicas: 1
     healthRoute: null
     healthPort: null
@@ -2497,7 +2501,7 @@ reporting:
   context: reporting
   replicas: 1
   ports:
-    - 80
+    - 4100
   env:
     DB_HOST: database
     DB_PORT: "5432"

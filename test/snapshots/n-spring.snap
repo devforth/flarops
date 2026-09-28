@@ -847,6 +847,10 @@ AWS_REGION=us-west-2
     "DATABASE_PORT": "5432"
   },
   "frontendEnv": {},
+  "apiUsedEnvVars": [
+    "SPRING_DATASOURCE_URL"
+  ],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [
     "SPRING_DATASOURCE_PASSWORD"
   ],

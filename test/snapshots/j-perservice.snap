@@ -795,7 +795,7 @@ AWS_REGION=us-west-2
       "originalName": "auth-service",
       "composeName": "auth-service",
       "ports": [
-        80
+        4001
       ],
       "healthRoute": null,
       "healthPort": null,
@@ -843,7 +843,7 @@ AWS_REGION=us-west-2
       "originalName": "billing-service",
       "composeName": "billing-service",
       "ports": [
-        80
+        4002
       ],
       "healthRoute": null,
       "healthPort": null,
@@ -889,6 +889,8 @@ AWS_REGION=us-west-2
   "supportServices": [],
   "apiEnv": {},
   "frontendEnv": {},
+  "apiUsedEnvVars": [],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [],
   "frontendSecretKeys": [],
   "apiExtraSecretEnvMappings": [],
@@ -1963,7 +1965,7 @@ additionalServices:
     secretKeys:
       - AUTH_SERVICE_POSTGRES_PASSWORD
     ports:
-      - 80
+      - 4001
     replicas: 1
     healthRoute: null
     healthPort: null
@@ -1988,7 +1990,7 @@ additionalServices:
     secretKeys:
       - BILLING_SERVICE_POSTGRES_PASSWORD
     ports:
-      - 80
+      - 4002
     replicas: 1
     healthRoute: null
     healthPort: null
@@ -2438,7 +2440,7 @@ auth-service:
   context: auth-service
   replicas: 1
   ports:
-    - 80
+    - 4001
   secretEnvs:
     AUTH_SERVICE_POSTGRES_PASSWORD: AUTH_SERVICE_POSTGRES_PASSWORD
   exposedRoutes:
@@ -2457,7 +2459,7 @@ billing-service:
   context: billing-service
   replicas: 1
   ports:
-    - 80
+    - 4002
   secretEnvs:
     BILLING_SERVICE_POSTGRES_PASSWORD: BILLING_SERVICE_POSTGRES_PASSWORD
   exposedRoutes:

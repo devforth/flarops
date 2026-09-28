@@ -837,6 +837,11 @@ AWS_REGION=us-west-2
     "REDIS_HOST": "cache"
   },
   "frontendEnv": {},
+  "apiUsedEnvVars": [
+    "DB_PASSWORD",
+    "REDIS_PASSWORD"
+  ],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [
     "REDIS_PASSWORD"
   ],

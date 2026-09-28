@@ -92,6 +92,38 @@ function splitComposeServiceBlocks(content) {
   return blocks;
 }
 
+// The entries of a service's "ports:" declaration, whichever style it is
+// written in. Returns the raw strings ("5000:5000", "127.0.0.1:3000:3000",
+// "3000"), unquoted and without comments.
+function composePortEntries(serviceBlock) {
+  const lines = String(serviceBlock).split('\n');
+  const out = [];
+  let indent = null;
+  for (const line of lines) {
+    if (indent === null) {
+      const m = line.match(/^([ \t]*)ports:\s*(.*)$/);
+      if (!m) continue;
+      indent = m[1].length;
+      const inline = m[2].replace(/\s+#.*$/, '').trim();
+      if (inline.startsWith('[')) {
+        // Flow style: everything between the brackets, split on commas.
+        for (const part of inline.replace(/^\[|\]$/g, '').split(',')) {
+          const value = part.trim().replace(/^["']|["']$/g, '');
+          if (value) out.push(value);
+        }
+        break;
+      }
+      if (inline !== '') break; // something else entirely on the same line
+      continue;
+    }
+    if (line.trim() === '' || /^\s*#/.test(line)) continue;
+    if (line.match(/^([ \t]*)/)[1].length <= indent) break;
+    const item = line.trim().replace(/^-\s*/, '').replace(/\s+#.*$/, '').replace(/^["']|["']$/g, '');
+    if (item) out.push(item);
+  }
+  return out;
+}
+
 async function findPortsInCompose(baseDir, possibleServiceNames) {
   const composeFiles = listComposeFiles(baseDir);
   const ports = new Set();
@@ -102,11 +134,23 @@ async function findPortsInCompose(baseDir, possibleServiceNames) {
       for (const serviceName of possibleServiceNames) {
         const serviceBlock = serviceBlocks[serviceName];
         if (serviceBlock !== undefined) {
-          // Find port mappings like "80:80", "127.0.0.1:3000:3000"
-          const portRegex = /^\s*-\s*["']?(?:\d+\.\d+\.\d+\.\d+:)?\d+:(\d+)["']?/gm;
-          let portMatch;
-          while ((portMatch = portRegex.exec(serviceBlock)) !== null) {
-            ports.add(parseInt(portMatch[1], 10));
+          // Port mappings, in BOTH the styles compose accepts:
+          //
+          //   ports:                 ports: ["5000:5000", "9229:9229"]
+          //     - "5000:5000"
+          //
+          // Only the first was read, because the pattern required a line
+          // beginning with "-". The flow style is what a compact compose file
+          // uses, and a project writing it had its declared ports ignored
+          // entirely: the port then came from whatever the source happened to
+          // spell out, or from the 3000 fallback - so an app listening on 5000
+          // got an Ingress and a Service pointing at 3000.
+          for (const entry of composePortEntries(serviceBlock)) {
+            // "8080:80" publishes 80 in the container; "3000" is the container
+            // port itself; an IP prefix binds the host side and says nothing
+            // about the container.
+            const m = entry.match(/^(?:\d+\.\d+\.\d+\.\d+:)?(?:\d+:)?(\d+)(?:\/[a-z]+)?$/i);
+            if (m) ports.add(parseInt(m[1], 10));
           }
 
           // Services fronted by a reverse proxy (e.g. Traefik) often have no

@@ -700,7 +700,10 @@ Once you push to the `main` branch (or trigger it manually), the GitHub Actions 
 FROM node:20
 
 # ===== backend/index.js
-const express=require("express");const app=express();process.env.SECRET_TOKEN;process.env.APP_MODE;app.get("/items",(q,r)=>r.json([]));app.listen(3000)
+const express = require("express");
+const app = express();
+app.get("/api/items", (req, res) => res.json([]));
+app.listen(4400);
 
 # ===== backend/package.json
 {"name":"b","dependencies":{"express":"^4"}}
@@ -770,6 +773,8 @@ AWS_REGION=us-west-2
     "APP_MODE": "production"
   },
   "frontendEnv": {},
+  "apiUsedEnvVars": [],
+  "frontendUsedEnvVars": [],
   "apiSecretKeys": [
     "SECRET_TOKEN"
   ],
@@ -785,7 +790,7 @@ AWS_REGION=us-west-2
   "dbInitFiles": null,
   "hasDb": false,
   "apiPorts": [
-    3000
+    4400
   ],
   "frontendPorts": [
     80
@@ -802,7 +807,7 @@ AWS_REGION=us-west-2
   "dbUrlVars": [],
   "apiRoutes": [
     {
-      "path": "/items",
+      "path": "/api",
       "stripPrefix": false
     }
   ],
@@ -1460,11 +1465,11 @@ api:
   env:
     APP_MODE: "production"
 apiPorts:
-  - 3000
+  - 4400
 
 
 apiRoutes:
-  - path: "/items"
+  - path: "/api"
 
 # instanceType and volumeSize are deliberately NOT set here. They are declared
 # once, in deploy/terraform/variables.tf, and CI reads them back out of
@@ -1865,7 +1870,7 @@ services:
     backend:
         build: ./backend
         ports:
-            - "3000:3000"
+            - "4400:4400"
         environment:
             SECRET_TOKEN: s3cr3t
             APP_MODE: production
@@ -1876,13 +1881,13 @@ api:
   context: backend
   replicas: 1
   ports:
-    - 3000
+    - 4400
   env:
     APP_MODE: production
   secretEnvs:
     SECRET_TOKEN: SECRET_TOKEN
   exposedRoutes:
-    - /items
+    - /api
 
 # ============================================================================
 # This file is the source of truth for what gets deployed. Edit it, then run

@@ -11,16 +11,17 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'index.js');
 
+// spawnSync rather than execFileSync: both streams are needed on EVERY run,
+// not only on a failing one. sync reports what it could not wire on stderr
+// while still succeeding, and execFileSync discards stderr when the command
+// exits 0 - so an assertion about a warning silently had nothing to read.
 function runSync(dir) {
-  try {
-    return { status: 0, out: execFileSync('node', [CLI, 'sync'], { cwd: dir, stdio: 'pipe' }).toString() };
-  } catch (e) {
-    return { status: e.status, out: (e.stdout || Buffer.from('')).toString(), err: (e.stderr || Buffer.from('')).toString() };
-  }
+  const r = spawnSync('node', [CLI, 'sync'], { cwd: dir, encoding: 'utf8' });
+  return { status: r.status, out: r.stdout || '', err: r.stderr || '' };
 }
 
 const read = (dir, rel) => fs.readFileSync(path.join(dir, rel), 'utf8');
@@ -263,6 +264,54 @@ topic-setup:
     fs.writeFileSync(file, text
       .replace('    - path: "/a/b"\n      stripPrefix: true\n', '    - path: "/api"\n      stripPrefix: true\n')
       .replace('    - path: "/a-b"\n      stripPrefix: true', '    - "/click"'));
+    runSync(dir);
+  }
+
+  // 3f. A secret put under "database". A database image reads its password
+  // under one or more names of its own choosing, but all of them refer to the
+  // same Secret key - the chart has no generic secretKeys loop there. So a
+  // SECOND distinct key cannot be mounted: it reaches the cluster's Secret and
+  // no container, which from the outside is indistinguishable from the secret
+  // not working.
+  //
+  // It is reported, not refused. Refusing stopped an otherwise correct file
+  // over one misplaced line, and the same fault is already what the
+  // unmounted-keys check reports for every other service.
+  {
+    const file = path.join(dir, 'flarops.yaml');
+    const good = fs.readFileSync(file, 'utf8');
+    const at = good.indexOf('\ndatabase:\n');
+    check('the fixture has a database block', at !== -1);
+    if (at !== -1) {
+      const marker = '  secretEnvs:\n';
+      const secretsAt = good.indexOf(marker, at);
+      check('the database block declares a secret', secretsAt !== -1);
+      if (secretsAt !== -1) {
+        const insertAt = good.indexOf('\n', secretsAt + marker.length) + 1;
+
+        fs.writeFileSync(file, good.slice(0, insertAt) + '    JWT_SECRET: JWT_SECRET\n' + good.slice(insertAt));
+        r = runSync(dir);
+        check('a misplaced secret does not stop the sync', r.status === 0, r.err);
+        check('it is reported as reaching no container',
+          /no workload reads them/.test(r.err || '') && /JWT_SECRET/.test(r.err || ''), r.err);
+
+        // Two NAMES pointing at one key is not a mistake - it is what a mysql
+        // database with a non-root user legitimately needs, and what Flarops
+        // itself writes. Counting entries instead of distinct keys made the
+        // tool refuse its own generated file.
+        fs.writeFileSync(file, good);
+        runSync(dir);
+        const firstKey = (good.slice(secretsAt, insertAt).match(/:\s*(\S+)\s*$/m) || [])[1];
+        if (firstKey) {
+          fs.writeFileSync(file, good.slice(0, insertAt) + `    SECOND_NAME: ${firstKey}\n` + good.slice(insertAt));
+          r = runSync(dir);
+          check('a second NAME for the same key is accepted', r.status === 0, r.err);
+          check('and is not reported as unread',
+            !/no workload reads them/.test(r.err || ''), r.err);
+        }
+      }
+    }
+    fs.writeFileSync(file, good);
     runSync(dir);
   }
 
