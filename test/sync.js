@@ -221,6 +221,51 @@ topic-setup:
   check('the untransformed route stays on the main Ingress',
     /- path: \{\{ \$route\.path \}\}/.test(ingress), ingress.slice(0, 500));
 
+  // 3e. Two stripped routes whose slugs collide. Every run of
+  // non-alphanumerics becomes one dash, so "/a/b" and "/a-b" - both ordinary
+  // paths - used to produce the same Kubernetes object name. Two Middlewares
+  // with one name means the second replaces the first on apply and one route
+  // silently strips the other's prefix.
+  {
+    const file = path.join(dir, 'flarops.yaml');
+    const text = fs.readFileSync(file, 'utf8');
+    const marker = '\n  exposedRoutes:\n';
+    const at = text.indexOf(marker);
+    if (at !== -1) {
+      const head = text.slice(0, at + marker.length);
+      const rest = text.slice(at + marker.length);
+      const endRel = rest.search(/\n(?! *- |    )/);
+      const tail = endRel === -1 ? '' : rest.slice(endRel);
+      fs.writeFileSync(file, `${head}    - path: "/a/b"\n      stripPrefix: true\n    - path: "/a-b"\n      stripPrefix: true${tail}`);
+    }
+  }
+  r = runSync(dir);
+  check('sync accepts two colliding route slugs', r.status === 0, r.err);
+  {
+    const text = read(dir, 'deploy/helm/templates/01-ingress.yaml');
+    const objectNames = [...text.matchAll(/^  name: (\S+)$/gm)].map(m => m[1]);
+    check('colliding routes get distinct object names',
+      objectNames.length === new Set(objectNames).size, objectNames.join(', '));
+    // The readable name survives where nothing collides; only the colliding
+    // pair carries a hash.
+    check('a colliding name carries a hash of its own path',
+      objectNames.filter(n => /-strip-a-b-[0-9a-f]{6}(-ingress)?$/.test(n)).length === 4,
+      objectNames.join(', '));
+    // Each Ingress must point at the middleware it actually ships with.
+    for (const m of text.matchAll(/router\.middlewares: "\{\{ \.Release\.Namespace \}\}-([^@]+)@/g)) {
+      check(`middleware ${m[1]} is defined`, objectNames.includes(m[1]), objectNames.join(', '));
+    }
+  }
+  // Put the realistic route back for the checks that follow.
+  {
+    const file = path.join(dir, 'flarops.yaml');
+    const text = fs.readFileSync(file, 'utf8');
+    fs.writeFileSync(file, text
+      .replace('    - path: "/a/b"\n      stripPrefix: true\n', '    - path: "/api"\n      stripPrefix: true\n')
+      .replace('    - path: "/a-b"\n      stripPrefix: true', '    - "/click"'));
+    runSync(dir);
+  }
+
   // 4. The chart still renders with the hand-written service in it.
   if (helmRenders) {
     const err = helmRenders(dir);

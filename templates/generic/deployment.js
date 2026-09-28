@@ -1,4 +1,5 @@
 const { renderVolumes } = require('./volumes.js');
+const { secretRefs, urlEncodedRef, alreadyEmitted } = require('./env.js');
 
 // Percent-encodes a value that is spliced into a URL at GENERATION time. The
 // password cannot be done here - it is only a name until the container starts -
@@ -30,9 +31,7 @@ module.exports = (service) => {
   // as a mapping (DB_PASSWORD -> POSTGRES_PASSWORD) was emitted here a second
   // time under its own name, and the API server rejects the Deployment for
   // the duplicate.
-  const dbPasswordAlreadyEmitted =
-    (Array.isArray(service.secretKeys) && service.secretKeys.includes(service.dbPasswordKey)) ||
-    (service.extraSecretEnvMappings || []).some(m => m.envName === service.dbPasswordKey);
+  const dbPasswordAlreadyEmitted = alreadyEmitted(service.secretKeys, service.extraSecretEnvMappings, service.dbPasswordKey);
   const dbPasswordBlock = (service.dbPasswordKey && !dbPasswordAlreadyEmitted) ? `
             - name: ${service.dbPasswordKey}
               valueFrom:
@@ -72,12 +71,7 @@ module.exports = (service) => {
     // listed above it. Splicing the raw password is what produced "invalid
     // port number in database URL" when it held a ":" or a "/".
     if (db.passwordKey) {
-      ownDbUrlBlock += `
-            - name: ${db.passwordKey}_URLENCODED
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $.Values.projectName }}-secrets
-                  key: ${db.passwordKey}_URLENCODED`;
+      ownDbUrlBlock += urlEncodedRef(db.passwordKey);
     }
     for (const urlVar of service.dbUrlVars) {
       // A shared database has no single fixed name of its own - each
@@ -98,17 +92,7 @@ module.exports = (service) => {
   // keyed MONGO_INITDB_ROOT_PASSWORD) still needs that exact env var name in
   // its container - a secretKeyRef's container-side name and its key in the
   // Secret don't have to match.
-  let extraSecretEnvBlock = '';
-  if (Array.isArray(service.extraSecretEnvMappings)) {
-    for (const mapping of service.extraSecretEnvMappings) {
-      extraSecretEnvBlock += `
-            - name: ${mapping.envName}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $.Values.projectName }}-secrets
-                  key: ${mapping.secretKey}`;
-    }
-  }
+  const extraSecretEnvBlock = secretRefs(service.extraSecretEnvMappings);
 
   // The keys above are rendered straight into the manifest (their container-
   // side names differ from the Secret keys), so they are invisible to the

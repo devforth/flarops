@@ -1,19 +1,11 @@
 module.exports = (config) => {
+const { secretRefs, urlEncodedRef, alreadyEmitted } = require('../generic/env.js');
+
   // A shared credential (see tryWireSharedCredential in init.js) whose env
   // var name on the frontend doesn't match the canonical secret key it was
   // generated under - the container-side name and the Secret's own key are
   // independent, exactly like generic/deployment.js's extraSecretEnvMappings.
-  let extraSecretEnvBlock = '';
-  if (config && Array.isArray(config.frontendExtraSecretEnvMappings)) {
-    for (const mapping of config.frontendExtraSecretEnvMappings) {
-      extraSecretEnvBlock += `
-            - name: ${mapping.envName}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $.Values.projectName }}-secrets
-                  key: ${mapping.secretKey}`;
-    }
-  }
+  const extraSecretEnvBlock = secretRefs(config && config.frontendExtraSecretEnvMappings);
   const hasExtraSecretEnv = extraSecretEnvBlock.length > 0;
   // The keys above are rendered straight into the manifest (their container-
   // side names differ from the Secret keys), so they are invisible to the

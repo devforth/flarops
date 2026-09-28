@@ -15,17 +15,11 @@
 // fails on a conflict. The task must therefore be safe to run again, which is
 // the normal shape for this kind of work (`--if-not-exists`, an upsert, a
 // no-op on a store that is already seeded).
+const { secretRefs, urlEncodedRef, alreadyEmitted } = require('./env.js');
+
 
 module.exports = (service, { valuesRef }) => {
-  let extraSecretEnvBlock = '';
-  for (const mapping of service.extraSecretEnvMappings || []) {
-    extraSecretEnvBlock += `
-            - name: ${mapping.envName}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $.Values.projectName }}-secrets
-                  key: ${mapping.secretKey}`;
-  }
+  const extraSecretEnvBlock = secretRefs(service.extraSecretEnvMappings);
 
   const hasEnvBlock = `{{- if or $svc.env $svc.secretKeys ${extraSecretEnvBlock ? 'true' : 'false'} }}`;
 

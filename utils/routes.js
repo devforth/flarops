@@ -1,3 +1,5 @@
+const crypto = require('crypto');
+
 // An exposed route: the path the OUTSIDE world uses, plus what has to happen
 // to a request before the service behind it sees it.
 //
@@ -35,18 +37,53 @@ function normalizeRoutes(list) {
   return list.map(normalizeRoute).filter(Boolean);
 }
 
-// The path alone, for the places that only care where a request goes - route
-// ownership, conflict reporting, the gateway checks.
-function routePaths(list) {
-  return normalizeRoutes(list).map(r => r.path);
-}
-
-// A Kubernetes object name for the middleware that strips one prefix. Traefik
+// Kubernetes object names for the middlewares that strip a prefix. Traefik
 // applies middlewares per INGRESS, not per path, so each distinct prefix needs
 // its own middleware and its own Ingress carrying the annotation.
-function stripMiddlewareName(projectName, path) {
-  const slug = String(path).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
-  return `${projectName}-strip-${slug || 'root'}`;
+//
+// The name is a slug of the path, and a slug loses information: every run of
+// non-alphanumerics becomes one dash, so "/a/b" and "/a-b" - both perfectly
+// ordinary paths - produced the SAME name. Two Middleware objects with one
+// name means the second silently replaces the first on apply, and one of the
+// two routes then strips the other's prefix. Nothing says so.
+//
+// Names are therefore assigned for the whole set at once: a slug that is
+// unique keeps its readable name, and only a colliding one carries a short
+// hash of its full path. That way the common project reads as
+// "<project>-strip-api" in kubectl, and a name never changes because some
+// unrelated route was added elsewhere - the hash depends on the path alone.
+function stripMiddlewareNames(projectName, paths) {
+  const slugOf = (p) => String(p).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
+
+  const bySlug = new Map();
+  for (const p of paths) {
+    const slug = slugOf(p);
+    if (!bySlug.has(slug)) bySlug.set(slug, []);
+    bySlug.get(slug).push(p);
+  }
+
+  const names = new Map();
+  const taken = new Set();
+  for (const [slug, group] of bySlug) {
+    for (const p of group) {
+      const name = group.length === 1
+        ? `${projectName}-strip-${slug}`
+        : `${projectName}-strip-${slug}-${crypto.createHash('sha256').update(String(p)).digest('hex').slice(0, 6)}`;
+      // A path that still collides after the hash cannot be told apart at all.
+      // This should never happen; if it does, generating anyway would mean
+      // shipping the very ambiguity the hash exists to remove.
+      if (taken.has(name)) {
+        const other = [...names.keys()].find(k => names.get(k) === name);
+        throw new Error(
+          `Two exposed routes produce the same Kubernetes object name "${name}": ` +
+          `${other} and ${p}. Rename one of them in flarops.yaml.`
+        );
+      }
+      taken.add(name);
+      names.set(p, name);
+    }
+  }
+  return names;
 }
 
-module.exports = { normalizeRoute, normalizeRoutes, routePaths, stripMiddlewareName };
+module.exports = { normalizeRoute, normalizeRoutes, stripMiddlewareNames };

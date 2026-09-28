@@ -12,6 +12,8 @@ const { defaultUserFor, passwordKeyFor, defaultImageFor } = require('../../utils
 const { yamlEscapeDoubleQuoted, generateEnvString } = require('../../utils/yamlWrite.js');
 const { listComposeFiles, isVariantComposeFile, approveVariantComposeFile, composeBaseDir } = require('../../utils/composeFiles.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
+const { EnvFile } = require('../../utils/envFile.js');
+const { SecretWiring } = require('../../utils/secretWiring.js');
 const isYes = collectOperatorAnswers.isYes;
 const hclEscapeString = writeTerraform.hclEscapeString;
 
@@ -777,22 +779,21 @@ module.exports = async function init() {
   // secretKey is the canonical name this credential is stored and referenced
   // under everywhere: in deploy/.env, as a GitHub secret, and as the key
   // inside the project's Kubernetes Secret.
-  const sharedCredentialSecrets = new Map();
+  // Owns the canonical key per shared credential and who reads it under which
+  // name - see utils/secretWiring.js. The names below are aliases into it, so
+  // the reading code stays as it was while the collections have one owner.
+  const wiring = new SecretWiring();
+  const sharedCredentialSecrets = wiring.credentials;
   // Consumers discovered during the compose scan, before apiSecretKeys/
   // frontendSecretKeys exist yet (they are computed later from usedEnvVars,
   // which would never catch a name Spring's relaxed binding invents purely
   // by convention and never spells out anywhere in source).
-  const apiForcedSecretKeys = new Set();
-  const frontendForcedSecretKeys = new Set();
-  let apiExtraSecretEnvMappings = [];
-  let frontendExtraSecretEnvMappings = [];
+  const apiForcedSecretKeys = wiring.api.forcedKeys;
+  const frontendForcedSecretKeys = wiring.frontend.forcedKeys;
+  const apiExtraSecretEnvMappings = wiring.api.mappings;
+  const frontendExtraSecretEnvMappings = wiring.frontend.mappings;
 
-  function registerSharedCredential(varName, secretKeyName) {
-    if (sharedCredentialSecrets.has(varName)) return sharedCredentialSecrets.get(varName);
-    const entry = { secretKey: secretKeyName, value: crypto.randomBytes(16).toString('hex') };
-    sharedCredentialSecrets.set(varName, entry);
-    return entry;
-  }
+  const registerSharedCredential = (varName, secretKeyName) => wiring.registerCredential(varName, secretKeyName);
 
   // Runs once, before any service's environment is scanned - a consumer can
   // appear earlier in docker-compose.yml than the component whose credential
@@ -837,23 +838,9 @@ module.exports = async function init() {
     if (!bareVar || !sharedCredentialSecrets.has(bareVar)) return false;
     const { secretKey } = sharedCredentialSecrets.get(bareVar);
 
-    if (isBackend) {
-      if (key === secretKey) apiForcedSecretKeys.add(key);
-      else if (!apiExtraSecretEnvMappings.some(m => m.envName === key)) apiExtraSecretEnvMappings.push({ envName: key, secretKey });
-    }
-    if (isFrontend) {
-      if (key === secretKey) frontendForcedSecretKeys.add(key);
-      else if (!frontendExtraSecretEnvMappings.some(m => m.envName === key)) frontendExtraSecretEnvMappings.push({ envName: key, secretKey });
-    }
-    if (matchedAdditionalServices && matchedAdditionalServices.length > 0) {
-      for (const s of matchedAdditionalServices) {
-        if (key === secretKey) {
-          s.forcedSecretKeys.add(key);
-        } else {
-          if (!s.extraSecretEnvMappings.some(m => m.envName === key)) s.extraSecretEnvMappings.push({ envName: key, secretKey });
-        }
-      }
-    }
+    if (isBackend) wiring.wire(wiring.api, key, secretKey);
+    if (isFrontend) wiring.wire(wiring.frontend, key, secretKey);
+    for (const s of matchedAdditionalServices || []) wiring.wire(s, key, secretKey);
     return true;
   }
 
@@ -1560,9 +1547,11 @@ module.exports = async function init() {
       if (shared.secretKey !== finalDbPasswordKey) {
         console.log(`\x1b[34mINFO: the database password is the shared variable \${${'${bareVar}'}}, already wired as ${'${shared.secretKey}'} - using that key for the database too instead of a second secret named ${'${finalDbPasswordKey}'}.\x1b[0m`);
         if (finalDbPasswordKey && finalDbPasswordKey !== shared.secretKey) {
-          apiExtraSecretEnvMappings = apiExtraSecretEnvMappings
-            .filter(mp => mp.envName !== finalDbPasswordKey)
-            .concat([{ envName: finalDbPasswordKey, secretKey: shared.secretKey }]);
+          // In place: the list is owned by the wiring object now, and
+          // replacing the binding would leave that owner holding the old one.
+          const existing = apiExtraSecretEnvMappings.findIndex(mp => mp.envName === finalDbPasswordKey);
+          if (existing !== -1) apiExtraSecretEnvMappings.splice(existing, 1);
+          apiExtraSecretEnvMappings.push({ envName: finalDbPasswordKey, secretKey: shared.secretKey });
         }
         finalDbPasswordKey = shared.secretKey;
       }
@@ -1585,12 +1574,15 @@ module.exports = async function init() {
   // sensitive variables from project .env files", and this hash was extracted
   // from nothing - Flarops generates it. Filing it there told the operator
   // their repository contained a credential it never had.
+  const envFile = path.join(deployDir, '.env');
+  // Owns the file and the set of keys in it - see utils/envFile.js. Seeded
+  // from whatever a previous run left behind, so a re-run neither re-appends a
+  // key that is already there nor has to read the file back to find out.
+  const envIO = new EnvFile(fs, envFile);
+
   let dashboardEnvContent = '';
   {
-    // envFile is declared further down, so resolve the path directly here.
-    const deployEnvPath = path.join(deployDir, '.env');
-    const existingEnvForDashboard = fs.existsSync(deployEnvPath) ? fs.readFileSync(deployEnvPath, 'utf8') : '';
-    const alreadyProvisioned = /^DASHBOARD_PASSWORD_HASH=/m.test(existingEnvForDashboard);
+    const alreadyProvisioned = envIO.has('DASHBOARD_PASSWORD_HASH');
     if (!alreadyProvisioned) {
       // 18 random bytes -> 24 base64url characters, ~144 bits of entropy.
       dashboardPassword = crypto.randomBytes(18).toString('base64url');
@@ -1665,16 +1657,14 @@ REGISTRY_PASSWORD="${registryPassword}"
 SSH_PRIVATE_KEY="${privateKey}"
 `;
 
-  const envFile = path.join(deployDir, '.env');
-  if (!fs.existsSync(envFile)) {
-    fs.writeFileSync(envFile, envContent);
+  if (!envIO.exists()) {
+    envIO.write(envContent);
     console.log("Created deploy/.env");
   } else {
-    let existingEnv = fs.readFileSync(envFile, 'utf8');
     let appended = false;
 
-    if (finalDbPassword && !new RegExp('^' + escapeRegex(finalDbPasswordKey) + '=', 'm').test(existingEnv)) {
-      fs.appendFileSync(envFile, `\n${finalDbPasswordKey}="${finalDbPassword}"\n`);
+    if (finalDbPassword && !envIO.has(finalDbPasswordKey)) {
+      envIO.append(`\n${finalDbPasswordKey}="${finalDbPassword}"\n`);
       console.log(`Appended fallback ${finalDbPasswordKey} to deploy/.env`);
       appended = true;
     }
@@ -1686,8 +1676,8 @@ SSH_PRIVATE_KEY="${privateKey}"
     // nowhere: CI then set DASHBOARD_PASSWORD_HASH to empty, the dashboard
     // refused to start, and with it every PR capsule deploy that asks its
     // capacity oracle.
-    if (dashboardEnvContent && !/^DASHBOARD_PASSWORD_HASH=/m.test(existingEnv)) {
-      fs.appendFileSync(envFile, `\n# Generated by Flarops for the deployment dashboard - not taken from your project\n${dashboardEnvContent}`);
+    if (dashboardEnvContent && !envIO.has('DASHBOARD_PASSWORD_HASH')) {
+      envIO.append(`\n# --- Generated by Flarops for the deployment dashboard ----------------------\n${dashboardEnvContent}`);
       appended = true;
     }
 
@@ -1696,8 +1686,8 @@ SSH_PRIVATE_KEY="${privateKey}"
     for (const sLine of sensitiveLines) {
       if (sLine.trim()) {
         const key = sLine.split('=')[0];
-        if (!new RegExp('^' + escapeRegex(key) + '=', 'm').test(existingEnv)) {
-          fs.appendFileSync(envFile, `${sLine}\n`);
+        if (!envIO.has(key)) {
+          envIO.append(`${sLine}\n`);
           appended = true;
         }
       }
@@ -2099,8 +2089,7 @@ AWS_REGION=${awsRegion}
     // deploy/.env is the operator's list of what to put in GitHub Secrets, so
     // it has to carry the key too - with whatever value was discovered for it,
     // or empty when there is none to discover.
-    const existing = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
-    if (!new RegExp('^' + escapeRegex(key) + '=', 'm').test(existing)) {
+    if (!envIO.has(key)) {
       const known = sharedCredentialSecrets.get(key);
       const value = known ? known.value : (apiEnv[key] || frontendEnv[key] || '');
       // Under a heading of their own. Appended bare they landed under
@@ -2108,11 +2097,11 @@ AWS_REGION=${awsRegion}
       // deployment dashboard", so a database password read as a dashboard
       // credential.
       if (!lateSectionWritten) {
-        fs.appendFileSync(envFile, `\n# --- Required because a service in your stack reads them ---------------------\n# Values shown as \${OTHER_KEY} must be given the SAME value as that key.\n`);
+        envIO.append(`\n# --- Required because a service in your stack reads them ---------------------\n# Values shown as \${OTHER_KEY} must be given the SAME value as that key.\n`);
         lateSectionWritten = true;
       }
       lateSecretKeys.push(key);
-      fs.appendFileSync(envFile, `${key}="${String(value).replace(/"/g, '\\"')}"\n`);
+      envIO.append(`${key}="${String(value).replace(/"/g, '\\"')}"\n`);
     }
   };
 
@@ -2156,9 +2145,8 @@ AWS_REGION=${awsRegion}
     const passwordKey = `${serviceUpper}_${passwordKeyBase}`;
     const password = crypto.randomBytes(16).toString('hex');
 
-    const existingEnvContent = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
-    if (!new RegExp('^' + escapeRegex(passwordKey) + '=', 'm').test(existingEnvContent)) {
-      fs.appendFileSync(envFile, `\n${passwordKey}="${password}"\n`);
+    if (!envIO.has(passwordKey)) {
+      envIO.append(`\n${passwordKey}="${password}"\n`);
       console.log(`\x1b[34mINFO: Generated a database for additional service "${s.name}" (${serviceDb.dbType}) - password stored under ${passwordKey} in deploy/.env\x1b[0m`);
     }
     if (!envKeysToPass.includes(passwordKey)) envKeysToPass.push(passwordKey);
@@ -2221,14 +2209,7 @@ AWS_REGION=${awsRegion}
       const deadKeyIdx = envKeysToPass.indexOf('SPRING_DATASOURCE_PASSWORD');
       if (deadKeyIdx !== -1 && 'SPRING_DATASOURCE_PASSWORD' !== passwordKey) {
         envKeysToPass.splice(deadKeyIdx, 1);
-        try {
-          const currentEnvContent = fs.readFileSync(envFile, 'utf8');
-          const withoutDeadLine = currentEnvContent.replace(/^SPRING_DATASOURCE_PASSWORD=.*\n?/m, '');
-          if (withoutDeadLine !== currentEnvContent) {
-            fs.writeFileSync(envFile, withoutDeadLine);
-            fs.chmodSync(envFile, 0o600);
-          }
-        } catch (e) { /* deploy/.env not written yet or already clean */ }
+        envIO.removeKey('SPRING_DATASOURCE_PASSWORD');
         console.log(`\x1b[34mINFO: "SPRING_DATASOURCE_PASSWORD" was found in the project but Spring's relaxed environment-variable binding means the container never reads a secret under that exact name - it uses ${passwordKey} instead (wired automatically). Removed it from the required GitHub secrets and deploy/.env.\x1b[0m`);
       }
     } else {
@@ -2547,9 +2528,8 @@ AWS_REGION=${awsRegion}
             if (!parsed.secretKeys.includes(key)) parsed.secretKeys.push(key);
             // deploy/.env has already been written by this point, so append
             // the way the per-service database passwords above do.
-            const existing = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
-            if (!new RegExp('^' + escapeRegex(key) + '=', 'm').test(existing)) {
-              fs.appendFileSync(envFile, `${key}=${sanitizeEnvValue(rawVal, key)}\n`);
+            if (!envIO.has(key)) {
+              envIO.append(`${key}=${sanitizeEnvValue(rawVal, key)}\n`);
             }
             if (!envKeysToPass.includes(key)) envKeysToPass.push(key);
           } else {
@@ -3017,7 +2997,7 @@ appVersion: "1.0.0"
   // ends.
   {
     const placeholder = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
-    const finalEnv = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
+    const finalEnv = envIO.read();
     const valueOf = (key) => {
       const m = finalEnv.match(new RegExp('^' + escapeRegex(key) + '=(.*)$', 'm'));
       return m ? m[1].replace(/^["']|["']$/g, '') : '';

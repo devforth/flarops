@@ -1,4 +1,4 @@
-const { normalizeRoutes, stripMiddlewareName } = require('../utils/routes.js');
+const { normalizeRoutes, stripMiddlewareNames } = require('../utils/routes.js');
 
 module.exports = (config) => {
   // Traefik applies a middleware to an INGRESS, not to a path: the annotation
@@ -19,8 +19,12 @@ module.exports = (config) => {
     }
   }
 
+  // Assigned for the whole set at once, so a colliding slug can be told apart -
+  // see stripMiddlewareNames.
+  const names = stripMiddlewareNames(config.projectName, stripped.map(s => s.route.path));
+
   const stripObjects = stripped.map(({ route, service, portExpr }) => {
-    const name = stripMiddlewareName(config.projectName, route.path);
+    const name = names.get(route.path);
     return `
 ---
 apiVersion: traefik.io/v1alpha1

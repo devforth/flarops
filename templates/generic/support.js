@@ -8,6 +8,8 @@
 // after the compose service so every hostname the application already carries
 // resolves without rewriting anything.
 const { renderVolumes } = require('./volumes.js');
+const { secretRefs, urlEncodedRef, alreadyEmitted } = require('./env.js');
+
 
 module.exports = (service) => {
   const idx = `(index .Values.supportServices (index .Values.supportServicesIndices "${service.name}" | int))`;
@@ -20,17 +22,7 @@ module.exports = (service) => {
   // POSTGRES_PASSWORD. Rendered directly (not through values.yaml), the same
   // way generic/deployment.js does, since the mapping is fixed at generation
   // time, not something an operator would ever hand-edit per environment.
-  let extraSecretEnvBlock = '';
-  if (Array.isArray(service.extraSecretEnvMappings)) {
-    for (const mapping of service.extraSecretEnvMappings) {
-      extraSecretEnvBlock += `
-            - name: ${mapping.envName}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $.Values.projectName }}-secrets
-                  key: ${mapping.secretKey}`;
-    }
-  }
+  const extraSecretEnvBlock = secretRefs(service.extraSecretEnvMappings);
   const hasExtraSecretEnv = extraSecretEnvBlock.length > 0;
   // The keys above are rendered straight into the manifest (their container-
   // side names differ from the Secret keys), so they are invisible to the

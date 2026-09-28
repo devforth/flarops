@@ -1,19 +1,11 @@
+const { secretRefs, urlEncodedRef, alreadyEmitted } = require('../generic/env.js');
+
 module.exports = (config) => {
   // A shared credential whose env var name on the primary backend doesn't
   // match the canonical secret key it was generated under - the container-
   // side name and the Secret's own key are independent, exactly like
   // generic/deployment.js's extraSecretEnvMappings.
-  let extraSecretEnvBlock = '';
-  if (Array.isArray(config.apiExtraSecretEnvMappings)) {
-    for (const mapping of config.apiExtraSecretEnvMappings) {
-      extraSecretEnvBlock += `
-            - name: ${mapping.envName}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.projectName }}-secrets
-                  key: ${mapping.secretKey}`;
-    }
-  }
+  const extraSecretEnvBlock = secretRefs(config.apiExtraSecretEnvMappings, '.');
   const hasExtraSecretEnv = extraSecretEnvBlock.length > 0;
   // The keys above are rendered straight into the manifest (their container-
   // side names differ from the Secret keys), so they are invisible to the
@@ -53,12 +45,7 @@ module.exports = (config) => {
     // listed above it in the same container. Splicing the raw password here is
     // what produced "invalid port number in database URL" - see
     // flarops.urlencode in _helpers.tpl.
-    dbUrlEnvBlock += `
-            - name: ${config.dbPasswordKey}_URLENCODED
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.projectName }}-secrets
-                  key: ${config.dbPasswordKey}_URLENCODED`;
+    dbUrlEnvBlock += urlEncodedRef(config.dbPasswordKey, '.');
 
     for (const urlVar of config.dbUrlVars) {
       let query = urlVar.query || '';
@@ -97,9 +84,7 @@ module.exports = (config) => {
   // as a mapping (DB_PASSWORD -> POSTGRES_PASSWORD) was emitted here a second
   // time under its own name, and the API server rejects the Deployment for
   // the duplicate.
-  const dbPasswordAlreadyEmitted =
-    (Array.isArray(config.apiSecretKeys) && config.apiSecretKeys.includes(config.dbPasswordKey)) ||
-    (config.apiExtraSecretEnvMappings || []).some(m => m.envName === config.dbPasswordKey);
+  const dbPasswordAlreadyEmitted = alreadyEmitted(config.apiSecretKeys, config.apiExtraSecretEnvMappings, config.dbPasswordKey);
   const dbPasswordBlock = (hasDbPassword && !dbPasswordAlreadyEmitted) ? `
             - name: {{ "${config.dbPasswordKey}" }}
               valueFrom:
