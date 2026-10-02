@@ -1,12 +1,4 @@
-// The one place that decides which Helm templates a given config produces, and
-// with what content.
-//
-// `flarops init` and `flarops sync` both have to answer that question, and
-// they have to answer it identically: sync's whole contract is that a service
-// declared by hand in flarops.yaml comes out the same as one init discovered
-// itself, with only the values the author wrote differing from the defaults.
-// Two copies of this list would make that contract untestable the first time
-// one of them gained a template the other did not.
+// Which Helm templates a config produces. init and sync both render from here.
 
 const path = require('path');
 
@@ -27,24 +19,16 @@ const genericDatabaseTemplate = require('./generic/database.js');
 const supportServiceTemplate = require('./generic/support.js');
 const jobTemplate = require('./generic/job.js');
 
-// The Secret keys that a URL is built from, and which therefore need a
-// percent-encoded twin alongside them. Only these: a twin for every secret
-// would double the Secret for no reason and put a second copy of values that
-// are never spliced into a URL on disk.
+// Keys spliced into a URL get a percent-encoded twin in the Secret.
 function urlEncodedSecretKeys(config) {
   const keys = new Set();
   if (config.dbPasswordKey && (config.dbUrlVars || []).length > 0) keys.add(config.dbPasswordKey);
   for (const service of config.additionalServices || []) {
-    // The generic template splices service.db.passwordKey, not the service's
-    // own dbPasswordKey - they are different keys when a service talks to a
-    // database that is not its own.
     if (service.db && service.db.passwordKey && (service.dbUrlVars || []).length > 0) keys.add(service.db.passwordKey);
   }
   return [...keys];
 }
 
-// Returns [{ file, content }] for every template this config implies, with
-// `file` resolved under templatesDir.
 function renderChartTemplates(config, templatesDir) {
   const at = (name) => path.join(templatesDir, name);
   const files = [
@@ -62,9 +46,6 @@ function renderChartTemplates(config, templatesDir) {
     files.push({ file: at('frontend.yaml'), content: frontendServiceTemplate() + '\n---\n' + frontendDeploymentTemplate(config) });
   }
 
-  // A one-shot task gets a Job and nothing else: no Service (it has no
-  // endpoints), no probes, no Ingress. Which list it sits in still decides
-  // where its values live and whether werf builds it.
   const supportRef = (s) => `(index .Values.supportServices (index .Values.supportServicesIndices "${s.name}" | int))`;
   const additionalRef = (s) => `(index .Values.additionalServices (index .Values.additionalServicesIndices "${s.name}" | int))`;
 
@@ -79,8 +60,7 @@ function renderChartTemplates(config, templatesDir) {
       files.push({ file: at(`${s.name}.yaml`), content: jobTemplate(s, { valuesRef: additionalRef(s) }) });
       continue;
     }
-    // A workload that listens on nothing - a queue consumer, a scheduler - has
-    // no endpoints, so a Service for it would select pods and route nowhere.
+    // No ports, no Service.
     const hasPorts = (s.ports || []).length > 0;
     files.push({ file: at(`${s.name}.yaml`), content: (hasPorts ? genericServiceTemplate(s) + '\n---\n' : '') + genericDeploymentTemplate(s) });
     if (s.db && !s.db.shared) {

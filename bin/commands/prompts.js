@@ -1,23 +1,12 @@
-// Everything `flarops init` asks the operator, in one place.
-//
-// Extracted from init.js for one concrete reason: while these prompts sat in
-// the middle of the generation function, no part of init could run without a
-// TTY, an AWS account and a Docker daemon - so nothing about the generator was
-// testable, and every template change was verified by hand or not at all.
-// With the questions behind one call, test/harness.js stubs this and the whole
-// analysis and generation path runs for real.
-//
-// It returns a plain object and reads nothing from the caller's scope, so the
-// answers cannot be quietly mutated later in the generation.
+// Everything `flarops init` asks the operator, in one place (stubbed by test/harness.js).
 
 const path = require('path');
-// Every choice prompt in init is "[Y/n]": pressing Enter accepts. The one
-// exception lives in utils/awsHelper.js - reusing a bucket that already exists
-// is not something to agree to by reflex, so it stays "[y/N]" and Enter
-// declines.
-//
-// Written once because the four call sites each parsed the answer themselves,
-// and a default that is only right in three of them is worse than none.
+// Enter accepts. The one [y/N] prompt (reusing an existing state bucket) lives in utils/awsHelper.js.
+// At least two labels, each 1-63 letters, digits or hyphens, not starting or ending with a hyphen.
+function isDomain(value) {
+  return value.length <= 253 && /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(value);
+}
+
 function isYes(answer) {
   const a = String(answer == null ? '' : answer).trim().toLowerCase();
   return a === '' || a === 'y' || a === 'yes';
@@ -56,8 +45,14 @@ module.exports = async function collectOperatorAnswers({
     }
   }
 
-  const domainAnswer = await askQuestion('Enter project domain (press Enter to skip if you are not using one): ');
-  const domain = domainAnswer.trim();
+  // Required: the dashboard and every PR environment are addressed under it, and an empty one
+  // produced Ingress hosts ("dashboard.", "pr-1.") the API server rejects with the whole release.
+  let domain = '';
+  while (true) {
+    domain = (await askQuestion('Enter project domain (e.g. app.example.com): ')).trim().toLowerCase().replace(/\.$/, '');
+    if (isDomain(domain)) break;
+    console.log(domain ? `"${domain}" is not a domain name - expected something like app.example.com` : 'domain is required');
+  }
 
   let cloudflareApiToken = '';
   let cloudflareZoneId = '';
@@ -88,12 +83,6 @@ module.exports = async function collectOperatorAnswers({
     awsCredentials.secretKey = secretKeyInput.trim();
   }
 
-  // One answer, one region. This value used to be hardcoded in three places
-  // that disagreed: the CI workflows and the S3 state bucket said us-west-2
-  // while Terraform's own aws_region variable defaulted to eu-central-1, so
-  // the infrastructure ran in a different region from its own state and from
-  // whatever the CI session was configured for. Everything downstream reads
-  // this one value.
   const regionAnswer = await askQuestion('Enter AWS region (press Enter for us-west-2): ');
   const awsRegion = regionAnswer.trim() || 'us-west-2';
 
@@ -111,3 +100,4 @@ module.exports = async function collectOperatorAnswers({
 };
 
 module.exports.isYes = isYes;
+module.exports.isDomain = isDomain;

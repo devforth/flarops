@@ -1,23 +1,5 @@
-// `flarops sync` - apply flarops.yaml to the generated deployment.
-//
-// flarops.yaml is the declarative description of what this project deploys.
-// `flarops init` writes it once, from its own analysis of the repository, and
-// from then on it is the file a person edits: change a parameter and sync
-// carries that change into the chart, the values and the werf build; declare a
-// service that was never there and sync creates it, from the same templates
-// every discovered service is built from, with the defaults below standing in
-// for everything the author did not spell out.
-//
-// Sync is a MERGE, not a regeneration. deploy/.flarops-state.json holds what
-// init worked out by reading the repository - the DB URLs it rewrites into
-// each container, a detected migration step, init-SQL, whether a Dockerfile
-// needs the repo root as its build context. None of that belongs in a
-// hand-edited file, and none of it can be re-derived from one, so declared
-// values are laid over the discovered state rather than replacing it.
-//
-// Where the two disagree about something flarops.yaml does model, flarops.yaml
-// wins. That is what "source of truth" means, and it is why sync reports every
-// change it makes before writing anything.
+// `flarops sync`: apply flarops.yaml to the generated deployment. A merge over the state init
+// recorded (deploy/.flarops-state.json), not a regeneration; where they disagree, flarops.yaml wins.
 
 const fs = require('fs');
 const path = require('path');
@@ -34,9 +16,7 @@ const renderWerf = require('../../templates/werf.yaml.js');
 const renderDeployWorkflow = require('../../templates/deploy.yml.js');
 const renderPrCapsuleWorkflow = require('../../templates/pr-capsule.yml.js');
 
-// The constant values a newly declared service starts from, before anything
-// the author wrote in flarops.yaml is laid over them. A service created by
-// hand and one discovered by init differ only in these.
+// Defaults a newly declared service starts from before the author's values are laid over them.
 const SERVICE_DEFAULTS = Object.freeze({
   replicas: 1,
   ports: [80],
@@ -55,16 +35,11 @@ const SERVICE_DEFAULTS = Object.freeze({
   db: null,
 });
 
-// Services the chart gives their own templates to; every other key in
-// flarops.yaml is an ordinary service.
 const PRIMARY = new Set(['api', 'frontend', 'database']);
 
-// Templates present in every chart, whatever the project contains.
 const ALWAYS_PRESENT = new Set([
   '_helpers.tpl', '01-ingress.yaml', 'secret.yaml', 'registry-secret.yaml', 'dashboard.yaml',
 ]);
-
-// --- reading flarops.yaml --------------------------------------------------
 
 function declaredServices(text) {
   const doc = parse(text);
@@ -78,16 +53,11 @@ function declaredServices(text) {
     }
     out.set(name, { ...SERVICE_DEFAULTS, ...(body || {}) });
   }
-  // Before anything is applied: these values are pasted into file names,
-  // workflows and werf.yaml without escaping - see utils/flaropsValidate.js.
   validateDeclarations(out);
   return out;
 }
 
-// flarops.yaml states a secret as "container env name: Secret key", which is
-// how they actually relate. The chart wants them split by whether the two
-// names happen to coincide: the generic secretKeys loop handles the ones that
-// do, and only the rest need an explicit mapping.
+// secretEnvs is "env name: Secret key"; the chart splits same-name keys from renamed ones.
 function splitSecretEnvs(secretEnvs) {
   const secretKeys = [];
   const extraSecretEnvMappings = [];
@@ -98,12 +68,6 @@ function splitSecretEnvs(secretEnvs) {
   return { secretKeys, extraSecretEnvMappings };
 }
 
-// "KEY=value" as docker and compose spell build args, back into a map.
-//
-// The field is `buildArgs`. It used to be `args`, which collided with
-// Kubernetes' own `args` - the container's command line - so a reader could
-// not tell from the name whether a value applied at build time or at run
-// time. Files written before the rename still say `args`, and are still read.
 function parseBuildArgs(args) {
   if (!Array.isArray(args) || args.length === 0) return null;
   const out = {};
@@ -116,9 +80,6 @@ function parseBuildArgs(args) {
   return out;
 }
 
-// flarops.yaml states a volume as "name / path / size", which is how a person
-// thinks about one. The chart's own shape calls the path `target`, because it
-// came from docker-compose's "source:target" mounts.
 function parseVolumes(volumes) {
   const out = [];
   for (const v of asList(volumes)) {
@@ -133,7 +94,7 @@ function parseVolumes(volumes) {
   return out;
 }
 
-// Accepts the old spelling so a file written before the rename keeps working.
+// `args` is the old spelling of `buildArgs`.
 function buildArgsOf(decl) {
   const declared = decl.buildArgs;
   if (Array.isArray(declared) && declared.length > 0) return declared;
@@ -145,17 +106,9 @@ function asList(value) {
   return Array.isArray(value) ? value : [value];
 }
 
-// --- applying a declaration to the discovered state ------------------------
-
-// Records every field it actually changes, so sync can say what it did rather
-// than rewriting files and leaving the operator to diff them.
 function makeRecorder(changes) {
-  // "absent" and "empty" are the same thing to every consumer of this state,
-  // and reporting "volumes: none -> none" for each of ten services buries the
-  // one line that says what actually changed.
+  // "absent" and "empty" are the same to every consumer; do not report them as a change.
   const normalize = (v) => {
-    // A flag that is off is the same as a flag that was never written, so
-    // "oneShot: none -> false" is not a change anyone needs to read.
     if (v === undefined || v === null || v === false) return null;
     if (Array.isArray(v)) return v.length === 0 ? null : v;
     if (typeof v === 'object' && Object.keys(v).length === 0) return null;
@@ -202,44 +155,13 @@ function applyDatabase(config, decl, set) {
   if (decl.port) set(config, 'dbPort', Number(decl.port), 'database.port');
   if (decl.user) set(config, 'dbUser', String(decl.user), 'database.user');
   if (decl.name) set(config, 'dbName', String(decl.name), 'database.name');
-  // The database container takes its password under a name its IMAGE dictates
-  // (POSTGRES_PASSWORD, MONGO_INITDB_ROOT_PASSWORD, ...), and every one of
-  // those names points at the same Secret key - so the chart needs the key,
-  // not the names.
-  //
-  // It has no generic secretKeys loop, which means a key added here that is
-  // NOT that password cannot be mounted anywhere. Until now the extra entries
-  // were dropped in silence while still being collected into the list CI
-  // passes: the key reached the cluster's Secret and no container, which from
-  // the outside is indistinguishable from the secret not working.
-  // A database image takes its password under one or more names of its own
-  // choosing - mysql with a non-root user reads MYSQL_ROOT_PASSWORD *and*
-  // MYSQL_PASSWORD - but every one of them refers to the SAME Secret key. The
-  // chart has no generic secretKeys loop here, so a SECOND key cannot be
-  // mounted: it would be collected into the list CI passes, reach the
-  // cluster's Secret, and reach no container.
-  //
-  // The constraint is therefore one distinct KEY, not one entry. Counting
-  // entries instead rejected Flarops' own output, which writes two names for
-  // exactly that mysql case.
-  // A database image takes its password under one or more names of its own
-  // choosing - mysql with a non-root user reads MYSQL_ROOT_PASSWORD *and*
-  // MYSQL_PASSWORD - but every one of them refers to the SAME Secret key, and
-  // that key is all the chart needs.
-  //
-  // A SECOND distinct key here cannot be mounted: the database template has no
-  // generic secretKeys loop, so it would reach the cluster's Secret and no
-  // container. That is not refused, though - it is the same fault the
-  // unmounted-keys check reports for every service, and refusing here would
-  // stop an otherwise correct file over one misplaced line. The warning names
-  // the key and which service reads it; the rest of the file still applies.
+  // Every env name a database image reads its password under points at one Secret key, which is
+  // all the chart needs. A second distinct key cannot be mounted; unmountedSecretKeys reports it.
   const distinctKeys = [...new Set(Object.values(decl.secretEnvs || {}).map(String))];
   if (distinctKeys.length > 0) set(config, 'dbPasswordKey', distinctKeys[0], 'database.secretEnvs');
   set(config, 'hasDb', true, 'database present');
 }
 
-// A service the state has never seen. It gets the full ServiceEntry shape so
-// nothing downstream has to ask whether this one was declared or discovered.
 function newService(name, decl) {
   return makeServiceEntry({
     name,
@@ -267,8 +189,6 @@ function applyService(service, decl, set, label) {
   set(service, 'extraSecretEnvMappings', extraSecretEnvMappings, `${label}.secretEnvs (renamed)`);
   set(service, 'exposedRoutes', normalizeRoutes(asList(decl.exposedRoutes)), `${label}.exposedRoutes`);
   set(service, 'volumes', parseVolumes(decl.volumes), `${label}.volumes`);
-  // A one-shot task has no Service object, so there is nothing for an Ingress
-  // rule to point at. Saying so beats generating a route to nowhere.
   if (decl.oneShot && asList(decl.exposedRoutes).length > 0) {
     throw new YamlError(`"${label}" is oneShot, so it has no Service and cannot own exposedRoutes`);
   }
@@ -291,19 +211,7 @@ function applyService(service, decl, set, label) {
   }
 }
 
-// The recorded state predates flarops.yaml's vocabulary in two places, and
-// without reconciling them a sync that changes nothing would still report - and
-// write - changes, which makes every real change impossible to see.
-//
-//  * Replica counts were a constant in the values template, so the state has no
-//    field for them. Absent means the default, which is what SERVICE_DEFAULTS
-//    already says.
-//  * The database password reaches a container through its own dedicated block,
-//    not through secretKeys. flarops.yaml has no such distinction - it states
-//    every secret the same way - so reading it back turns that key into an
-//    ordinary secretKey. The rendered manifest is identical either way (the
-//    template suppresses its block when the name is already emitted), but the
-//    state would drift a little further from the chart on every run.
+// Older state has no replica counts; absent means the default, or every sync would report changes.
 function normalizeState(config) {
   config.apiReplicas = config.apiReplicas || SERVICE_DEFAULTS.replicas;
   config.frontendReplicas = config.frontendReplicas || SERVICE_DEFAULTS.replicas;
@@ -313,25 +221,13 @@ function normalizeState(config) {
   }
 }
 
-// Drops the keys that have a dedicated block of their own, so they are not
-// also emitted through the generic loop.
 function withoutDedicatedKeys(secretKeys, ...dedicated) {
   const owned = new Set(dedicated.filter(Boolean));
   return secretKeys.filter(k => !owned.has(k));
 }
 
-// Which GitHub Secrets CI has to pass, derived from what flarops.yaml declares.
-//
-// The Secret the chart mounts is built from .Values.env, which CI fills from
-// the SECRET_ENV_* lines in the workflows, which come from this list. A key
-// declared in flarops.yaml but missing here is a secretKeyRef pointing at
-// something that will never exist, and the pod sits in
-// CreateContainerConfigError - the deployment looks generated and cannot
-// start. Recomputing it is therefore part of applying the file, not an extra.
-//
-// DASHBOARD_PASSWORD_HASH is Flarops' own and is never declared, so it is kept
-// unconditionally; dropping it leaves the dashboard unable to start, and with
-// it every PR capsule that asks its capacity oracle.
+// The GitHub Secrets CI must pass, derived from flarops.yaml. A declared key missing here is a
+// secretKeyRef to nothing. DASHBOARD_PASSWORD_HASH is Flarops' own and always passed.
 const ALWAYS_PASSED = ['DASHBOARD_PASSWORD_HASH'];
 
 function secretKeysFor(declared, config) {
@@ -345,8 +241,7 @@ function secretKeysFor(declared, config) {
   add(config.dbPasswordKey);
   for (const key of ALWAYS_PASSED) add(key);
 
-  // Keys still needed keep the order they already had, so re-running sync
-  // without changing anything produces no diff in the workflows.
+  // Keep the existing order so an unchanged sync produces no diff in the workflows.
   const previous = config.envKeysToPass || [];
   const kept = previous.filter(k => keys.includes(k));
   return [...kept, ...keys.filter(k => !kept.includes(k))];
@@ -365,9 +260,6 @@ function applyDeclarations(state, declared) {
     if (name === 'api' || name === 'frontend') { applyPrimary(config, name, decl, set); continue; }
     if (name === 'database') { applyDatabase(config, decl, set); continue; }
 
-    // A service this repository BUILDS declares a dockerfile; one it only
-    // pulls declares an image. That is the same distinction docker-compose
-    // draws, and the one the template comment in flarops.yaml documents.
     const isBuilt = !!decl.dockerfile;
     const list = isBuilt ? (config.additionalServices ||= []) : (config.supportServices ||= []);
     (isBuilt ? seenAdditional : seenSupport).add(name);
@@ -381,9 +273,7 @@ function applyDeclarations(state, declared) {
     applyService(service, decl, set, name);
   }
 
-  // A service removed from flarops.yaml is removed from the deployment - that
-  // is the only way the file can express a deletion, and leaving the workload
-  // running would make the file a description of something else.
+  // A service removed from flarops.yaml is removed from the deployment.
   for (const key of ['additionalServices', 'supportServices']) {
     const seen = key === 'additionalServices' ? seenAdditional : seenSupport;
     const before = config[key] || [];
@@ -393,7 +283,6 @@ function applyDeclarations(state, declared) {
     }
     config[key] = after;
   }
-  // Recomputed last, from everything the declarations turned out to need.
   const secretKeys = secretKeysFor(declared, config);
   const before = config.envKeysToPass || [];
   const added = secretKeys.filter(k => !before.includes(k));
@@ -411,16 +300,10 @@ function applyDeclarations(state, declared) {
   return { config, changes };
 }
 
-// --- writing ---------------------------------------------------------------
-
-// Every template the config implies, by filename.
 function expectedTemplateNames(config, templatesDir) {
   return new Set(renderChartTemplates(config, templatesDir).map(t => path.basename(t.file)));
 }
 
-// Exported so `init` can warn about orphans without removing anything. Built
-// from the SAME renderer that writes them, so a template that stops being
-// generated is recognised as stale without this list being updated too.
 function findOrphanTemplates(currentDir) {
   const templatesDir = path.join(currentDir, 'deploy', 'helm', 'templates');
   if (!fs.existsSync(templatesDir)) return null;
@@ -482,10 +365,6 @@ module.exports = async function sync() {
     process.exit(1);
   }
 
-  // A declaration can be well-formed YAML and still describe something that
-  // cannot be built - a volume with no path, a task that owns routes, a
-  // database asked to carry a secret it has no way to read. Those refusals
-  // read as an error message, not as a stack trace.
   let config, changes;
   try {
     ({ config, changes } = applyDeclarations(state, declared));
@@ -497,10 +376,7 @@ module.exports = async function sync() {
     throw e;
   }
 
-  // Checked BEFORE the no-change shortcut. A deployment can match flarops.yaml
-  // exactly and still be wrong in this one way, and that is the state nobody
-  // finds: sync says "nothing to do" while a key sits in the cluster's Secret
-  // that no container reads.
+  // Checked before the no-change shortcut: a deployment can match flarops.yaml and still mount nothing for a key.
   const unmounted = unmountedSecretKeys(config);
   if (unmounted.length > 0) {
     console.warn(`\x1b[33mWARNING: CI passes these Secret keys but no workload reads them: ${unmounted.join(', ')}. They reach the cluster's Secret and no container - which looks exactly like the secret not working. Declare each under the secretEnvs of the service that needs it in flarops.yaml and run sync again, or remove it if nothing needs it.\x1b[0m`);
@@ -518,17 +394,11 @@ module.exports = async function sync() {
   }
   console.log('');
 
-  // Render first, write second: a template that throws must not leave the
-  // chart half-updated.
+  // Render everything first, so a template that throws leaves nothing half-written.
   const context = { hasLocalhostWarnings: false };
   const valuesYaml = renderValues(config, context);
   const templates = renderChartTemplates(config, templatesDir);
   const werfYaml = renderWerf(config);
-  // The workflows are re-rendered, not patched: they carry the SECRET_ENV_*
-  // list, and every fact they need beyond it - registry, domain, region,
-  // Cloudflare - is in the recorded state, so the same emitters init used can
-  // produce them again. Patching just the secret lines would have left two
-  // ways of writing a workflow to drift apart.
   const workflows = [
     { file: path.join(currentDir, '.github', 'workflows', 'deploy.yml'), content: renderDeployWorkflow(config) },
     { file: path.join(currentDir, '.github', 'workflows', 'pr-capsule.yml'), content: renderPrCapsuleWorkflow(config) },
@@ -552,12 +422,6 @@ module.exports = async function sync() {
     console.log(`Removed ${orphans.length} template(s) for services flarops.yaml no longer declares: ${orphans.join(', ')}`);
   }
 
-  // A secret the chart now mounts has to be something CI actually puts in the
-  // Secret, and CI only passes what the workflow names. The workflows were
-  // re-rendered above, so this only fires when they could not be written
-  // (no .github/workflows directory) or were edited by hand since - and then
-  // it says plainly what is missing rather than leaving a chart that cannot
-  // start.
   const needed = new Set();
   for (const decl of declared.values()) {
     for (const key of Object.values(decl.secretEnvs || {})) needed.add(String(key));
@@ -571,7 +435,6 @@ module.exports = async function sync() {
       console.warn(`\x1b[33mWARNING: these Secret keys are now referenced by the chart but not passed by .github/workflows/deploy.yml: ${missing.join(', ')}. Add a "SECRET_ENV_<KEY>: \${{ secrets.<KEY> }}" line for each under the deploy step's env:, and add the secret to the repository - without it those pods stay in CreateContainerConfigError.\x1b[0m`);
     }
   }
-
 
   if (context.hasLocalhostWarnings) {
     console.warn('\x1b[33mWARNING: some values still point at localhost, which inside a cluster reaches the pod itself. Change them to the service name in flarops.yaml.\x1b[0m');

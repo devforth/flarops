@@ -1,16 +1,5 @@
-// What flarops.yaml may contain, checked before `flarops sync` applies any of it.
-//
-// Every value in the file ends up pasted into something else: a service name
-// becomes a FILE NAME under deploy/helm/templates and a Kubernetes object name,
-// a secret key becomes a line in both GitHub workflows, a context becomes a
-// path in werf.yaml. None of those writers escape - they were written for what
-// init produces, which is already well-formed. A hand-edited file is not, and
-// nothing stood between the two: a service named "../../../.github/workflows/x"
-// wrote a file into .github/workflows, and a secret key holding "\n" added
-// lines of its own to deploy.yml.
-//
-// So the shapes are enforced here, once, with a message naming the field -
-// rather than escaped in each of the places a value can reach.
+// Validates flarops.yaml before sync applies it: these values are pasted unescaped into file
+// names, workflows and werf.yaml.
 
 const path = require('path');
 const { YamlError } = require('./yamlLite.js');
@@ -77,7 +66,6 @@ function checkRoutes(where, routes) {
   });
 }
 
-// A path inside the repository: relative, and not climbing out of it.
 function checkRepoPath(where, value) {
   if (value === null || value === undefined) return;
   const text = String(value);
@@ -109,16 +97,13 @@ function checkBuildArgs(where, args) {
 function checkVolumes(where, volumes) {
   asList(volumes).forEach((v, i) => {
     if (!v || typeof v !== 'object') return; // shape errors are reported by the parser in sync
-    // Turned into a claim name by claimNameFor (templates/generic/volumes.js),
-    // so compose spellings like "postgres_data" are fine - only what could
-    // break the line it is written on is refused.
+    // claimNameFor sanitizes the name; refuse only what would break the line.
     if (v.name !== undefined && !VOLUME_NAME.test(String(v.name))) fail(`${where}[${i}].name`, 'must be letters, digits, "-", "_" or "."');
     if (v.path !== undefined && !URL_PATH.test(String(v.path))) fail(`${where}[${i}].path`, 'must be an absolute path inside the container');
     if (v.size !== undefined && !QUANTITY.test(String(v.size))) fail(`${where}[${i}].size`, `must be a size such as 5Gi, not ${JSON.stringify(v.size)}`);
   });
 }
 
-// Fields every service block can carry.
 function checkCommon(name, decl) {
   checkReplicas(`${name}.replicas`, decl.replicas);
   checkPorts(`${name}.ports`, decl.ports);
@@ -150,7 +135,6 @@ function checkDatabase(where, db) {
   checkSecretEnvs(`${where}.secretEnvs`, db.secretEnvs);
 }
 
-// Throws YamlError on the first value that cannot be applied safely.
 function validateDeclarations(declared) {
   for (const [name, decl] of declared) {
     if (!PRIMARY.has(name)) {

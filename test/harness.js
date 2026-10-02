@@ -1,10 +1,5 @@
-// Runs `flarops init` non-interactively against a copy of a fixture.
-//
-// init is one 3000-line function that prompts, shells out to docker and talks
-// to AWS, so nothing in it could be exercised without a TTY and credentials -
-// which is why every template change until now was verified by hand, or not at
-// all. This stubs exactly three things (the prompts, the AWS helper, and the
-// docker binary) and leaves the entire analysis and generation path real.
+// Runs `flarops init` non-interactively against a copy of a fixture: prompts, the AWS helper and
+// `docker` are stubbed, everything else is real.
 
 const path = require('path');
 const fs = require('fs');
@@ -14,8 +9,6 @@ const child_process = require('child_process');
 
 const REPO = path.resolve(__dirname, '..');
 
-// Matched against the prompt text, first hit wins. Refactor prompts answer "n"
-// so a fixture's source is never rewritten under the test.
 const ANSWERS = {
   'docker registry': '',
   'username for': 'testuser',
@@ -36,8 +29,6 @@ function installStubs(extraAnswers) {
   readline.createInterface = () => ({
     question(q, cb) {
       let answer = '';
-      // A per-run override, so a test can answer one question differently
-      // without every fixture inheriting that answer.
       for (const [needle, value] of Object.entries({ ...ANSWERS, ...(extraAnswers || {}) })) {
         if (q.includes(needle)) { answer = value; break; }
       }
@@ -58,7 +49,6 @@ function installStubs(extraAnswers) {
     }),
   };
 
-  // `docker login` is the only binary init runs that needs a daemon.
   const realExecFile = child_process.execFileSync;
   child_process.execFileSync = function (file, args, opts) {
     if (String(file) === 'docker') return Buffer.from('');
@@ -66,29 +56,20 @@ function installStubs(extraAnswers) {
   };
 }
 
-// Copies a fixture to a scratch directory, makes it a git repo (init requires
-// one) and runs the generator in it. Returns { dir, log, ok }.
 async function generate(fixtureDir, extraAnswers) {
-  // The working directory's BASENAME becomes projectName, which appears in the
-  // chart, the workflows and the state bucket name - so a random mkdtemp name
-  // would make every generated file differ between runs and snapshots
-  // worthless. The random part goes in the parent directory instead.
+  // The directory's basename becomes projectName, so it must be stable for snapshots.
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-test-'));
   const work = path.join(parent, path.basename(fixtureDir));
   fs.cpSync(fixtureDir, work, { recursive: true });
   child_process.execFileSync('git', ['init', '-q'], { cwd: work });
-  // A real project keeps .env and .env.local out of git, and init treats
-  // whatever IS committed as public (see untrustedSecretValueReason). Without
-  // this every fixture's .env would read as a committed one. A fixture that
-  // means to test a committed env file uses another name (.env.production).
+  // .env and .env.local stay out of git, as in a real project: init treats committed values as public.
   fs.appendFileSync(path.join(work, '.git', 'info', 'exclude'), '.env\n.env.local\n');
   child_process.execFileSync('git', ['add', '-A'], { cwd: work, stdio: 'ignore' });
   child_process.execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'fixture'],
     { cwd: work, stdio: 'ignore' });
 
   installStubs(extraAnswers);
-  // Module-level state in the generator that would otherwise carry from one
-  // generation to the next.
+  // Reset module-level state between generations.
   require(path.join(REPO, 'utils/composeFiles.js')).approveVariantComposeFile(null);
 
   const lines = [];

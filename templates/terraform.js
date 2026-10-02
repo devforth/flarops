@@ -1,19 +1,9 @@
 // Generates deploy/terraform/{main.tf,variables.tf}.
-//
-// Extracted from init.js because it is genuinely separable: it reads nine
-// values from the operator's answers and writes two files, and nothing later
-// in the generation reads anything it produces. It was 447 lines sitting in
-// the middle of a 3000-line function, which is the single largest reason that
-// function is hard to follow.
 
 const fs = require('fs');
 const path = require('path');
 
-// Escapes a value for safe interpolation inside a double-quoted HCL string literal.
-// Escapes a value for safe interpolation inside a double-quoted HCL string
-// literal. Values here come from the operator's answers and from the scanned
-// repository, so they can legally contain a quote, a backslash, or HCL's own
-// "${" and "%{" interpolation markers.
+// Escapes a value for a double-quoted HCL string, including HCL's own ${ and %{.
 function hclEscapeString(s) {
   return String(s)
     .replace(/\\/g, '\\\\')
@@ -24,66 +14,21 @@ function hclEscapeString(s) {
     .replace(/%\{/g, '%%{');
 }
 
-// writeTerraform is deliberately given writeFileIfNotExists rather than
-// importing it: whether a file is preserved across re-runs is a policy the
-// caller owns, not this module.
 module.exports = function writeTerraform({
   projectName, domain, publicKey, awsRegion, remoteStateBucket, terraformDir,
   cloudflareApiToken, cloudflareZoneId, writeFileIfNotExists,
 }) {
 
-
-  // The head of both bootstrap scripts, shared verbatim by the server and the
-  // workers. Four spaces of indent, because it is pasted inside a Terraform
-  // <<-EOF whose body sits at that column.
-  const bootstrapPreamble = `    # Everything this script prints goes to one file. Until now the only trace
-    # a failed bootstrap left behind was /var/log/cloud-init-output.log, which
-    # nothing ever fetched - so a node that failed to install k3s looked
-    # exactly like one still working on it, from every angle CI could see.
-    # The deploy workflow prints this log back into the job output when its
-    # wait gives up.
-    #
-    # Deliberately no "set -x": this log is published into a CI job, and
-    # xtrace would put the cluster join token in it.
-    exec > >(tee -a /var/log/flarops-bootstrap.log) 2>&1
+  // The head of both bootstrap scripts. Indented four spaces: it sits inside a <<-EOF heredoc.
+  const bootstrapPreamble = `    exec > >(tee -a /var/log/flarops-bootstrap.log) 2>&1
     set -Eeuo pipefail
 
     mkdir -p /var/lib/flarops
-    # The sentinel CI polls for. Without it "k3s is not up yet" and "k3s will
-    # never be up" are the same observation from outside, so a bootstrap that
-    # died in its first ten seconds was still only reported a quarter of an
-    # hour later, after the full timeout had been sat out.
     trap 'echo "flarops: bootstrap FAILED at line $LINENO"' ERR
-    # The sentinel is written from the EXIT trap, not the ERR one. An explicit
-    # "exit 1" - the installer download giving up after its last retry - is not
-    # a failed command, so ERR never fires for it, and the node would sit there
-    # broken with no sentinel while CI waited out the whole timeout.
     trap 'flarops_rc=$?; if [ "$flarops_rc" != 0 ]; then touch /var/lib/flarops/bootstrap-failed; fi' EXIT
 `;
 
-  // Fetch the k3s installer. See the comments inside for why this is neither a
-  // pipe nor a single source.
-  const installerDownload = `    # Downloaded to a file and then run, rather than piped straight into sh.
-    # "curl -sfL https://get.k3s.io | ... sh -" swallowed every failure it had:
-    # on a network error or an HTTP 5xx, curl exits non-zero having written
-    # nothing, the sh on the right of the pipe reads an empty script and exits
-    # 0, and the pipeline's status is sh's. cloud-init then reported success on
-    # an instance with no k3s on it, and nothing anywhere recorded an error.
-    #
-    # Two sources, tried in order, and the pinned one comes first on purpose.
-    # raw.githubusercontent.com serves the installer exactly as it shipped with
-    # var.k3s_version, while get.k3s.io always serves master's copy, which can
-    # drift from the version it is being asked to install. It also removes a
-    # dependency rather than adding one: the installer downloads the k3s binary
-    # itself from github.com either way, so a node that cannot reach GitHub
-    # cannot be built at all - whereas get.k3s.io is a separate service that
-    # fails on its own. On 2026-09-29 it answered every request with Cloudflare
-    # error 1101, and every node built during that window got no k3s.
-    #
-    # The retries cover the transient case on top of that: DNS and the default
-    # route are seconds old when this runs, and there is no second chance -
-    # user_data executes on first boot only.
-    K3S_INSTALLER_URLS="https://raw.githubusercontent.com/k3s-io/k3s/\${var.k3s_version}/install.sh https://get.k3s.io"
+  const installerDownload = `    K3S_INSTALLER_URLS="https://raw.githubusercontent.com/k3s-io/k3s/\${var.k3s_version}/install.sh https://get.k3s.io"
 
     downloaded=""
     for attempt in $(seq 1 5); do
@@ -115,11 +60,6 @@ provider "cloudflare" {
     bucket = "${remoteStateBucket}"
     key    = "terraform.tfstate"
     region = "${awsRegion}"
-    # The state file contains the k3s join token and the deploy public key in
-    # clear text, so it is encrypted at rest. use_lockfile is S3-native state
-    # locking (Terraform 1.10+): without any lock, the three places that run
-    # "terraform apply" - a push to main, a PR capsule scaling up, and one
-    # scaling down - could interleave and corrupt the state.
     encrypt      = true
     use_lockfile = true
   }
@@ -228,7 +168,7 @@ resource "aws_security_group" "sg" {
 
 data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["099720109477"] # Canonical
+  owners      = ["099720109477"]
 
   filter {
     name   = "name"
@@ -252,14 +192,6 @@ resource "aws_instance" "server" {
     volume_type = "gp3"
   }
 
-  # The instance metadata service hands out whatever is in user_data - which
-  # includes the k3s join token. With IMDSv1 any process that can make an
-  # outbound HTTP request could read it, so an SSRF in an application pod was
-  # enough to take over the cluster. Requiring a session token (IMDSv2) blocks
-  # the plain-GET SSRF shape, and a hop limit of 1 means the response never
-  # survives the extra network hop out of a container - only the host itself
-  # can reach it. Nothing in user_data queries the metadata service any more,
-  # so requiring tokens costs nothing.
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
@@ -278,18 +210,11 @@ ${bootstrapPreamble}
 
 ${installerDownload}
     echo "flarops: installing k3s server \${var.k3s_version}"
-    # The join token travels in K3S_TOKEN rather than in "--token" inside
-    # INSTALL_K3S_EXEC so that it is never part of a command line: this log is
-    # printed back into the CI job output when a bootstrap fails, and an
-    # argument list would put a cluster-admin credential in it.
     INSTALL_K3S_VERSION="\${var.k3s_version}" \\
       K3S_TOKEN="\${random_password.k3s_token.result}" \\
       INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --tls-san \${aws_eip.eip.public_ip}" \\
       sh /tmp/k3s-install.sh
 
-    # The installer exits once the systemd unit exists, so its own success says
-    # nothing about the cluster being up. CI treats /etc/rancher/k3s/k3s.yaml
-    # as "ready to receive a deploy", and this loop is what makes that true.
     for attempt in $(seq 1 60); do
       if [ -f /etc/rancher/k3s/k3s.yaml ]; then break; fi
       sleep 5
@@ -306,25 +231,13 @@ ${installerDownload}
   }
 
   lifecycle {
-    # user_data is ignored for the same reason as ami: cloud-init runs it only
-    # on FIRST boot, so a change to it (bumping var.k3s_version, rotating the
-    # deploy key) cannot take effect on a running instance - it only stops and
-    # starts it, taking the cluster down for nothing. Applying a new k3s
-    # version means replacing the node deliberately, not letting a plan do it
-    # as a side effect: the whole cluster, including every local-path volume
-    # holding the database, lives on this instance's root EBS.
+    # Changes to the AMI or to user_data reach only new instances; replace this
+    # one deliberately (terraform apply -replace=...) to apply them here. The
+    # cluster's data lives on its root volume.
     ignore_changes = [ami, user_data]
   }
 }
 
-# The Elastic IP is allocated BEFORE the server so its address can be baked
-# into the API server certificate via --tls-san above. When the EIP was
-# instead declared with "instance = aws_instance.server.id", k3s booted first
-# and could only see the temporary auto-assigned public IP; the EIP attached
-# afterwards, and every later "terraform output public_ip" returned an address
-# the certificate did not cover, so kubectl failed with
-# "x509: certificate is valid for <old-ip>". Association is a separate
-# resource purely to keep the dependency pointing this way.
 resource "aws_eip" "eip" {
   domain = "vpc"
 }
@@ -346,14 +259,6 @@ resource "aws_instance" "worker" {
     volume_type = "gp3"
   }
 
-  # The instance metadata service hands out whatever is in user_data - which
-  # includes the k3s join token. With IMDSv1 any process that can make an
-  # outbound HTTP request could read it, so an SSRF in an application pod was
-  # enough to take over the cluster. Requiring a session token (IMDSv2) blocks
-  # the plain-GET SSRF shape, and a hop limit of 1 means the response never
-  # survives the extra network hop out of a container - only the host itself
-  # can reach it. Nothing in user_data queries the metadata service any more,
-  # so requiring tokens costs nothing.
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
@@ -381,10 +286,6 @@ ${installerDownload}
       INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" \\
       sh /tmp/k3s-install.sh
 
-    # A worker has no kubeconfig to wait for, and the agent retries the join on
-    # its own for as long as it takes - so the service being up is the most
-    # this script can honestly assert. Whether the node actually joined is
-    # checked from CI with "kubectl wait node", against the server.
     for attempt in $(seq 1 60); do
       if systemctl is-active --quiet k3s-agent; then break; fi
       sleep 5
@@ -402,13 +303,9 @@ ${installerDownload}
   }
 
   lifecycle {
-    # user_data is ignored for the same reason as ami: cloud-init runs it only
-    # on FIRST boot, so a change to it (bumping var.k3s_version, rotating the
-    # deploy key) cannot take effect on a running instance - it only stops and
-    # starts it, taking the cluster down for nothing. Applying a new k3s
-    # version means replacing the node deliberately, not letting a plan do it
-    # as a side effect: the whole cluster, including every local-path volume
-    # holding the database, lives on this instance's root EBS.
+    # Changes to the AMI or to user_data reach only new instances; replace this
+    # one deliberately (terraform apply -replace=...) to apply them here. The
+    # cluster's data lives on its root volume.
     ignore_changes = [ami, user_data]
   }
 }
@@ -439,26 +336,11 @@ output "public_ip" {
   value = aws_eip.eip.public_ip
 }
 
-# The instance shape is declared once, in variables.tf, and read back out
-# here. CI feeds these outputs into the Helm values (see deploy.yml), which is
-# what the dashboard prices the fleet against - so changing the instance type
-# means editing exactly one line in variables.tf, not three files that can
-# silently disagree about what is actually running.
-# The slots currently provisioned. CI reads this instead of counting lines in
-# "terraform state list", so scaling decisions are made against a real value
-# Terraform itself reports rather than a grep over its output.
-# Node names are derived from this, so CI must read it rather than rebuild it
-# from the project name - they are only equal until someone edits the variable.
 output "instance_name" {
   value = var.instance_name
 }
 
 output "worker_slots" {
-  # Numbers, not strings. Terraform's sort() only takes a list of strings and
-  # gives strings back, so sorting the numbers directly emitted ["1","3"] -
-  # and the CI arithmetic that picks the next free slot then compared integers
-  # against strings, found every slot "free", and handed back a number that
-  # collided with a running worker.
   value = [for s in sort([for x in var.worker_slots : tostring(x)]) : tonumber(s)]
 }
 
@@ -505,16 +387,8 @@ variable "instance_name" {
   default     = "${projectName}-instance"
 }
 
-# Workers are addressed by SLOT, not by position in a list.
-#
-# With "count", Terraform identifies an instance by its index, so removing a
-# node in the middle renumbers every node above it - and reducing the count
-# destroys the highest index, whichever node that happens to be. Reclaiming an
-# idle worker while a busier one sits above it was therefore impossible, and
-# the PR-capsule teardown could only ever peel nodes off the top.
-#
-# A set of slot numbers makes each worker independently addressable:
-# dropping 2 from [1,2,3] destroys exactly worker 2 and leaves 1 and 3 alone.
+# Worker nodes, by slot number. The PR-capsule workflow adds and removes them;
+# there is no need to edit this by hand.
 variable "worker_slots" {
   description = "Slot numbers of the worker nodes to run, e.g. [1,3]. Each slot is one instance, addressable independently of the others."
   type        = set(number)
@@ -527,11 +401,8 @@ variable "instance_type" {
   default     = "t3a.medium"
 }
 
-# Pinned on purpose. "curl https://get.k3s.io | sh" without a version installs
-# whatever is current the moment each node boots, so a fleet grown over weeks
-# ends up running different Kubernetes versions, and a compromise of the
-# install endpoint would land on every node that has yet to be created. Change
-# it here and nowhere else - both the server and the agents read this.
+# Read by the server and every worker. A change applies to NEW nodes only -
+# replace an existing one (terraform apply -replace=...) to upgrade it.
 variable "k3s_version" {
   description = "k3s version installed on every node (see https://github.com/k3s-io/k3s/releases)"
   type        = string
@@ -565,13 +436,7 @@ variable "domain" {
   const variablesTfExisted = fs.existsSync(variablesTfFile) && fs.readFileSync(variablesTfFile, 'utf8').trim() !== '';
   writeFileIfNotExists(variablesTfFile, variablesTfContent, "Created deploy/terraform/variables.tf", "deploy/terraform/variables.tf already exists");
 
-  // variables.tf is deliberately preserved across re-runs so hand-tuned
-  // instance_type/volume_size/aws_region survive - but "domain" is not a
-  // tuning knob, it's the answer to a prompt this run just asked again.
-  // Leaving the old value behind while values.yaml and both workflows get
-  // the new one splits the stack in half: the Ingress serves the new host
-  // while Cloudflare's DNS record still points the old one at the cluster,
-  // which surfaces only as a 404 from an otherwise healthy deployment.
+  // variables.tf is preserved across re-runs, but the domain follows the latest answer.
   if (variablesTfExisted) {
     try {
       const existing = fs.readFileSync(variablesTfFile, 'utf8');

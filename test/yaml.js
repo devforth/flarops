@@ -1,9 +1,4 @@
 // Checks for the flarops.yaml reader.
-//
-// Every case here is a shape a person or an agent actually writes. The file is
-// the one piece of generated output that gets hand-edited, so the reader's job
-// is to agree with any other YAML tool on what it accepts, and to refuse the
-// rest with a line number rather than returning something plausible.
 
 const { parse, YamlError } = require('../utils/yamlLite');
 
@@ -19,16 +14,11 @@ const CASES = [
   ['a trailing comment is not part of the value', 'a: text # why\n', { a: 'text' }],
   ['a # inside quotes is', 'a: "c#1"\n', { a: 'c#1' }],
 
-  // Flow collections: what an agent writes without thinking about it, and what
-  // every docker-compose file is full of.
   ['flow sequence', 'command: ["node", "server.js"]\n', { command: ['node', 'server.js'] }],
   ['empty flow sequence', 'a: []\n', { a: [] }],
   ['flow mapping', 'a: {x: 1, y: two}\n', { a: { x: 1, y: 'two' } }],
   ['a comma inside quotes does not split', 'a: ["x,y", "z"]\n', { a: ['x,y', 'z'] }],
 
-  // Anchors. Before these were supported, "env: *shared" with nothing indented
-  // under it parsed as the STRING "*shared" and produced one environment
-  // variable per character of it.
   ['an anchor on a block, reused by an alias',
     'a:\n  env: &shared\n    X: "1"\nb:\n  env: *shared\n',
     { a: { env: { X: '1' } }, b: { env: { X: '1' } } }],
@@ -61,7 +51,6 @@ function run(check) {
     try { parse(text); } catch (e) { error = e; }
     check(`refuses ${name}`, error instanceof YamlError && pattern.test(error.message),
       error ? error.message : 'no error was raised');
-    // A refusal nobody can act on is barely better than a wrong answer.
     if (error instanceof YamlError && !/multiple documents/.test(name)) {
       check(`the refusal of ${name} names a line`, /line \d+/.test(error.message), error.message);
     }

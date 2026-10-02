@@ -16,10 +16,7 @@ import (
 //go:embed static/*
 var content embed.FS
 
-// A WebSocket handshake is exempt from the same-origin policy, so accepting
-// every Origin meant any page an authenticated operator happened to visit
-// could open this socket with their cookies attached and stream the entire
-// cluster state back to its author. See originIsSameHost in auth.go.
+// Only same-host origins (see originIsSameHost).
 var upgrader = websocket.Upgrader{
 	CheckOrigin: originIsSameHost,
 }
@@ -27,10 +24,7 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	conn *websocket.Conn
 	send chan []byte
-	// The session this socket was opened with. requireAuth only runs on the
-	// handshake, so without re-checking it a token used once yielded an
-	// unbounded feed of the entire cluster state that logging out could not
-	// revoke - destroySession deletes the row, and the socket kept streaming.
+	// Re-checked per frame: requireAuth only runs on the handshake.
 	sessionToken string
 }
 
@@ -61,9 +55,6 @@ func (h *Hub) run() {
 			}
 		case message := <-h.broadcast:
 			for client := range h.clients {
-				// Checked on every frame rather than only at the handshake, so
-				// a logout or an expired session closes the stream within one
-				// collection interval instead of never.
 				if !sessionIsValid(client.sessionToken) {
 					close(client.send)
 					delete(h.clients, client)
@@ -93,8 +84,6 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	}
 	hub.register <- client
 
-	// Bound what a client can send and how long it may sit idle. Neither was
-	// limited before, so a socket neither aged out nor capped its input.
 	conn.SetReadLimit(4 << 10)
 	_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	conn.SetPongHandler(func(string) error {
@@ -149,10 +138,7 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// The same binary ships as the DaemonSet that reports node disk usage.
-	// It shares nothing with the dashboard: no database, no Kubernetes client,
-	// no ServiceAccount token. See nodeagent.go for why that separation is the
-	// point rather than an economy.
+	// The same binary is the node-agent DaemonSet, which shares nothing with the dashboard.
 	if os.Getenv("FLAROPS_NODE_AGENT") == "1" {
 		runNodeAgent()
 		return
@@ -167,9 +153,7 @@ func main() {
 	}
 	startSampleRetention()
 
-	// Loaded before anything starts listening, and fatal on failure: a
-	// dashboard that cannot authenticate must not come up at all rather than
-	// come up open. See loadAuthConfig in auth.go.
+	// Fatal on failure: never come up unauthenticated.
 	authCfg, err := loadAuthConfig()
 	if err != nil {
 		log.Fatal("auth: ", err)
@@ -181,9 +165,6 @@ func main() {
 	startSessionPurge()
 	startLimiterCleanup()
 
-	// Fetch pricing data in the background instead of blocking startup on it -
-	// a hung or slow third-party endpoint (instances.vantage.sh) must not delay
-	// the k8s client, websocket hub, or HTTP server from coming up.
 	go startPriceFetcher()
 
 	k8sClient, err := NewK8sClient()
@@ -194,9 +175,7 @@ func main() {
 	go hub.run()
 	go startCollector(k8sClient)
 
-	// Loopback only, and never behind the Ingress: reachable solely from
-	// inside this pod, which is what "kubectl exec" gives the CI job. See
-	// capacity.go.
+	// Loopback only; CI reaches it with kubectl exec.
 	startCapacityServer()
 
 	staticFS, err := fs.Sub(content, "static")
@@ -206,16 +185,10 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// The only two routes reachable without a session. Both are rendered from
-	// templates with a per-response CSP nonce, so neither depends on
-	// 'unsafe-inline'.
 	mux.Handle("/login", securityHeaders(http.HandlerFunc(handleLogin), nil))
 	mux.Handle("/logout", securityHeaders(http.HandlerFunc(handleLogout), nil))
 
-	// Everything else - the dashboard itself and the live metrics socket -
-	// goes through requireAuth. Registering the guard on "/" rather than on
-	// individual assets means a route added later is authenticated by
-	// default instead of accidentally public.
+	// Guard on "/" so a route added later is authenticated by default.
 	app := http.NewServeMux()
 	app.HandleFunc("/ws", serveWs)
 	app.Handle("/", http.FileServer(http.FS(staticFS)))
@@ -229,10 +202,7 @@ func main() {
 	server := &http.Server{
 		Addr:    ":" + port,
 		Handler: mux,
-		// gorilla/websocket hijacks the connection on upgrade, so once /ws is
-		// streaming these server-level timeouts no longer apply to it (net/http
-		// stops managing deadlines on a hijacked connection) - they only guard
-		// the plain static-file responses and the upgrade handshake itself.
+		// These do not apply to a hijacked WebSocket connection.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

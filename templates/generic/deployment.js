@@ -2,36 +2,17 @@ const { renderVolumes } = require('./volumes.js');
 const { secretRefs, urlEncodedRef, alreadyEmitted } = require('./env.js');
 const { dbUrlScheme } = require('../../utils/dbDefaults.js');
 
-// Percent-encodes a value that is spliced into a URL at GENERATION time. The
-// password cannot be done here - it is only a name until the container starts -
-// and is handled by flarops.urlencode in the chart instead.
+// Encodes values known at generation time; the password is encoded in the Secret (flarops.urlencode).
 const urlComponent = (value) => encodeURIComponent(String(value === undefined || value === null ? '' : value));
 
 module.exports = (service) => {
-  // A service this repository builds could not ask for storage at all - not in
-  // the chart and not in flarops.yaml - while a support service pulled from a
-  // registry could. Nothing about being built from source makes a workload
-  // stateless.
   const { pvcs, volumeMounts, volumes } = renderVolumes(service, { mountIndent: 12, volumeIndent: 8 });
-  // A pod holding a ReadWriteOnce claim must be gone before its replacement
-  // can bind the same volume, so the default rolling update deadlocks: the new
-  // pod waits for a volume the old one still holds.
+  // A ReadWriteOnce claim deadlocks a rolling update: Recreate.
   const strategyBlock = volumes ? `
   strategy:
     type: Recreate` : '';
 
-  // Same pitfall as api/deployment.js: when this service's own source code
-  // reads the DB password under a name that also independently qualifies as
-  // "sensitive" (so it's already in service.secretKeys), adding this block
-  // unconditionally on top would emit that env var name twice in the same
-  // container - which Kubernetes' server-side apply rejects outright.
-  // "Already emitted" means under this container-side NAME, by any of the
-  // mechanisms that write into the same env list - the generic secretKeys
-  // loop, or an explicit mapping whose envName happens to be this one. The
-  // check used to look at secretKeys alone, so a shared credential recorded
-  // as a mapping (DB_PASSWORD -> POSTGRES_PASSWORD) was emitted here a second
-  // time under its own name, and the API server rejects the Deployment for
-  // the duplicate.
+  // Skip the DB password block when the same env name is already emitted - duplicates are rejected.
   const dbPasswordAlreadyEmitted = alreadyEmitted(service.secretKeys, service.extraSecretEnvMappings, service.dbPasswordKey);
   const dbPasswordBlock = (service.dbPasswordKey && !dbPasswordAlreadyEmitted) ? `
             - name: ${service.dbPasswordKey}
@@ -40,10 +21,6 @@ module.exports = (service) => {
                   name: {{ $.Values.projectName }}-secrets
                   key: ${service.dbPasswordKey}` : '';
 
-  // Spring Boot binds SPRING_DATASOURCE_PASSWORD automatically (relaxed env
-  // var binding) - this service's own database (see analyzeDatabase /
-  // analyzeServiceDatabaseFromCompose in init.js), which is entirely separate
-  // from the project's shared primary database above.
   const springDatasourcePasswordBlock = service.springDatasourcePasswordSecretKey ? `
             - name: SPRING_DATASOURCE_PASSWORD
               valueFrom:
@@ -51,54 +28,29 @@ module.exports = (service) => {
                   name: {{ $.Values.projectName }}-secrets
                   key: ${service.springDatasourcePasswordSecretKey}` : '';
 
-  // Generic (non-Spring) fallback: a hardcoded connection string in this
-  // service's own source was rewritten (refactorBackendDbUrl) to read from
-  // an env var - wire that var to this service's own database, using the
-  // K8s $(VAR) interpolation trick to pull in the password secret defined
-  // just above without ever putting it in plain text.
   let ownDbUrlBlock = '';
   if (service.db && Array.isArray(service.dbUrlVars) && service.dbUrlVars.length > 0) {
     const db = service.db;
-    // A distinct database gets its own dedicated StatefulSet, reached at
-    // "<service>-db" (see templates/generic/database.js); a database shared
-    // with the project's primary backend is the existing "database" Service.
     const dbHost = db.shared ? 'database' : `${service.name}-db`;
     let scheme = 'postgres';
     if (db.type === 'mysql' || db.type === 'mariadb') scheme = 'mysql';
     else if (db.type === 'mongodb') scheme = 'mongodb';
     const authSuffix = scheme === 'mongodb' ? '?authSource=admin' : '';
-    // The percent-encoded twin of the password, declared BEFORE the URLs that
-    // splice it in: Kubernetes expands "$(VAR)" only against variables already
-    // listed above it. Splicing the raw password is what produced "invalid
-    // port number in database URL" when it held a ":" or a "/".
+    // The encoded twin must come before the URLs: $(VAR) expands only against earlier entries.
     if (db.passwordKey) {
       ownDbUrlBlock += urlEncodedRef(db.passwordKey);
     }
     for (const urlVar of service.dbUrlVars) {
-      // A shared database has no single fixed name of its own - each
-      // service using it declared its own db name in docker-compose (see the
-      // compose environment: scan in init.js), captured per-var here.
       const dbName = urlVar.dbName || db.name;
-      // The user and database name are known here, at generation time, so
-      // they are encoded here by the same rule the chart applies to the
-      // password.
       ownDbUrlBlock += `
             - name: ${urlVar.key}
               value: "${dbUrlScheme(db.type, urlVar.scheme)}://${urlComponent(db.user)}:$(${db.passwordKey}_URLENCODED)@${dbHost}:${db.port}/${urlComponent(dbName)}${authSuffix}"`;
     }
   }
 
-  // A service whose own code reads the DB password under a name that doesn't
-  // match the shared secret's key (e.g. it expects DB_PASS, but the secret is
-  // keyed MONGO_INITDB_ROOT_PASSWORD) still needs that exact env var name in
-  // its container - a secretKeyRef's container-side name and its key in the
-  // Secret don't have to match.
   const extraSecretEnvBlock = secretRefs(service.extraSecretEnvMappings);
 
-  // The keys above are rendered straight into the manifest (their container-
-  // side names differ from the Secret keys), so they are invisible to the
-  // secretKeys list the checksum otherwise reads - name them explicitly or a
-  // rotation of one of them would not roll this pod.
+  // Keys rendered directly must be named for the checksum, or rotating them would not roll the pod.
   const extraKeyList = [
     ...(service.extraSecretEnvMappings || []).map(m => m.secretKey),
     service.dbPasswordKey,
@@ -128,12 +80,6 @@ spec:
     spec:
       automountServiceAccountToken: false
 {{- if $.Values.dataNodeSelector }}
-      # The whole capsule sits on the node its placement chose, not only its
-      # database. Left to the scheduler, a capsule's stateless pods spread over
-      # every node with room, so closing one pull request freed no node at all:
-      # each still carried another capsule's api or worker, and the teardown
-      # that reclaims idle workers never found one idle. Production leaves this
-      # empty and is not pinned.
       nodeSelector:
 {{ toYaml $.Values.dataNodeSelector | indent 8 }}
 {{- end }}
@@ -175,27 +121,12 @@ spec:
 {{- end }}
 {{- end }}${dbPasswordBlock}${springDatasourcePasswordBlock}${ownDbUrlBlock}${extraSecretEnvBlock}
 {{- end }}
-          # No resource requests or limits are set here on purpose. A generated
-          # figure is a guess about someone else's workload, and the two ways it
-          # can be wrong are both bad: too low and the pod is OOM-killed or
-          # throttled under load, too high and the scheduler reserves capacity
-          # nothing uses, which is exactly the capacity the capsule placement
-          # maths is trying to account for. Set them per service in
-          # deploy/helm/values.yaml when the real numbers are known.
 {{- if $serviceObj.healthRoute }}
-          # A startup probe covers the (often long) boot of a JVM/runtime
-          # without forcing the liveness probe to be slack for the whole life
-          # of the pod: liveness only begins once startup has succeeded, so a
-          # slow start no longer reads as a crash, and a real hang is still
-          # caught quickly afterwards.
           startupProbe:
             httpGet:
               path: {{ $serviceObj.healthRoute }}
               port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
             periodSeconds: 10
-            # A JVM answering its first probes while still warming up regularly
-            # needs more than the 1s default, and a probe that times out counts
-            # as a failure exactly like a 404 would.
             timeoutSeconds: 5
             failureThreshold: 30
           livenessProbe:

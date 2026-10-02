@@ -1,11 +1,7 @@
 const { normalizeRoutes, stripMiddlewareNames } = require('../utils/routes.js');
 
 module.exports = (config) => {
-  // Traefik applies a middleware to an INGRESS, not to a path: the annotation
-  // names middlewares for every router the object generates. A route that
-  // strips its prefix therefore needs an Ingress of its own, carrying only
-  // that route and only that annotation - which is also why each distinct
-  // prefix gets its own Middleware rather than one shared object.
+  // Traefik applies middlewares per Ingress, so each stripped prefix gets its own Middleware and Ingress.
   const stripped = [];
   for (const route of normalizeRoutes(config.apiRoutes)) {
     if (route.stripPrefix) stripped.push({ route, service: 'api', portExpr: '{{ index .Values.apiPorts 0 | default 3000 }}' });
@@ -19,8 +15,6 @@ module.exports = (config) => {
     }
   }
 
-  // Assigned for the whole set at once, so a colliding slug can be told apart -
-  // see stripMiddlewareNames.
   const names = stripMiddlewareNames(config.projectName, stripped.map(s => s.route.path));
 
   const stripObjects = stripped.map(({ route, service, portExpr }) => {
@@ -46,7 +40,6 @@ metadata:
     app: {{ .Values.projectName }}
   annotations:
     kubernetes.io/ingress.class: "traefik"
-    # Namespaced reference: Traefik resolves "<namespace>-<name>@kubernetescrd".
     traefik.ingress.kubernetes.io/router.middlewares: "{{ .Release.Namespace }}-${name}@kubernetescrd"
 spec:
   ingressClassName: traefik
@@ -68,21 +61,6 @@ spec:
   }).join('');
 
   return `
-{{/*
-An Ingress with an empty paths list is not merely useless - "paths: null"
-fails HTTPIngressRuleValue's schema and the API server rejects the object, so
-werf converge aborts and NOTHING deploys. A project can legitimately end up
-with no public route (every service behind a gateway that itself exposes
-nothing, or two services whose conflicting prefixes were both dropped), and
-that should leave the services running and reachable inside the cluster rather
-than blocking the whole deployment. init prints a NOTE when it happens.
-*/}}
-{{/*
-Routes that strip a prefix are NOT counted here: they live in their own Ingress
-below, because Traefik applies a middleware to a whole Ingress rather than to
-one path. Counting them would let this object render with an empty paths list
-when every route strips - the exact "paths: null" the note above is about.
-*/}}
 {{- $hasApiRoutes := false }}
 {{- if .Values.hasBackend }}
 {{- range $route := (.Values.apiRoutes | default list) }}
@@ -106,18 +84,6 @@ metadata:
   labels:
     app: {{ .Values.projectName }}
   annotations:
-    # No cert-manager issuer and no tls: block, on either path.
-    #
-    # The non-Cloudflare path used to declare both, and the certificate was
-    # even issued - HTTP-01 only needs port 80. But the generated security
-    # group opens 22, 80 and 6443 and nothing else, so 443 was unreachable and
-    # every request stayed cleartext while the chart claimed otherwise. A
-    # declared-but-unserviceable TLS is worse than none: it reads as secure in
-    # the manifest, and the dashboard's Secure/__Host- cookies are then
-    # rejected by the browser on an http:// origin, so login cannot complete
-    # at all. TLS termination belongs in front of the cluster (Cloudflare, or
-    # whatever the operator puts there), which is where it already was on the
-    # only path that worked.
     kubernetes.io/ingress.class: "traefik"
 spec:
   ingressClassName: traefik

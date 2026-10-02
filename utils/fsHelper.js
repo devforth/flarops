@@ -11,18 +11,7 @@ function logDebug(err) {
   }
 }
 
-/**
- * Safely walks a directory, ignoring symlinks and large files.
- * @param {string} dir - The directory to walk.
- * @param {Array<string>} fileList - Optional accumulator for file paths.
- * @param {number} maxDepth - Max recursion depth to prevent infinite loops (default: 10).
- * @param {number} currentDepth - Current recursion depth.
- * @returns {Promise<Array<string>>}
- */
-// The depth cap exists to bound pathological trees, but hitting it silently
-// meant part of a deep monorepo was simply never analyzed with nothing said
-// about it - the generated chart then looked complete while missing whatever
-// lived below the cut. Warn once per run instead of only under FLAROPS_DEBUG.
+// Warn once when the depth cap cuts the scan short.
 let depthLimitWarned = false;
 
 async function walkDir(dir, fileList = [], maxDepth = 16, currentDepth = 0) {
@@ -48,7 +37,6 @@ async function walkDir(dir, fileList = [], maxDepth = 16, currentDepth = 0) {
       }
 
       if (stat.isSymbolicLink()) {
-        // Skip symbolic links to avoid loops and escaping repo
         continue;
       }
 
@@ -58,7 +46,6 @@ async function walkDir(dir, fileList = [], maxDepth = 16, currentDepth = 0) {
         }
         await walkDir(filePath, fileList, maxDepth, currentDepth + 1);
       } else {
-        // Check size for files
         if (stat.size <= MAX_FILE_SIZE) {
           fileList.push(filePath);
         } else {

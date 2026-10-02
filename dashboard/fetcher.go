@@ -11,13 +11,9 @@ import (
 	"time"
 )
 
-// The feed is large - over 300 MB at the time of writing - and is decoded as
-// it streams, so memory stays flat, but the download itself takes time. The
-// old 30-second limit covered the WHOLE body and routinely cut it off midway.
+// Over 300 MB, decoded while streaming; the timeout covers the whole download.
 var pricingHTTPClient = &http.Client{Timeout: 10 * time.Minute}
 
-// Far above the real size, so growth does not break it, but bounded: a
-// misbehaving endpoint cannot keep this pod reading forever.
 const maxPriceFeedBytes = 2 << 30
 
 var priceFeedURL = "https://instances.vantage.sh/instances.json"
@@ -36,9 +32,7 @@ var (
 	awsPricesMutex sync.RWMutex
 )
 
-// Replaces the price table only with a COMPLETE feed. A decode error halfway
-// through used to swap in whatever had been read so far, so every instance
-// type after the break silently fell back to the default rate.
+// Only a complete feed replaces the table.
 func fetchAWSPrices() error {
 	resp, err := pricingHTTPClient.Get(priceFeedURL)
 	if err != nil {
@@ -82,9 +76,7 @@ func fetchAWSPrices() error {
 	return nil
 }
 
-// How long to wait before trying again after a failed fetch, by attempt. A
-// single failure at startup used to mean the next try a month later, with
-// every cost on the dashboard at the default rate for the whole month.
+// Retry delays after a failed fetch.
 var priceRetryDelays = []time.Duration{5 * time.Minute, 15 * time.Minute, time.Hour, 6 * time.Hour}
 
 func startPriceFetcher() {

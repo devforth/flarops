@@ -1,23 +1,7 @@
 package main
 
-// The node agent.
-//
-// Node filesystem figures used to come from the kubelet's stats/summary,
-// reached through the API server with `get` on nodes/proxy. That one RBAC verb
-// is far more than it looks: the API server maps a GET on a proxy subresource
-// to `get`, and the kubelet serves /exec on GET as well as POST - so the right
-// to read a disk gauge is also the right to
-//
-//	GET /api/v1/nodes/<node>/proxy/exec/<ns>/<pod>/<container>?command=sh
-//
-// on every container in the cluster. RBAC cannot scope a subresource to one
-// path, so the only way to keep the gauge without that authority is to stop
-// asking the kubelet.
-//
-// This agent runs as a DaemonSet, mounts the host root read-only, and answers
-// exactly two numbers over loopback-free HTTP on the pod network. It has no
-// ServiceAccount token and makes no API calls: compromising it yields the size
-// of a disk.
+// The node agent: one node's disk usage, over HTTP, with no ServiceAccount token and no API access.
+// It replaces `get nodes/proxy`, which would also authorize exec into every container.
 
 import (
 	"encoding/json"
@@ -34,8 +18,6 @@ type nodeDisk struct {
 	UsedBytes  uint64 `json:"usedBytes"`
 }
 
-// hostRoot is where the DaemonSet mounts the node's filesystem. Reported
-// figures are for that mount point, which is the node's root volume.
 func hostRoot() string {
 	if p := os.Getenv("FLAROPS_HOST_ROOT"); p != "" {
 		return p
@@ -50,14 +32,10 @@ func readNodeDisk(mountPoint string) (nodeDisk, error) {
 	}
 	blockSize := uint64(st.Bsize)
 	total := st.Blocks * blockSize
-	// Used as the filesystem itself reports it: everything not free, which
-	// includes the root-reserved blocks. That matches what "df" shows for the
-	// disk as a whole rather than what an unprivileged writer could still use.
 	used := (st.Blocks - st.Bfree) * blockSize
 	return nodeDisk{TotalBytes: total, UsedBytes: used}, nil
 }
 
-// runNodeAgent serves the disk figures and never returns.
 func runNodeAgent() {
 	addr := os.Getenv("NODE_AGENT_ADDR")
 	if addr == "" {

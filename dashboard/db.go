@@ -8,10 +8,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Samples are recorded roughly once a minute with no upper bound on table size.
-// Keep a year of history (comfortably more than the month-over-month spend
-// comparison in getSpendStats needs) and prune the rest so the PVC backing this
-// database doesn't grow indefinitely.
+// About a year of samples.
 const sampleRetention = 400 * 24 * time.Hour
 
 func startSampleRetention() {
@@ -162,9 +159,7 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 			}
 		}
 		cumulativePrev := 0.0
-		// Need to find days in previous month
 		daysInPrevMonth := time.Date(now.Year(), now.Month(), 0, 0, 0, 0, 0, now.Location()).Day()
-		// Fill prevVals up to dayOfMonth (or daysInPrevMonth if less)
 		for i := 1; i <= dayOfMonth; i++ {
 			if i <= daysInPrevMonth {
 				cumulativePrev += dailyCostsPrev[i]
@@ -186,9 +181,7 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 		RunRate:    runRate,
 		Projected:  projected,
 		MonthLabel: now.Month().String(),
-		// From the FIRST of the month: AddDate normalises an overflowing day,
-		// so on 31 October "one month back" is 31 September = 1 October, and
-		// the previous month was labelled with the current one.
+		// From the 1st: AddDate normalises an overflowing day (31 Oct - 1 month = 1 Oct).
 		PrevLabel: time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -1, 0).Month().String(),
 		Days:      curDays,
 		Cur:       curVals,
@@ -208,8 +201,6 @@ func getCapsulesCostLife(hourlyRate float64) map[string]float64 {
 		var id string
 		var count int
 		if err := rows.Scan(&id, &count); err == nil {
-			// rough approximation: if multiple capsules share host, they should split cost.
-			// For simplicity, we just assign hourlyRate * hours.
 			res[id] = float64(count) * (hourlyRate / 60.0)
 		}
 	}

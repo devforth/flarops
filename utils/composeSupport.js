@@ -1,20 +1,7 @@
-// Docker-compose routinely declares third-party components an application
-// genuinely needs at runtime but that live in no directory of the repository:
-// a Redis cache, a RabbitMQ broker, a Keycloak identity provider, a search
-// cluster. Flarops only ever generated the services it BUILDS, plus the
-// project's database - so those components silently vanished from the chart
-// while every reference to them survived in the generated environment
-// (SPRING_RABBITMQ_HOST=notification-rabbitmq, an issuer URI pointing at
-// keycloak-server). The result is a chart that renders perfectly and a
-// deployment where half the pods crash-loop on a DNS name nothing serves.
-//
-// This module reads such a service out of its compose block so it can be
-// generated as an ordinary Deployment + Service running the same public image.
+// Supporting services: third-party components declared in docker-compose (a cache, a broker, an
+// identity provider) that the application references but the repository does not build.
 
-// Container ports for images that conventionally declare none in compose
-// (because the compose author only ever reached them from inside the default
-// bridge network). Without a port a Service cannot be created at all, and
-// without a Service the hostname still does not resolve.
+// Container ports for images whose compose files usually declare none.
 const WELL_KNOWN_IMAGE_PORTS = [
   [/redis|valkey/i, [6379]],
   [/rabbitmq/i, [5672, 15672]],
@@ -40,9 +27,6 @@ function blockLines(block) {
   return block.split('\n');
 }
 
-// Reads a nested block ("environment:", "ports:", ...) by indentation and
-// hands back its raw lines. Compose allows both a mapping and a sequence
-// under most of these keys, so the caller decides how to read the lines.
 function readSection(block, sectionName) {
   const lines = blockLines(block);
   let indent = null;
@@ -64,8 +48,6 @@ function readSection(block, sectionName) {
 }
 
 function stripInlineComment(value) {
-  // Only a " #" sequence starts a comment in a compose scalar; a '#' inside a
-  // value (a URL fragment, a generated password) does not.
   return value.replace(/\s+#.*$/, '').trim();
 }
 
@@ -78,9 +60,7 @@ function extractImage(block) {
   return m ? m[1] : null;
 }
 
-// Container-side ports only. "5433:5432" publishes the container's 5432 on
-// the host's 5433; inside the cluster only 5432 exists, and generating a
-// Service on 5433 would point at nothing.
+// Container-side ports only: in the cluster "5433:5432" exists only as 5432.
 function extractPorts(block, image) {
   const ports = new Set();
   for (const section of ['ports', 'expose']) {
@@ -88,16 +68,13 @@ function extractPorts(block, image) {
       const raw = entry.inline || entry.line || '';
       const item = unquote(stripInlineComment(raw.replace(/^\s*-\s*/, '')));
       if (!item) continue;
-      // host:container, ip:host:container, or a bare container port
       const parts = item.split(':');
       const candidate = parts[parts.length - 1].split('/')[0].trim();
       if (/^\d+$/.test(candidate)) {
         ports.add(parseInt(candidate, 10));
         continue;
       }
-      // "8000-8010:8000-8010" publishes a whole range. Dropped silently, the
-      // Service came out with no ports at all and nothing resolved; expand it,
-      // bounded so a careless range cannot generate thousands of entries.
+      // Expand a port range, bounded.
       const range = candidate.match(/^(\d+)-(\d+)$/);
       if (range) {
         const from = parseInt(range[1], 10);
@@ -128,16 +105,11 @@ function extractEnv(block) {
     if (!raw) continue;
     const m = raw.match(/^[ \t]*(?:-\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*[:=]\s*([\s\S]*)$/);
     if (!m) continue;
-    // Read as a YAML scalar: a quoted value keeps a " #" inside it.
     env[m[1]] = parseComposeScalar(m[2]);
   }
   return env;
 }
 
-// Splits a shell-form compose command into arguments, respecting single and
-// double quotes and backslash escapes. Not a full shell parser - it does not
-// expand anything - which is exactly right here: the arguments are handed to
-// the container verbatim, not to a shell.
 function tokenizeShellWords(line) {
   const out = [];
   let current = '';
@@ -164,10 +136,7 @@ function tokenizeShellWords(line) {
   return out;
 }
 
-// One YAML scalar as compose's own parser reads it. Stripping the outer
-// quotes was not enough: inside double quotes YAML has escapes, so the compose
-// line `- "grep -E '^\\d+$'"` means the argument `grep -E '^\d+$'` - with ONE
-// backslash - and keeping both made the container run something else.
+// One YAML scalar as compose reads it, escapes included.
 function parseComposeScalar(raw) {
   const text = String(raw).trim();
   if (text.startsWith('"')) {
@@ -198,9 +167,6 @@ function parseComposeScalar(raw) {
   return stripInlineComment(text);
 }
 
-// Splits a flow sequence body ("a", "b, c", d) at the commas that separate
-// items - not the ones inside a quoted item, which the old split(',') cut in
-// half.
 function splitFlowItems(body) {
   const items = [];
   let current = '';
@@ -221,12 +187,7 @@ function splitFlowItems(body) {
   return items.map(s => s.trim()).filter(s => s !== '');
 }
 
-// A service's `command:` in every form compose accepts: a block list, a flow
-// list, or a single string. Returns the argument list, or null when there is
-// none. Used for app services and supporting services alike - init.js had a
-// parser of its own that read only the block form, so a worker declared as
-// `command: ["node", "worker.js"]` lost its command and ran its image's CMD,
-// which for a worker sharing the API's build context is a second API.
+// `command:` in every form compose accepts: block list, flow list or a single string.
 function extractCommand(block) {
   const args = [];
   const section = readSection(block, 'command');
@@ -237,10 +198,7 @@ function extractCommand(block) {
         const body = inline.replace(/^\[/, '').replace(/\]\s*$/, '');
         for (const part of splitFlowItems(body)) args.push(parseComposeScalar(part));
       } else {
-        // Shell form. YAML first (the whole string may itself be quoted),
-        // then the shell-style split compose applies to it - splitting on
-        // whitespace alone broke every quoted argument, so `--requirepass
-        // "my pass"` became three arguments, two of them wrong.
+        // Shell form: YAML first (the string may be quoted), then the shell-style split.
         for (const part of tokenizeShellWords(parseComposeScalar(inline))) args.push(part);
       }
       continue;
@@ -251,10 +209,7 @@ function extractCommand(block) {
   return args.length > 0 ? args : null;
 }
 
-// A service's `env_file:` entries in every form compose accepts - a single
-// path, a flow or block list of paths, or the long form with `path:` and
-// `required:`. Returns [{ path, required }] with paths as written (relative to
-// the compose file), or [] when there are none.
+// `env_file:` in every form compose accepts. Paths are relative to the compose file.
 function extractEnvFiles(block) {
   const out = [];
   let pending = null;
@@ -283,12 +238,7 @@ function extractEnvFiles(block) {
   return out.filter(e => e.path);
 }
 
-// Two very different things share the "volumes:" key. A NAMED volume
-// ("pgdata:/var/lib/...") is real persistence and becomes a PVC. A BIND mount
-// ("./docker/keycloak/realms/:/opt/keycloak/data/import/") ships host files
-// into the container - configuration, seed data, certificates - which cannot
-// be carried into a cluster by this generator at all, so it is reported
-// rather than silently dropped.
+// A named volume becomes a PVC; a bind mount ships host files and is handled separately.
 function extractVolumes(block) {
   const persistent = [];
   const bindMounts = [];
@@ -311,17 +261,11 @@ function extractVolumes(block) {
   return { persistent, bindMounts };
 }
 
-// docker-compose's build.args are how a frontend image is told, at BUILD
-// time, which configuration to compile and which API base URL to bake in.
-// They are not runtime environment and no amount of env wiring replaces them:
-// miss them and the image quietly builds with its Dockerfile's ARG defaults -
-// which, by convention, are the developer's local ones.
 function extractBuildArgs(block) {
   const args = {};
   for (const entry of readSection(block, 'args')) {
     const raw = entry.line;
     if (!raw) continue;
-    // Mapping form ("KEY: value") and sequence form ("- KEY=value").
     const m = raw.match(/^[ \t]*(?:-\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*([\s\S]*)$/);
     if (!m) continue;
     args[m[1]] = parseComposeScalar(m[2]);
@@ -329,12 +273,7 @@ function extractBuildArgs(block) {
   return Object.keys(args).length > 0 ? args : null;
 }
 
-// Host paths that only ever appear in a node-level agent: a container that
-// instruments the machine it runs on (Datadog, cAdvisor, a log shipper)
-// rather than serving the application. In Kubernetes that is a DaemonSet with
-// hostPath volumes and its own RBAC, not a Deployment - and generated as a
-// Deployment with those mounts silently dropped, it starts, instruments
-// nothing, and adds a required secret for an API key nobody asked for.
+// Host paths that mark a node-level agent (it belongs in a DaemonSet, not a Deployment).
 const NODE_AGENT_HOST_PATHS = [
   '/var/run/docker.sock',
   '/proc',
@@ -349,17 +288,11 @@ function looksLikeNodeAgent(bindMounts) {
     NODE_AGENT_HOST_PATHS.some((p) => source === p || source.startsWith(p + '/')));
 }
 
-// RFC 1123: a Kubernetes object name is lowercase alphanumerics and "-", and
-// must START and END alphanumeric, at most 63 characters. Lowercasing and
-// replacing the rest was not enough - a compose service spelled "_cache" or
-// "redis_" produced "-cache" / "redis-", which the API server rejects, so the
-// whole chart failed to apply on a name nobody would think to look at.
+// RFC 1123 object name: lowercase alphanumerics and "-", starting and ending alphanumeric, max 63.
 function toK8sName(raw) {
   let name = String(raw).toLowerCase().replace(/[^a-z0-9-]/g, '-');
   name = name.replace(/-+/g, '-').replace(/^-+/, '').replace(/-+$/, '');
   if (name.length > 63) name = name.slice(0, 63).replace(/-+$/, '');
-  // Nothing usable survived (a name of only separators, or only digits after
-  // trimming is still fine - a leading digit is legal in RFC 1123).
   if (name === '') return null;
   return name;
 }
@@ -382,16 +315,7 @@ function parseSupportService(composeName, block) {
   };
 }
 
-// A bind mount is usually the supporting service's ENTIRE configuration: the
-// gateway's nginx.conf, the identity provider's realm export, the broker's
-// definitions file. Reported and dropped, the generated Deployment starts the
-// stock image with none of it - an nginx serving its welcome page where the
-// project expects an API gateway - and the chart looks complete while the
-// component does nothing it was included to do.
-//
-// Those files are in the repository and readable right here, so carry them as
-// a ConfigMap instead. Only what cannot be carried (a host path outside the
-// repo, something too large for a ConfigMap, a binary) is reported.
+// A bind mount is usually a supporting service's whole configuration; it is carried as a ConfigMap.
 const MAX_CONFIG_FILE_BYTES = 256 * 1024;
 const MAX_CONFIG_TOTAL_BYTES = 768 * 1024;
 const MAX_CONFIG_FILES = 24;
@@ -406,22 +330,12 @@ function configMapKeyFor(name, taken) {
   return candidate;
 }
 
-// A ConfigMap generated from a bind mount is written into the chart, which
-// FLAROPS.md tells the operator to commit, and lands in the cluster as a
-// plain ConfigMap readable by anything with configmap access in that
-// namespace. Carrying the gateway's nginx.conf that way is the point; doing
-// the same to a mounted private key or credentials file would take secret
-// material that was sitting in a gitignored directory and commit it.
-//
-// Name and content are both consulted, because neither alone is reliable: a
-// key file is routinely called "server.key" with no telltale header stripped,
-// and a "config.yml" can hold an API token.
+// A ConfigMap is committed and readable by anything with configmap access, so files that look like
+// secret material are refused.
 const SECRET_FILENAME_REGEX = /(^|[-_.])(id_rsa|id_dsa|id_ecdsa|id_ed25519)($|[-_.])|\.(key|pem|p12|pfx|jks|keystore|truststore|asc|gpg|kdbx|ppk)$|(^|[-_.])(secret|secrets|credential|credentials|password|passwords|token|tokens|htpasswd)($|[-_.])|^\.?env(\..*)?$/i;
 
 const SECRET_CONTENT_REGEX = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|-----BEGIN PGP PRIVATE|-----BEGIN OPENSSH PRIVATE KEY-----|PuTTY-User-Key-File/;
 
-// A key=value line whose key names a credential and whose value is neither
-// empty, a placeholder, nor an unresolved ${...} reference.
 const SECRET_ASSIGNMENT_REGEX = /^[ \t]*["']?[A-Za-z0-9_.-]*(PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL)[A-Za-z0-9_.-]*["']?[ \t]*[:=][ \t]*["']?(?!\s*$)(?!\$\{)(?!<)(?!changeme\b)(?!change_me\b)(?!your[-_])(?!example\b)(?!placeholder\b)(?!todo\b)(?!tbd\b)(?!""|'')\S/im;
 
 function secretMaterialReason(name, content) {
@@ -432,14 +346,9 @@ function secretMaterialReason(name, content) {
 }
 
 function isProbablyText(buf) {
-  // A NUL byte never appears in the text formats these mounts carry, and
-  // ConfigMap data is a UTF-8 string field, so anything binary has to be
-  // reported rather than mangled.
   return !buf.includes(0);
 }
 
-// fsMod is injected so this stays testable and the module keeps no top-level
-// filesystem dependency of its own.
 function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
   const data = {};
   const fileMounts = [];
@@ -457,9 +366,6 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
     let buf;
     try { buf = fsMod.readFileSync(absPath); } catch (e) { return { error: 'could not be read' }; }
     if (!isProbablyText(buf)) return { error: 'is a binary file' };
-    // Checked before anything is stored: a ConfigMap is committed and is not
-    // a Secret, so secret material must be left for the operator to place
-    // deliberately rather than copied into the chart.
     const secretReason = secretMaterialReason(displayName, buf.toString('utf8'));
     if (secretReason) return { error: secretReason, secret: true };
     const key = configMapKeyFor(displayName, taken);
@@ -471,17 +377,7 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
 
   for (const mount of bindMounts) {
     const abs = pathMod.resolve(baseDir, mount.source);
-    // Never reach outside the repository: a mount of /etc or ~/ is the host's
-    // own configuration, not this project's, and copying it into a ConfigMap
-    // would put whatever it holds into the cluster.
-    //
-    // The check is on the RESOLVED path, because statSync and readdirSync
-    // resolve too. Comparing the lexical path let a symlink whose own name sat
-    // inside the repository - "./initdb" pointing at ~/.kube - pass the test
-    // and be read straight through into a chart the operator is told to
-    // commit. Nothing in the secret-material filter catches that: a kubeconfig
-    // is named "config" and its keys are client-key-data and
-    // certificate-authority-data.
+    // Never read outside the repository; the check is on the resolved path, so symlinks cannot escape.
     let realAbs;
     try {
       realAbs = fsMod.realpathSync(abs);
@@ -514,23 +410,15 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
       continue;
     }
 
-
     if (stat.isDirectory()) {
       let entries = [];
       try { entries = fsMod.readdirSync(abs, { withFileTypes: true }); } catch (e) {
         unresolved.push({ ...mount, reason: 'could not be listed' });
         continue;
       }
-      // One level only: a ConfigMap has no notion of nested directories, and
-      // "items" can only place each key at a flat path under the mount.
-      // A directory is scanned for secret material BEFORE anything from it is
-      // stored. One key file poisons the whole mount: carrying the rest would
-      // hand the service a half-populated configuration directory, which is a
-      // worse failure than carrying none of it and saying so.
+      // One directory level only (ConfigMaps are flat). One secret-looking file refuses the whole mount.
       let dirSecretReason = null;
       for (const entry of entries) {
-        // isFile() is false for a symlink under withFileTypes, so links inside
-        // a mounted directory are skipped rather than followed.
         if (!entry.isFile()) continue;
         let buf;
         try { buf = fsMod.readFileSync(pathMod.join(abs, entry.name)); } catch (e) { continue; }

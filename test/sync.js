@@ -1,13 +1,4 @@
-// End-to-end checks for `flarops sync`.
-//
-// Sync's contract is that flarops.yaml is the source of truth: editing a
-// parameter changes the deployment, declaring a service creates one from the
-// same templates a discovered service is built from, and removing one takes it
-// away. Each of those is checked against the files that actually get deployed,
-// not against sync's own reporting.
-//
-// The real CLI is driven in a child process because sync exits the process on
-// bad input, which inside the runner would take the suite with it.
+// End-to-end checks for `flarops sync` against a generated project.
 
 const fs = require('fs');
 const path = require('path');
@@ -15,10 +6,7 @@ const { execFileSync, spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'index.js');
 
-// spawnSync rather than execFileSync: both streams are needed on EVERY run,
-// not only on a failing one. sync reports what it could not wire on stderr
-// while still succeeding, and execFileSync discards stderr when the command
-// exits 0 - so an assertion about a warning silently had nothing to read.
+// spawnSync: stderr is needed even when the exit code is 0.
 function runSync(dir) {
   const r = spawnSync('node', [CLI, 'sync'], { cwd: dir, encoding: 'utf8' });
   return { status: r.status, out: r.stdout || '', err: r.stderr || '' };
@@ -27,11 +15,9 @@ function runSync(dir) {
 const read = (dir, rel) => fs.readFileSync(path.join(dir, rel), 'utf8');
 const exists = (dir, rel) => fs.existsSync(path.join(dir, rel));
 
-// Replaces one "key: value" line inside a named top-level service block.
 function editService(dir, service, key, value) {
   const file = path.join(dir, 'flarops.yaml');
   const text = fs.readFileSync(file, 'utf8');
-  // The first block starts at offset 0 with no newline before it.
   const at = text.startsWith(`${service}:\n`) ? 0 : text.indexOf(`\n${service}:\n`) + 1;
   if (at === 0 && !text.startsWith(`${service}:\n`)) throw new Error(`no ${service} block in flarops.yaml`);
   const head = text.slice(0, at);
@@ -89,22 +75,13 @@ mailer:
   check('its defaults fill in what was not declared',
     /healthRoute: null/.test(values.slice(values.indexOf('- name: mailer'))), 'healthRoute missing');
   check('werf.yaml learns to build it', /^image: mailer$/m.test(read(dir, 'werf.yaml')), read(dir, 'werf.yaml'));
-  // A key the chart now mounts has to be something CI actually puts in the
-  // Secret. CI only passes what the workflows name, so sync must add it there
-  // too - otherwise the generated deployment looks complete and every pod
-  // needing that key sits in CreateContainerConfigError.
   check('the new secret is reported', /SMTP_TOKEN/.test(r.out + (r.err || '')), r.out);
   for (const wf of ['.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml']) {
     check(`${wf} now passes it`, read(dir, wf).includes('SECRET_ENV_SMTP_TOKEN'),
       read(dir, wf).split('\n').filter(l => /SECRET_ENV_/.test(l)).join('\n'));
   }
-  // Flarops' own key is never declared in flarops.yaml, so a list rebuilt from
-  // that file alone would drop it - and the dashboard would stop starting,
-  // taking every PR capsule's capacity check with it.
   check('the dashboard key is not dropped',
     read(dir, '.github/workflows/deploy.yml').includes('SECRET_ENV_DASHBOARD_PASSWORD_HASH'));
-  // Every secretKeyRef in the rendered chart must have a source, which is the
-  // failure this whole mechanism exists to prevent.
   {
     const provided = new Set([...read(dir, '.github/workflows/deploy.yml')
       .matchAll(/SECRET_ENV_([A-Z0-9_]+):/g)].map(m => m[1]));
@@ -121,9 +98,7 @@ mailer:
     check('no secretKeyRef is left without a source after sync', orphans.size === 0, [...orphans].join('\n'));
   }
 
-  // 3b. Storage declared by hand on a service this repository BUILDS. Nothing
-  // about being built from source makes a workload stateless, and until this
-  // was added only a pulled image could ask for a volume.
+  // 3b. Storage on a service this repository builds.
   fs.appendFileSync(path.join(dir, 'flarops.yaml'), `
 archiver:
   dockerfile: "archiver/Dockerfile"
@@ -140,12 +115,8 @@ archiver:
   check('a claim is written for it', /kind: PersistentVolumeClaim/.test(archiver) && /name: archiver-spool/.test(archiver), archiver.slice(0, 400));
   check('the declared size is used', /storage: "40Gi"/.test(archiver), archiver.slice(0, 600));
   check('it is mounted where declared', /mountPath: \/var\/spool\/archiver/.test(archiver));
-  // A pod holding a ReadWriteOnce claim has to be gone before its replacement
-  // can bind the same volume, so a rolling update would deadlock.
   check('a volume forces Recreate', /type: Recreate/.test(archiver), archiver.slice(0, 700));
 
-  // A volume missing its path cannot be mounted anywhere, and guessing is
-  // worse than saying so.
   const beforeBad = read(dir, 'deploy/helm/values.yaml');
   fs.appendFileSync(path.join(dir, 'flarops.yaml'), `
 broken:
@@ -159,10 +130,7 @@ broken:
   const cleanup = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
   fs.writeFileSync(path.join(dir, 'flarops.yaml'), cleanup.slice(0, cleanup.indexOf('\nbroken:\n')) + '\n');
 
-  // 3b'. Values that are pasted into file names and workflows unescaped. A
-  // service name climbing out of the chart wrote a file into
-  // .github/workflows, and a secret key with "\n" in it added lines of its own
-  // to deploy.yml - both must be refused before anything is written.
+  // 3b'. Values pasted unescaped into file names and workflows must be refused.
   const hostile = [
     ['a service name outside the chart', '"../../../.github/workflows/pwn":\n  image: "busybox:1"\n', /not a valid service name/],
     ['a secret key that adds workflow lines', 'hostile:\n  image: "busybox:1"\n  secretEnvs:\n    X: "X }}\\n      INJECTED: ${{ github.token"\n', /not a valid GitHub secret name/],
@@ -180,9 +148,7 @@ broken:
     !exists(dir, '.github/workflows/pwn.yaml') && read(dir, '.github/workflows/deploy.yml') === cleanWorkflow);
   fs.writeFileSync(path.join(dir, 'flarops.yaml'), cleanFile);
 
-  // 3c. A task, not a service. Declared as an ordinary service with
-  // replicas: 1 it would become a Deployment, exit, be restarted, and sit in
-  // CrashLoopBackOff forever while redoing its work on every loop.
+  // 3c. A one-shot task.
   fs.appendFileSync(path.join(dir, 'flarops.yaml'), `
 topic-setup:
   image: "busybox:1"
@@ -196,13 +162,10 @@ topic-setup:
   const job = read(dir, 'deploy/helm/templates/support-topic-setup.yaml');
   check('it is rendered as a Job', /kind: Job/.test(job) && !/kind: Deployment/.test(job), job.slice(0, 300));
   check('it re-runs on every deploy', /helm.sh\/hook": post-install,post-upgrade/.test(job), job.slice(0, 400));
-  // A Job's pod template is immutable and the name is fixed, so the previous
-  // one has to go before the next can be created.
   check('the previous run is removed first', /hook-delete-policy": before-hook-creation/.test(job));
   check('it does not restart on success', /restartPolicy: OnFailure/.test(job));
   check('a task gets no Service', !/kind: Service/.test(job), job.slice(0, 300));
 
-  // A task has no Service, so there is nothing an Ingress rule could point at.
   const beforeRoute = read(dir, 'deploy/helm/values.yaml');
   const withTask = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
   fs.writeFileSync(path.join(dir, 'flarops.yaml'), withTask + '  exposedRoutes:\n    - "/setup"\n');
@@ -212,10 +175,7 @@ topic-setup:
   fs.writeFileSync(path.join(dir, 'flarops.yaml'), withTask);
   runSync(dir);
 
-  // 3d. A route whose prefix is stripped before the service sees it. Without
-  // this the generated Ingress passed /api/... through untouched, the backend
-  // answered 404, and the catch-all "/" rule handed the browser HTML where it
-  // expected JSON.
+  // 3d. A route whose prefix is stripped.
   editService(dir, 'api', 'healthRoute', '/health');
   {
     const file = path.join(dir, 'flarops.yaml');
@@ -235,19 +195,13 @@ topic-setup:
   check('sync accepts a stripped route', r.status === 0, r.err);
   const ingress = read(dir, 'deploy/helm/templates/01-ingress.yaml');
   check('a Middleware is generated for it', /kind: Middleware/.test(ingress) && /- \/api$/m.test(ingress), ingress.slice(-900));
-  // Traefik applies a middleware to a whole Ingress, so the stripped route
-  // cannot share the main one.
   check('it gets an Ingress of its own', (ingress.match(/kind: Ingress/g) || []).length >= 2);
   check('the middleware is referenced by annotation',
     /traefik\.ingress\.kubernetes\.io\/router\.middlewares/.test(ingress), ingress.slice(-900));
   check('the untransformed route stays on the main Ingress',
     /- path: \{\{ \$route\.path \}\}/.test(ingress), ingress.slice(0, 500));
 
-  // 3e. Two stripped routes whose slugs collide. Every run of
-  // non-alphanumerics becomes one dash, so "/a/b" and "/a-b" - both ordinary
-  // paths - used to produce the same Kubernetes object name. Two Middlewares
-  // with one name means the second replaces the first on apply and one route
-  // silently strips the other's prefix.
+  // 3e. Stripped routes whose slugs collide.
   {
     const file = path.join(dir, 'flarops.yaml');
     const text = fs.readFileSync(file, 'utf8');
@@ -268,17 +222,13 @@ topic-setup:
     const objectNames = [...text.matchAll(/^  name: (\S+)$/gm)].map(m => m[1]);
     check('colliding routes get distinct object names',
       objectNames.length === new Set(objectNames).size, objectNames.join(', '));
-    // The readable name survives where nothing collides; only the colliding
-    // pair carries a hash.
     check('a colliding name carries a hash of its own path',
       objectNames.filter(n => /-strip-a-b-[0-9a-f]{6}(-ingress)?$/.test(n)).length === 4,
       objectNames.join(', '));
-    // Each Ingress must point at the middleware it actually ships with.
     for (const m of text.matchAll(/router\.middlewares: "\{\{ \.Release\.Namespace \}\}-([^@]+)@/g)) {
       check(`middleware ${m[1]} is defined`, objectNames.includes(m[1]), objectNames.join(', '));
     }
   }
-  // Put the realistic route back for the checks that follow.
   {
     const file = path.join(dir, 'flarops.yaml');
     const text = fs.readFileSync(file, 'utf8');
@@ -288,16 +238,7 @@ topic-setup:
     runSync(dir);
   }
 
-  // 3f. A secret put under "database". A database image reads its password
-  // under one or more names of its own choosing, but all of them refer to the
-  // same Secret key - the chart has no generic secretKeys loop there. So a
-  // SECOND distinct key cannot be mounted: it reaches the cluster's Secret and
-  // no container, which from the outside is indistinguishable from the secret
-  // not working.
-  //
-  // It is reported, not refused. Refusing stopped an otherwise correct file
-  // over one misplaced line, and the same fault is already what the
-  // unmounted-keys check reports for every other service.
+  // 3f. Secrets under "database".
   {
     const file = path.join(dir, 'flarops.yaml');
     const good = fs.readFileSync(file, 'utf8');
@@ -316,10 +257,6 @@ topic-setup:
         check('it is reported as reaching no container',
           /no workload reads them/.test(r.err || '') && /JWT_SECRET/.test(r.err || ''), r.err);
 
-        // Two NAMES pointing at one key is not a mistake - it is what a mysql
-        // database with a non-root user legitimately needs, and what Flarops
-        // itself writes. Counting entries instead of distinct keys made the
-        // tool refuse its own generated file.
         fs.writeFileSync(file, good);
         runSync(dir);
         const firstKey = (good.slice(secretsAt, insertAt).match(/:\s*(\S+)\s*$/m) || [])[1];

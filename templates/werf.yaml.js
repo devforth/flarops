@@ -1,6 +1,4 @@
-// docker-compose's build.args are build-time inputs no Kubernetes manifest
-// can supply after the fact - werf has to pass them to the Docker build, or
-// the image silently compiles with its Dockerfile's ARG defaults.
+// build.args reach the image build only through werf.
 function renderBuildArgs(args) {
   if (!args || Object.keys(args).length === 0) return '';
   let out = 'args:\n';
@@ -40,11 +38,7 @@ context: ${config.dbContext === '.' ? '.' : config.dbContext}
   
   if (config.additionalServices && config.additionalServices.length > 0) {
     for (const s of config.additionalServices) {
-      // A Maven reactor module's pom.xml inherits <parent> from the repo-root
-      // pom.xml, which Maven resolves via the default "../pom.xml" relative
-      // lookup - so it can only be built with the repo root as Docker build
-      // context (the module's own directory alone never includes that parent
-      // pom), with the Dockerfile path adjusted to be relative to that root.
+      // A Maven reactor module builds from the repo root (its pom inherits ../pom.xml).
       const context = s.isMavenReactorModule
         ? '.'
         : (s.relativePath && s.relativePath !== '.' ? s.relativePath : '.');

@@ -1,16 +1,4 @@
-// Generates `flarops.yaml` - the declarative source of truth for every service
-// Flarops manages.  Written once by `flarops init`, it describes each service's
-// build/image, replicas, env, secrets and (when detected) resource limits.
-//
-// The file is intended to be human-editable and committed alongside the rest of
-// the project.  A trailing comment block doubles as a template that documents
-// every supported field.
-
-// ---------------------------------------------------------------------------
-// YAML helpers – we deliberately avoid a YAML library (Flarops has zero
-// runtime deps) and produce the output by hand.  The shapes are simple enough
-// that this is safe.
-// ---------------------------------------------------------------------------
+// Generates flarops.yaml, the file the user edits; `flarops sync` applies it.
 
 const { passwordKeyFor } = require('./dbDefaults');
 const { normalizeRoutes } = require('./routes');
@@ -18,13 +6,7 @@ const { normalizeRoutes } = require('./routes');
 function yamlScalar(value) {
   if (value === null || value === undefined) return 'null';
   const s = String(value);
-  // Quote anything that might confuse a YAML parser - including a reader that
-  // is not this one. YAML 1.1, which PyYAML and many other tools still
-  // implement, reads yes/no/on/off as BOOLEANS; YAML 1.2 reads them as text.
-  // An unquoted "yes" in a container's command therefore means the string
-  // "yes" to one reader and the string "true" to another, and the file is
-  // meant to be readable by both. redis-server --appendonly yes is exactly
-  // this case and is not rare.
+  // Quote YAML 1.1 booleans (yes/no/on/off) and anything else a parser could misread.
   const YAML_11_BOOLEANS = /^(y|n|yes|no|true|false|on|off)$/i;
   if (s === '' || s === 'null' || s === '~' || YAML_11_BOOLEANS.test(s) ||
       /^[\d.]+$/.test(s) || /[:#\[\]{}&*!|>'"%@`]/.test(s) ||
@@ -39,10 +21,6 @@ function indentBlock(text, spaces) {
   return text.split('\n').map(l => pad + l).join('\n');
 }
 
-// ---------------------------------------------------------------------------
-// Render a single service block
-// ---------------------------------------------------------------------------
-
 function renderEnvBlock(envObj, indent) {
   const entries = Object.entries(envObj || {});
   if (entries.length === 0) return null;
@@ -51,17 +29,8 @@ function renderEnvBlock(envObj, indent) {
 }
 
 function renderSecretEnvBlock(secretKeys, extraMappings, indent) {
-  // secretKeys: [KEY, KEY2, …] – wired from a GH secret of the same name
-  // extraMappings: [{ envName, secretKey }, …] – env name differs from the secret name
-  //
-  // This renders a YAML MAPPING, where a repeated key is not a duplicate entry
-  // but a silently discarded one - the parser keeps the last. The sources feed
-  // in from independent detection paths that don't know about each other, so
-  // the same container-side name can arrive more than once; the first wins,
-  // and the order below puts the most specific statement first. The container
-  // env list in the chart has the same hazard with a louder failure, and is
-  // reconciled in init.js - this is the format-level guard, not a substitute
-  // for that one.
+  // A mapping: a repeated key would silently lose a value, so mappings come first and same-name keys
+  // are skipped when already present.
   const ordered = [
     ...(extraMappings || []).map(m => [m.envName, m.secretKey]),
     ...(secretKeys || []).map(k => [k, k]),
@@ -94,14 +63,9 @@ function renderPorts(ports, indent) {
   return ports.map(p => `${pad}- ${p}`).join('\n');
 }
 
-// ---------------------------------------------------------------------------
-// Build the service descriptor from init's internal state
-// ---------------------------------------------------------------------------
-
 function serviceBlock(name, opts) {
   const lines = [];
 
-  // image vs dockerfile+context (mutually exclusive)
   if (opts.image) {
     lines.push(`  image: ${yamlScalar(opts.image)}`);
   }
@@ -112,52 +76,41 @@ function serviceBlock(name, opts) {
     lines.push(`  context: ${yamlScalar(opts.context)}`);
   }
 
-  // A one-shot task runs to completion instead of staying up, so a replica
-  // count would be meaningless for it.
   if (opts.oneShot) {
     lines.push('  oneShot: true');
   } else {
     lines.push(`  replicas: ${opts.replicas || 1}`);
   }
 
-  // ports
   const portsStr = renderPorts(opts.ports, 4);
   if (portsStr) {
     lines.push('  ports:');
     lines.push(portsStr);
   } else if (Array.isArray(opts.ports)) {
-    // Written explicitly: left out, sync would read the absence as "use the
-    // default" and give a worker that listens on nothing port 80 and a Service.
+    // Written explicitly, or sync would apply its default of port 80.
     lines.push('  ports: []');
   }
 
-  // build args
   const argsStr = renderBuildArgs(opts.buildArgs, 4);
   if (argsStr) {
     lines.push('  buildArgs:');
     lines.push(argsStr);
   }
 
-  // command
   const cmdStr = renderCommand(opts.command, 4);
   if (cmdStr) {
     lines.push('  command:');
     lines.push(cmdStr);
   }
 
-  // env
   const envStr = renderEnvBlock(opts.env, 4);
   if (envStr) {
     lines.push('  env:');
     lines.push(envStr);
   }
 
-  // secretEnvs. The chart writes the DB password - and Spring's fixed
-  // SPRING_DATASOURCE_PASSWORD - from their own dedicated blocks rather than
-  // through the generic secretKeys loop, so a file built from secretKeys alone
-  // claimed those containers needed no database credential at all. They are
-  // mappings like any other; the dedup above collapses them when a more
-  // specific statement already covers the same name.
+  // The DB password (and Spring's SPRING_DATASOURCE_PASSWORD) come from dedicated blocks in the chart;
+  // list them here too so the file describes every secret the container receives.
   const allMappings = [...(opts.extraSecretEnvMappings || [])];
   if (opts.dbPasswordKey) {
     allMappings.push({ envName: opts.dbPasswordKey, secretKey: opts.dbPasswordKey });
@@ -171,8 +124,6 @@ function serviceBlock(name, opts) {
     lines.push(secretStr);
   }
 
-  // volumes. Declared beside the path they mount at, because a size means
-  // nothing without knowing what is stored there.
   if (Array.isArray(opts.volumes) && opts.volumes.length > 0) {
     lines.push('  volumes:');
     for (const v of opts.volumes) {
@@ -182,7 +133,6 @@ function serviceBlock(name, opts) {
     }
   }
 
-  // healthRoute / healthPort
   if (opts.healthRoute) {
     lines.push(`  healthRoute: ${yamlScalar(opts.healthRoute)}`);
   }
@@ -190,20 +140,15 @@ function serviceBlock(name, opts) {
     lines.push(`  healthPort: ${opts.healthPort}`);
   }
 
-  // exposedRoutes
   const routes = normalizeRoutes(opts.exposedRoutes);
   if (routes.length > 0) {
     lines.push('  exposedRoutes:');
     for (const r of routes) {
-      // The short form for the ordinary case; the long one only where the
-      // route actually carries a transformation, so the common file stays
-      // a list of paths.
       if (!r.stripPrefix) lines.push(`    - ${yamlScalar(r.path)}`);
       else lines.push(`    - path: ${yamlScalar(r.path)}`, '      stripPrefix: true');
     }
   }
 
-  // db (for additional services with own database)
   if (opts.db && !opts.db.shared) {
     lines.push('  db:');
     lines.push(`    type: ${yamlScalar(opts.db.type)}`);
@@ -211,8 +156,6 @@ function serviceBlock(name, opts) {
     lines.push(`    port: ${opts.db.port}`);
     lines.push(`    user: ${yamlScalar(opts.db.user)}`);
     lines.push(`    name: ${yamlScalar(opts.db.name)}`);
-    // This database is a workload of its own - the chart gives it a Deployment
-    // and mounts its password exactly like the shared one's.
     if (opts.db.passwordKey) {
       const names = databaseSecretEnvNames(opts.db.type, opts.db.user);
       if (names.length > 0) {
@@ -227,38 +170,17 @@ function serviceBlock(name, opts) {
   return `${name}:\n` + lines.join('\n');
 }
 
-// The database container takes its password under a name the IMAGE dictates,
-// which is not the name of the Secret key holding it - postgres wants
-// POSTGRES_PASSWORD, mongo wants MONGO_INITDB_ROOT_PASSWORD, and the key is
-// whatever this project's password was generated or discovered under. Both
-// halves belong in flarops.yaml: without them the file claims to describe
-// every service while the one service whose credential the whole deployment
-// turns on appears to need no secret at all.
-//
-// The name itself comes from utils/dbDefaults, the one table the chart and
-// the PR-capsule clone commands also answer this question from. Writing a
-// fresh engine switch here would have made a fifth copy of a mapping that has
-// already drifted once (see that file's own header).
+// The env names each database image reads its password under, all pointing at one Secret key.
 function databaseSecretEnvNames(dbType, dbUser) {
   const rootKey = passwordKeyFor(dbType);
   const names = [rootKey];
-  // The only part the shared table does not answer. mysql and mariadb take a
-  // SECOND credential for a non-root user, and the chart sets it only when the
-  // user is not root - root already has its password from <PREFIX>_ROOT_PASSWORD,
-  // and setting both for the same account makes the entrypoint fail. Derived
-  // from the root key rather than a second engine switch, and confined to these
-  // two engines because mongodb's key also contains _ROOT_ while having no such
-  // pair.
+  // mysql/mariadb take a second credential for a non-root user.
   const engine = String(dbType || '').toLowerCase();
   if ((engine === 'mysql' || engine === 'mariadb') && dbUser && dbUser !== 'root') {
     names.push(rootKey.replace('_ROOT_PASSWORD', '_PASSWORD'));
   }
   return names;
 }
-
-// ---------------------------------------------------------------------------
-// The trailing template/comment
-// ---------------------------------------------------------------------------
 
 const TEMPLATE_COMMENT = `
 # ============================================================================
@@ -350,10 +272,6 @@ const TEMPLATE_COMMENT = `
 #
 # ============================================================================`.trimStart();
 
-// ---------------------------------------------------------------------------
-// Main entry point – called from init.js after the config object is assembled
-// ---------------------------------------------------------------------------
-
 function generateFlaropsYaml(config, {
   apiEnv, frontendEnv, apiSecretKeys, frontendSecretKeys,
   apiExtraSecretEnvMappings, frontendExtraSecretEnvMappings,
@@ -361,7 +279,6 @@ function generateFlaropsYaml(config, {
 }) {
   const blocks = [];
 
-  // --- api ---
   if (config.hasBackend) {
     blocks.push(serviceBlock('api', {
       dockerfile: config.apiDockerfile,
@@ -380,7 +297,6 @@ function generateFlaropsYaml(config, {
     }));
   }
 
-  // --- frontend ---
   if (config.hasFrontend) {
     blocks.push(serviceBlock('frontend', {
       dockerfile: config.frontendDockerfile,
@@ -395,7 +311,6 @@ function generateFlaropsYaml(config, {
     }));
   }
 
-  // --- database ---
   if (config.hasDb) {
     const dbLines = [];
     if (config.dbHasLocalDockerfile) {
@@ -423,7 +338,6 @@ function generateFlaropsYaml(config, {
     blocks.push('database:\n' + dbLines.join('\n'));
   }
 
-  // --- additional services ---
   for (const s of (config.additionalServices || [])) {
     blocks.push(serviceBlock(s.name, {
       dockerfile: s.dockerfile,
@@ -446,7 +360,6 @@ function generateFlaropsYaml(config, {
     }));
   }
 
-  // --- support services ---
   for (const s of (config.supportServices || [])) {
     blocks.push(serviceBlock(s.name, {
       image: s.image,

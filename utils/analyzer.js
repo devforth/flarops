@@ -4,23 +4,10 @@ const { listComposeFiles, composeBaseDir } = require('./composeFiles');
 const { walkDir, logDebug } = require('./fsHelper');
 const { SERVICE_SCAN_IGNORED_DIRS } = require('./constants');
 
-// Conventional names for a "run this before the app starts" script - schema
-// migrations plus seed/first-user data, the exact thing cookiecutter-style
-// templates (e.g. this FastAPI template's own backend/scripts/prestart.sh,
-// which runs `alembic upgrade head` then creates the first superuser) ship
-// as a plain shell script the operator is expected to run once before/while
-// deploying. Flarops has no way to run arbitrary migration tooling for every
-// framework, but *this* convention is common and cheap to detect.
+// Conventional "run before the app starts" scripts: migrations and seed data.
 const PRESTART_SCRIPT_CANDIDATES = ['scripts/prestart.sh', 'scripts/migrate.sh', 'prestart.sh', 'migrate.sh'];
 
-// How many worker processes the backend's own Dockerfile spawns (uvicorn/
-// gunicorn `--workers N`/`-w N`, or a `WEB_CONCURRENCY`/`WORKERS` env var).
-// Each worker is a full copy of the process (its own interpreter, loaded
-// modules, DB connection pool, etc.), so a fixed one-size-fits-all memory
-// limit sized for a single process gets the container OOMKilled the moment
-// the image actually runs several of them - a very easy thing to miss since
-// the worker count lives in the Dockerfile/CMD, not in any of the env/port
-// signals already scanned elsewhere.
+// Worker processes the backend's Dockerfile spawns; each is a full copy, so memory scales with them.
 async function detectApiWorkerCount(backendPath, dockerfileName) {
   if (!backendPath || !dockerfileName) return 1;
   try {
@@ -42,10 +29,7 @@ async function detectApiWorkerCount(backendPath, dockerfileName) {
   return 1;
 }
 
-// Returns { checkFile, command } - checkFile is a path (relative to the
-// backend) whose presence in the built image gates actually running command,
-// so a wrong guess about the container's layout degrades to "skip" instead of
-// crashing the init container forever.
+// Returns { checkFile, command }; checkFile gates the command at runtime, so a wrong guess is a no-op.
 async function detectApiMigrationStep(backendPath) {
   if (!backendPath) return null;
   for (const candidate of PRESTART_SCRIPT_CANDIDATES) {
@@ -54,9 +38,7 @@ async function detectApiMigrationStep(backendPath) {
       return { checkFile: candidate, command: `bash ${candidate}` };
     } catch (e) { /* try next candidate */ }
   }
-  // Django's own convention: no wrapper script ships at all, but the
-  // presence of manage.py at the backend root means `manage.py migrate` is
-  // the schema-migration step this project uses.
+  // Django: manage.py at the root means `manage.py migrate`.
   try {
     await fs.access(path.join(backendPath, 'manage.py'));
     return { checkFile: 'manage.py', command: 'python manage.py migrate' };
@@ -64,18 +46,7 @@ async function detectApiMigrationStep(backendPath) {
   return null;
 }
 
-// Splits a compose file into its top-level service blocks, keyed by service
-// name. Matching a service name at ANY indentation (the previous approach)
-// also matches it where it appears as a key inside another service's
-// depends_on map -
-//   frontend:
-//     depends_on:
-//       api-gateway:
-//         condition: service_healthy
-// - and the block then ran on to the end of the NEXT real service, so that
-// service's published ports were attributed to this one. Anchoring to the
-// indentation of the first service under "services:" is what makes a header a
-// header.
+// Top-level service blocks of a compose file, keyed by name, anchored to the file's own indentation.
 function splitComposeServiceBlocks(content) {
   const blocks = {};
   const servicesMatch = content.match(/^services:\s*$/m);
@@ -92,9 +63,7 @@ function splitComposeServiceBlocks(content) {
   return blocks;
 }
 
-// The entries of a service's "ports:" declaration, whichever style it is
-// written in. Returns the raw strings ("5000:5000", "127.0.0.1:3000:3000",
-// "3000"), unquoted and without comments.
+// A service's "ports:" entries in either style (block list or flow), unquoted.
 function composePortEntries(serviceBlock) {
   const lines = String(serviceBlock).split('\n');
   const out = [];
@@ -106,7 +75,6 @@ function composePortEntries(serviceBlock) {
       indent = m[1].length;
       const inline = m[2].replace(/\s+#.*$/, '').trim();
       if (inline.startsWith('[')) {
-        // Flow style: everything between the brackets, split on commas.
         for (const part of inline.replace(/^\[|\]$/g, '').split(',')) {
           const value = part.trim().replace(/^["']|["']$/g, '');
           if (value) out.push(value);
@@ -134,37 +102,20 @@ async function findPortsInCompose(baseDir, possibleServiceNames) {
       for (const serviceName of possibleServiceNames) {
         const serviceBlock = serviceBlocks[serviceName];
         if (serviceBlock !== undefined) {
-          // Port mappings, in BOTH the styles compose accepts:
-          //
-          //   ports:                 ports: ["5000:5000", "9229:9229"]
-          //     - "5000:5000"
-          //
-          // Only the first was read, because the pattern required a line
-          // beginning with "-". The flow style is what a compact compose file
-          // uses, and a project writing it had its declared ports ignored
-          // entirely: the port then came from whatever the source happened to
-          // spell out, or from the 3000 fallback - so an app listening on 5000
-          // got an Ingress and a Service pointing at 3000.
           for (const entry of composePortEntries(serviceBlock)) {
-            // "8080:80" publishes 80 in the container; "3000" is the container
-            // port itself; an IP prefix binds the host side and says nothing
-            // about the container.
+            // "8080:80" is container port 80; an IP prefix binds the host side.
             const m = entry.match(/^(?:\d+\.\d+\.\d+\.\d+:)?(?:\d+:)?(\d+)(?:\/[a-z]+)?$/i);
             if (m) ports.add(parseInt(m[1], 10));
           }
 
-          // Services fronted by a reverse proxy (e.g. Traefik) often have no
-          // "ports:" mapping at all - the real listen port only shows up as a
-          // "traefik.http.services.<name>.loadbalancer.server.port=PORT" label.
+          // Behind a reverse proxy the port may appear only as a Traefik loadbalancer label.
           const traefikPortRegex = /loadbalancer\.server\.port=(\d+)/gi;
           let traefikMatch;
           while ((traefikMatch = traefikPortRegex.exec(serviceBlock)) !== null) {
             ports.add(parseInt(traefikMatch[1], 10));
           }
 
-          // Fall back to the port embedded in a healthcheck probe URL
-          // (e.g. `curl -f http://localhost:8000/health`), another common
-          // place the real listen port is the only place it's written down.
+          // Or only in a healthcheck URL.
           const healthcheckPortRegex = /healthcheck:[\s\S]*?:\/\/[^:\/\s"']+:(\d+)/i;
           const healthcheckMatch = healthcheckPortRegex.exec(serviceBlock);
           if (healthcheckMatch) {
@@ -177,15 +128,6 @@ async function findPortsInCompose(baseDir, possibleServiceNames) {
   return Array.from(ports);
 }
 
-
-
-// Resolves the build context directory for a compose service matched by
-// exact name (e.g. "api"), not by substring against directory names. A repo
-// can easily contain several directories that all happen to contain "api" as
-// a substring (e.g. "javaapi" and "nodeapi") with no reliable way to rank them
-// by name alone - but the project's own docker-compose.yml already states,
-// unambiguously, which one IS "the api" service. That's a stronger signal
-// than any directory-name heuristic and should be checked first.
 async function findServiceContextFromCompose(baseDir, serviceNames) {
   const composeFiles = listComposeFiles(baseDir);
   for (const file of composeFiles) {
@@ -204,8 +146,6 @@ async function findServiceContextFromCompose(baseDir, serviceNames) {
         block.match(/build:\s*["']?(\.[^\s"'#{][^\s"'#]*)["']?\s*$/m);
       if (!contextMatch) continue;
 
-      // Relative to the compose file's own directory - see the note in
-      // findBuildableComposeServices.
       const contextPath = path.resolve(composeBaseDir(baseDir, file), contextMatch[1]);
       try {
         const stat = await fs.stat(contextPath);
@@ -216,22 +156,7 @@ async function findServiceContextFromCompose(baseDir, serviceNames) {
   return null;
 }
 
-// Reverse-proxy configs (e.g. an nginx "api gateway" container that fronts
-// several backend services) often state, unambiguously, which URL prefix
-// belongs to which backend port - `location /webapi { proxy_pass
-// http://webapi:9000; }`. That's a stronger, more direct signal for "who owns
-// this route prefix" than trying to infer it from what the frontend calls,
-// which has no way to know that two visually unrelated prefixes (e.g. "/api"
-// and "/webapi") actually belong to two entirely different backend
-// processes. Returns a Map of route prefix -> port.
-// docker-compose's build: declarations are the authoritative inventory of what
-// this repository actually builds - including the service whose context is the
-// repo ROOT, which no directory scan can ever discover (there is no
-// subdirectory to find) and which is not necessarily the frontend. Only the
-// compose file says whose Dockerfile that is.
-//
-// Returns { <compose service name>: { context: <abs path>, dockerfile } } for
-// every service that declares a build context.
+// Every compose service that builds from a context: name -> { context, dockerfile }.
 async function findBuildableComposeServices(baseDir) {
   const composeFiles = listComposeFiles(baseDir);
   for (const file of composeFiles) {
@@ -243,8 +168,6 @@ async function findBuildableComposeServices(baseDir) {
     const blocks = splitComposeServiceBlocks(content);
     const out = {};
     for (const [name, block] of Object.entries(blocks)) {
-      // Long form ("build:" then an indented "context:") wins over the short
-      // form ("build: ./dir"), since a block carrying both is using the long one.
       const ctxMatch = block.match(/^\s*context:\s*["']?([^\s"'#]+)["']?/m);
       const shortMatch = block.match(/^\s*build:\s*["']?([^\s"'#][^\s"'#]*)["']?\s*$/m);
       const rawContext = ctxMatch ? ctxMatch[1] : (shortMatch ? shortMatch[1] : null);
@@ -252,11 +175,7 @@ async function findBuildableComposeServices(baseDir) {
 
       const dfMatch = block.match(/^\s*dockerfile:\s*["']?([^\s"'#]+)["']?/m);
       out[name] = {
-        // Relative to the COMPOSE FILE, not the repository root - that is how
-        // docker-compose reads it, and a file kept in deploy/ says "../api"
-        // for the repository's own api/. Resolving against the root instead
-        // sent every context one level too high, outside the repository, and
-        // every service in the file was silently skipped as unbuildable.
+        // Contexts resolve against the compose file's own directory, as compose does.
         context: path.resolve(composeBaseDir(baseDir, file), rawContext),
         dockerfile: dfMatch ? dfMatch[1] : null,
       };
@@ -286,18 +205,9 @@ async function findRoutePortMapFromGatewayConfig(baseDir) {
   return routePortMap;
 }
 
-// A "port:" key in a structured config file can belong to the server this
-// service runs OR to any client it talks to, and the two are indistinguishable
-// without the key's position in the document. The flat regexes below read a
-// line at a time, so "spring.data.redis.port: 6379" and "spring.mail.port"
-// came back as ports of the service itself - producing Service objects
-// publishing a Redis port and an SMTP port that nothing in the pod listens on.
-//
-// Prefix guards (PG_, REDIS_, ...) cannot help here: nested YAML writes the
-// component name on an enclosing line, not on the port's own.
+// A "port:" key may belong to a client this service talks to; only listen-port key paths count.
 const CLIENT_COMPONENT_KEY_REGEX = /^(redis|valkey|mongo|mongodb|datasource|jdbc|r2dbc|elasticsearch|opensearch|solr|rabbitmq|amqp|kafka|pulsar|nats|mail|smtp|imap|ftp|sftp|ldap|memcached|cassandra|influx|neo4j|etcd|consul|vault|minio|s3|eureka|zipkin|jaeger|otlp|statsd|graphite|sentry|keycloak|oauth2|clickhouse|db|database|cache|broker|queue|registry|discovery|client|proxy|upstream|remote|external)$/i;
 
-// Key paths that really do name the port this process listens on.
 const LISTEN_PORT_PATHS = [
   ['server', 'port'],
   ['port'],
@@ -318,9 +228,6 @@ function isListenPortPath(pathParts) {
     candidate.length === lower.length && candidate.every((seg, i) => seg === lower[i]));
 }
 
-// Reads YAML by indentation (no parser: these files routinely contain
-// placeholders and multi-document separators a strict parser rejects) and
-// returns only the ports this service listens on.
 function findListenPortsInYaml(content) {
   const found = new Set();
   const stack = []; // [{ indent, key }]
@@ -334,7 +241,6 @@ function findListenPortsInYaml(content) {
 
     while (stack.length > 0 && stack[stack.length - 1].indent >= indent) stack.pop();
 
-    // A dotted key ("spring.data.redis.port: 6379") carries its own path.
     const parts = [...stack.map(e => e.key), ...key.split('.')];
     if (parts[parts.length - 1].toLowerCase() === 'port') {
       const num = value.match(/^["']?(\d+)["']?$/);
@@ -345,8 +251,6 @@ function findListenPortsInYaml(content) {
   return found;
 }
 
-// .properties / .ini / .env-style files: the whole path is on the line, so no
-// indentation tracking is needed.
 function findListenPortsInFlatConfig(content) {
   const found = new Set();
   for (const rawLine of content.split('\n')) {
@@ -364,26 +268,13 @@ function findListenPortsInFlatConfig(content) {
 
 const STRUCTURED_CONFIG_EXTENSIONS = ['.yml', '.yaml', '.properties', '.ini', '.cfg', '.conf', '.toml'];
 
-// Prose describes the system; it does not configure it. A README with an
-// architecture diagram ("Auth Service ... Port 8081", repeated for every
-// service) handed the loose port regexes every port in the project at once,
-// so whichever service happened to sit next to that file published a Service
-// with a port for each of its siblings.
+// Documentation describes ports, it does not configure them.
 const DOCUMENTATION_EXTENSIONS = ['.md', '.mdx', '.markdown', '.rst', '.adoc', '.txt'];
 
-// The structured-config reader already refuses a port that belongs to some
-// component the service TALKS TO rather than listens on (CLIENT_COMPONENT_KEY_
-// REGEX). The line-oriented regexes below had only a short hardcoded list of
-// prefixes to guard against, so a name like DD_TRACE_AGENT_PORT=8126 in a
-// Dockerfile - the Datadog agent's port, not the app's - came back as the
-// service's own listen port, on every service that instruments itself.
+// A port next to another component's name is that component's port.
 const CLIENT_PORT_CONTEXT_REGEX = /\b(dd|datadog|trace|apm|agent|statsd|otlp|jaeger|zipkin|redis|valkey|mongo|mongodb|mysql|postgres|postgresql|pg|mariadb|rabbit|rabbitmq|amqp|kafka|pulsar|nats|memcached?|elastic|elasticsearch|opensearch|solr|smtp|mail|imap|ldap|consul|vault|etcd|eureka|zookeeper|influx|influxdb|clickhouse|cassandra|neo4j|minio|sentry|grafana|prometheus|loki|tempo|db|database)[_-]/i;
 
-// A test's ports are the ports of whatever the test stands up - an embedded
-// broker, a fake SMTP server, a testcontainer - never the ports the service
-// itself listens on in production. Reading them produced Service objects
-// publishing e.g. port 25 because an integration test pinned
-// "spring.mail.port" to it.
+// Ports in tests belong to what the test starts, not to the service.
 const TEST_PATH_SEGMENTS = new Set(['test', 'tests', '__tests__', 'spec', 'specs', 'e2e', 'integration-test', 'it', 'testing', 'fixtures', 'mocks', '__mocks__']);
 
 function isTestPath(relativePath) {
@@ -396,12 +287,7 @@ async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort,
     new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?:process\\.env\\.)?(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)(?:${portNamesPattern})\\s*\\|\\|\\s*(\\d+)`, 'gim'),
     new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)port\\s*[:=]\\s*["']?(\\d+)["']?`, 'gim'),
     new RegExp(`^(?!\\s*(?:#|\\/\\/)).*--inspect(?:-brk)?=(?:[^:]+:)?(\\d+)`, 'gim'),
-    // These two carry the same comment guard as the ones above. Without it the
-    // loosest pattern - "port" followed by any number within 15 characters -
-    // matched prose: a Dockerfile line reading "# The old image exposed port
-    // 9000; the app now listens on 4000" contributed 9000, which then became
-    // apiPorts[0] and drove the Service, the Ingress backend and the readiness
-    // probe at a port nothing listens on.
+    // Comment lines are skipped: prose like "port 8080" is not configuration.
     new RegExp(`^(?!\\s*(?:#|\\/\\/))(?:.*?)(?:^|\\s)(?:--port|-p)\\s*[=:]?\\s*(\\d+)`, 'gim'),
     new RegExp(`^(?!\\s*(?:#|\\/\\/)).*(?<!PG_|DB_|DATABASE_|MONGO_|MYSQL_|POSTGRES_|REDIS_)\\bport\\b.{0,15}?(?<![a-zA-Z0-9.-])(\\d{2,5})\\b`, 'gim'),
     new RegExp(`^\\s*EXPOSE\\s+(\\d+)`, 'gim')
@@ -409,11 +295,7 @@ async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort,
 
   let filesToScan = await walkDir(targetDir);
 
-  // When targetDir *is* the repo root (a backend with no dedicated
-  // subdirectory - its Dockerfile sits at the root itself), walking it also
-  // walks straight into sibling services like frontend/ that just happen to
-  // live underneath the same root. Exclude their top-level directory names so
-  // a frontend's own port declarations don't get attributed to the backend.
+  // When the service is the repo root, sibling services' source is excluded from the scan.
   if (excludeDirNames.length > 0) {
     filesToScan = filesToScan.filter(f => {
       const rel = path.relative(targetDir, f);
@@ -424,7 +306,6 @@ async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort,
 
   filesToScan = filesToScan.filter(f => !isTestPath(path.relative(targetDir, f)));
 
-  // Also scan base dir .env files if they exist and aren't already in targetDir
   if (baseDir !== targetDir) {
     try {
       const baseFiles = await fs.readdir(baseDir);
@@ -445,8 +326,6 @@ async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort,
       const ext = path.extname(filePath).toLowerCase();
       if (DOCUMENTATION_EXTENSIONS.includes(ext)) continue;
 
-      // Structured config carries the component each port belongs to in the
-      // key path, so it is read structurally instead of line-by-line.
       if (STRUCTURED_CONFIG_EXTENSIONS.includes(ext)) {
         const structured = (ext === '.yml' || ext === '.yaml')
           ? findListenPortsInYaml(content)
@@ -461,13 +340,6 @@ async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort,
         const matches = [...content.matchAll(regex)];
         for (const match of matches) {
           if (match[1]) {
-            // The matched text carries the variable name the port was read
-            // from; when that names another component, it is that
-            // component's port, not this service's. A bare "port=8126," in a
-            // client's constructor names nothing on its own line, so the two
-            // lines above it are considered as well - that is where the
-            // client being configured is spelled out ("tracer.configure(",
-            // "hostname='dd-agent'").
             const lineStart = content.lastIndexOf('\n', Math.max(0, match.index - 1)) + 1;
             let contextStart = lineStart;
             for (let back = 0; back < 2 && contextStart > 0; back++) {
@@ -476,7 +348,6 @@ async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort,
             const contextText = content.slice(contextStart, match.index + match[0].length);
             if (CLIENT_PORT_CONTEXT_REGEX.test(contextText)) continue;
             const portNum = parseInt(match[1], 10);
-            // Valid port range
             if (portNum > 0 && portNum <= 65535) {
               ports.add(portNum);
             }
@@ -489,11 +360,7 @@ async function findPortsInDir(baseDir, targetDir, portNamesPattern, defaultPort,
   return ports.size > 0 ? Array.from(ports) : [defaultPort];
 }
 
-// Suffixes that mark a Dockerfile as built for tests/CI only, never as the
-// thing that actually serves production traffic - e.g. "Dockerfile.playwright"
-// spins up a Playwright E2E test runner, not a web server. Without this,
-// findDockerfile's partial-match fallback would happily pick that file as
-// "the" frontend production image whenever a plain Dockerfile is missing.
+// Dockerfiles for tests or CI, never for production.
 const NON_PRODUCTION_DOCKERFILE_HINTS = ['playwright', 'cypress', 'e2e', 'selenium', 'test', 'ci', 'dev', 'debug', 'lint', 'sonar'];
 
 async function findDockerfile(dir) {
@@ -512,22 +379,12 @@ async function findDockerfile(dir) {
   return null;
 }
 
-// The single most reliable statement of a service's health endpoint is the
-// one its author already wrote in docker-compose:
-//   healthcheck:
-//     test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/actuator/health || exit 1"]
-// findHealthRoute only ever looked for a quoted "/health"-style literal in
-// source code, so every service whose health endpoint is provided by a
-// framework (Spring Actuator, Micronaut, Quarkus) rather than written by hand
-// got no probe at all - a crashed process stayed in the Service's endpoints
-// and kept receiving traffic.
+// A compose healthcheck is the most reliable statement of the health endpoint.
 function findHealthCheckInComposeBlock(serviceBlock) {
   if (!serviceBlock) return null;
   const healthcheckIdx = serviceBlock.search(/^\s*healthcheck:/m);
   if (healthcheckIdx === -1) return null;
   const section = serviceBlock.slice(healthcheckIdx);
-  // Only an HTTP probe maps to a Kubernetes httpGet probe; "pg_isready" and
-  // friends are exec probes the database templates already handle.
   const urlMatch = section.match(/https?:\/\/[^\s"'\\]*?(?::(\d+))?(\/[^\s"'\\|)]*)/i);
   if (!urlMatch) return null;
   const route = urlMatch[2];
@@ -535,18 +392,9 @@ function findHealthCheckInComposeBlock(serviceBlock) {
   return { route: route.replace(/[?#].*$/, ''), port: urlMatch[1] ? parseInt(urlMatch[1], 10) : null };
 }
 
-// The compose service that BUILDS from `dir` - the one whose ports and
-// healthcheck describe what actually runs from that directory. Port and
-// healthcheck lookups used to go by name alone (the directory's basename and
-// a few conventional words), so "flask-api: build: ./backend" with
-// ports: ["5000:80"] was never read: nothing called "backend" existed in
-// compose, and the 3000 default won for an app listening on 80.
-//
-// Several services can build from one directory - an API and the workers
-// that share its image. Then the one named like the directory wins, failing
-// that the only one that publishes ports (workers rarely do); when even that
-// is ambiguous the answer is none, and the name-based lookup stands alone as
-// it did before.
+// The compose service that BUILDS from `dir` (not one named after it) - its ports and healthcheck
+// describe what runs from there. Several share a directory: the conventionally named one wins,
+// then the only one publishing ports; otherwise none.
 async function composeServicesBuiltFrom(baseDir, dir, conventionalNames = []) {
   let builds;
   try { builds = await findBuildableComposeServices(baseDir); } catch (e) { return []; }
@@ -587,9 +435,7 @@ async function findHealthCheckFromCompose(baseDir, serviceNames) {
   return null;
 }
 
-// Spring Boot Actuator, Micronaut and Quarkus all ship a health endpoint at a
-// fixed, conventional path as soon as the dependency is present - no route is
-// ever written in the project's own source for findHealthRoute to find.
+// Frameworks with a fixed health endpoint once the dependency is present.
 const FRAMEWORK_HEALTH_MARKERS = [
   { files: ['pom.xml', 'build.gradle', 'build.gradle.kts'], marker: /spring-boot-starter-actuator/i, route: '/actuator/health' },
   { files: ['pom.xml', 'build.gradle', 'build.gradle.kts'], marker: /micronaut-management/i, route: '/health' },
@@ -606,7 +452,6 @@ async function findFrameworkHealthRoute(servicePath) {
       } catch (e) { continue; }
       if (!entry.marker.test(content)) continue;
 
-      // Actuator's base path is configurable; honour it rather than assuming.
       if (entry.route === '/actuator/health') {
         const configured = await findActuatorBasePath(servicePath);
         if (configured) return `${configured.replace(/\/$/, '')}/health`;
@@ -634,30 +479,19 @@ async function findActuatorBasePath(servicePath) {
   return null;
 }
 
-// A controller routinely declares its health endpoint relative to a prefix
-// mounted on the whole class - Spring's class-level @RequestMapping("/api"),
-// NestJS's @Controller('api'), an Express router mounted with
-// app.use('/api', ...). Reading only the method-level literal produced
-// "/health" for an endpoint that actually answers at "/api/health", so the
-// startup probe got a 404 and Kubernetes killed the container in a loop: the
-// application was healthy the whole time, the probe was pointed at nothing.
+// A health route is relative to the class/router prefix it is mounted under.
 function findMountPrefixForHealth(content, ext) {
   if (ext === '.java') {
-    // @RequestMapping on the class itself, i.e. the annotation that sits
-    // immediately before the class declaration (any number of other
-    // annotations may be interleaved).
     const m = content.match(/@RequestMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']\s*\)[\s\S]{0,400}?\bclass\s+\w/);
     if (m) return m[1];
     return null;
   }
   if (ext === '.ts' || ext === '.js') {
-    // NestJS controller prefix.
     const nest = content.match(/@Controller\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/);
     if (nest) return nest[1].startsWith('/') ? nest[1] : '/' + nest[1];
     return null;
   }
   if (ext === '.py') {
-    // Flask blueprint / FastAPI router prefix.
     const m = content.match(/url_prefix\s*=\s*["']([^"']+)["']/) ||
       content.match(/APIRouter\s*\([^)]*prefix\s*=\s*["']([^"']+)["']/);
     if (m) return m[1];
@@ -668,10 +502,7 @@ function findMountPrefixForHealth(content, ext) {
 
 async function findHealthRoute(backendPath, excludeDirNames = []) {
   const possibleRoutes = ['\\/healthz', '\\/health-check', '\\/healthcheck', '\\/health', '\\/ping', '\\/status', '\\/ready', '\\/live'];
-  // Capture the WHOLE literal, not just its tail: a route written as
-  // "/api/health" must come back as "/api/health". Allow a trailing slash
-  // before the closing quote - frameworks like FastAPI commonly declare
-  // routes as e.g. "/health-check/".
+  // Capture the whole literal: "/api/health" stays "/api/health".
   const regex = new RegExp(`['"\`]((?:\\/[A-Za-z0-9_.-]+)*?(?:${possibleRoutes.join('|')}))\\/?['"\`]`, 'i');
 
   let filesToScan = await walkDir(backendPath);
@@ -704,11 +535,7 @@ async function findHealthRoute(backendPath, excludeDirNames = []) {
   return null; // Fallback
 }
 
-// Well-known infrastructure/plumbing component names that happen to contain
-// "server"/"app" but are never the project's actual business-logic backend
-// (e.g. Spring Cloud's config-server, service registries, discovery servers).
-// Without this, the substring match below picks "config-server" over real
-// service directories just because it contains "server".
+// Infrastructure components whose names contain "server"/"app" but are not the backend.
 const NON_BUSINESS_BACKEND_DIRS = ['config-server', 'config server', 'configserver', 'eureka-server', 'eureka server', 'discovery-server', 'discovery server', 'service-registry', 'registry-server', 'naming-server', 'zookeeper', 'consul-server'];
 
 async function analyzeBackend(baseDir) {
@@ -716,22 +543,13 @@ async function analyzeBackend(baseDir) {
   const partialDirs = ['api', 'backend', 'server', 'app'];
   let backendPath = null;
 
-  // 0. A docker-compose service literally named "api"/"backend"/"server" is
-  // ground truth for which directory the project itself considers "the"
-  // backend - check it before any directory-name guessing. Without this, two
-  // sibling directories that both happen to contain "api" as a substring
-  // (e.g. "javaapi" and "nodeapi") are indistinguishable to steps 1-2 below,
-  // which then pick whichever one readdir() happens to list first - with no
-  // relation to which one the project's own compose file calls "api".
+  // A compose service named api/backend/server is ground truth for the backend's directory.
   const composeContext = await findServiceContextFromCompose(baseDir, exactDirs);
   if (composeContext && await findDockerfile(composeContext)) {
     backendPath = composeContext;
   }
 
-  // 1. Try exact match first - only accept a candidate that actually has its
-  // own Dockerfile. Otherwise Flarops would generate a werf.yaml image block
-  // pointing at a Dockerfile that doesn't exist (e.g. a directory literally
-  // named "api" that's built by some other, non-per-service mechanism).
+  // Only a candidate with its own Dockerfile.
   if (!backendPath) {
     for (const dir of exactDirs) {
       const fullPath = path.join(baseDir, dir);
@@ -745,16 +563,13 @@ async function analyzeBackend(baseDir) {
     }
   }
 
-  // 2. Fallback to partial match (e.g., 'kanban-app', 'my-api')
   if (!backendPath) {
     try {
       const files = await fs.readdir(baseDir, { withFileTypes: true });
       for (const file of files) {
         if (file.isDirectory() && !file.name.startsWith('.') && file.name !== 'node_modules') {
           const lowerName = file.name.toLowerCase();
-          // Avoid matching frontend folders as backend
           if (['ui', 'frontend', 'client', 'web', 'front'].some(k => lowerName.includes(k))) continue;
-          // Avoid matching infrastructure/plumbing services as "the" backend
           if (NON_BUSINESS_BACKEND_DIRS.some(k => lowerName.includes(k))) continue;
 
           if (partialDirs.some(k => lowerName.includes(k))) {
@@ -769,16 +584,7 @@ async function analyzeBackend(baseDir) {
     } catch (err) { logDebug(err); }
   }
 
-  // 3. Last resort: some projects put the backend's Dockerfile directly at
-  // the repo root, with the actual application package living in a
-  // same-named subdirectory that has no Dockerfile of its own (e.g. a Django
-  // project's manage.py/requirements.txt/Dockerfile all sitting at the root,
-  // next to a "backend/" package folder that's just settings.py/urls.py/
-  // wsgi.py - no Dockerfile in sight). Steps 1 and 2 only ever look inside
-  // subdirectories, so this layout was invisible to them entirely. Only do
-  // this when the root Dockerfile doesn't look like it merely serves static
-  // frontend assets (nginx/httpd/caddy/apache) - that shape is far more
-  // likely a frontend-only repo than an unconventional backend layout.
+  // Last resort: a Dockerfile at the repo root, unless it serves a static frontend.
   if (!backendPath) {
     const rootDockerfile = await findDockerfile(baseDir);
     if (rootDockerfile) {
@@ -800,9 +606,6 @@ async function analyzeBackend(baseDir) {
     return { hasBackend: false, backendPath: null, port: 3000, healthRoute: null };
   }
 
-  // Only relevant when backendPath fell back to the repo root itself (step 3
-  // above) - a backend living in its own subdirectory never contains a
-  // sibling frontend/ to begin with, so this is a no-op in every other case.
   const scanExcludeDirNames = backendPath === baseDir ? ['frontend', 'client', 'ui', 'web', 'front'] : [];
 
   const portNamesPattern = ['PORT', 'SERVER_PORT', 'APP_PORT', 'API_PORT', 'HTTP_PORT', 'BACKEND_PORT', 'LISTEN_PORT', 'NODE_PORT', 'SERVICE_PORT'].join('|');
@@ -810,10 +613,7 @@ async function analyzeBackend(baseDir) {
   const builtFromBackend = await composeServicesBuiltFrom(baseDir, backendPath, [...partialDirs, path.basename(backendPath)]);
   const composePorts = await findPortsInCompose(baseDir, [...builtFromBackend, ...partialDirs, path.basename(backendPath)]);
 
-  // The Dockerfile compose names for this service, when it names one - the
-  // frontend and every additional service already worked this way. With only
-  // findDockerfile, a backend declared with "dockerfile: Dockerfile.prod"
-  // beside a development Dockerfile was built from the development one.
+  // The compose-declared Dockerfile wins over findDockerfile's guess.
   let composeDockerfile = null;
   if (builtFromBackend.length > 0) {
     try {
@@ -822,8 +622,7 @@ async function analyzeBackend(baseDir) {
     } catch (e) { logDebug(e); }
   }
   const dockerfile = composeDockerfile || await findDockerfile(backendPath);
-  // Most authoritative first: the probe the compose author actually wrote,
-  // then a framework's conventional endpoint, then a route literal in source.
+  // Most authoritative first: the compose probe, a framework convention, then a route in source.
   const composeHealth = await findHealthCheckFromCompose(baseDir, [...builtFromBackend, path.basename(backendPath), ...partialDirs]);
   const healthRoute = (composeHealth && composeHealth.route)
     || await findFrameworkHealthRoute(backendPath)
@@ -861,13 +660,6 @@ async function inferFrontendPortFromPackage(frontendPath) {
       } catch (e) { logDebug(e); }
     }
   } catch (e) { }
-  // No package.json, or none of its dependencies matched a known frontend
-  // framework (e.g. a non-JS app, like a Go binary serving its own static
-  // UI) - there's no real signal here at all, so don't invent one. Returning
-  // 80 unconditionally used to make this look exactly like a confident
-  // "static frontend on nginx" detection to every caller, letting it
-  // silently outrank an actually-detected port (e.g. from docker-compose)
-  // wherever the two were merged.
   return null;
 }
 
@@ -928,13 +720,7 @@ async function analyzeFrontend(baseDir, backendPath = null) {
   let frontendPath = null;
   let composeDockerfile = null;
 
-  // 0. If docker-compose names a frontend service, its build context IS the
-  // frontend - wherever it points. Every step below only ever looks at
-  // SUBDIRECTORIES, so a frontend built from the repo root (a very common
-  // Vite/Next layout: package.json and Dockerfile at the top, sources under
-  // client/) was invisible and the whole frontend silently dropped out of the
-  // deployment. The compose file is also the only thing that can say whose
-  // Dockerfile the root one is - it is not necessarily the frontend's.
+  // A compose service named frontend/client/ui/web: its context is the frontend, wherever it points.
   {
     const composeBuilds = await findBuildableComposeServices(baseDir);
     for (const name of Object.keys(composeBuilds)) {
@@ -953,9 +739,6 @@ async function analyzeFrontend(baseDir, backendPath = null) {
     }
   }
 
-  // 1. Try exact match first - only accept a candidate that actually has its
-  // own Dockerfile, otherwise Flarops would generate a werf.yaml image block
-  // pointing at a Dockerfile that doesn't exist.
   for (const dir of exactDirs) {
     const fullPath = path.join(baseDir, dir);
     if (fullPath === backendPath) continue;
@@ -968,7 +751,6 @@ async function analyzeFrontend(baseDir, backendPath = null) {
     } catch (err) { logDebug(err); }
   }
 
-  // 2. Fallback to partial match
   if (!frontendPath) {
     try {
       const files = await fs.readdir(baseDir, { withFileTypes: true });
@@ -986,7 +768,6 @@ async function analyzeFrontend(baseDir, backendPath = null) {
     } catch (err) { logDebug(err); }
   }
 
-  // 3. Fallback: heuristic scoring of directories with Dockerfile
   if (!frontendPath) {
     try {
       let bestScore = 0;
@@ -1023,26 +804,10 @@ async function analyzeFrontend(baseDir, backendPath = null) {
   const inferredPort = await inferFrontendPortFromPackage(frontendPath);
   const dockerfilePort = await analyzeDockerfile(frontendPath);
 
-  // dockerfilePort/inferredPort are real, specific signals (an EXPOSE line, a
-  // recognized frontend framework's own dev-server port convention) - a
-  // fixed 80 fallback used to masquerade as one of these even when neither
-  // fired, silently outranking an actually-detected compose/env port below.
-  // Only fall back to 80 once every other signal, including the ones found
-  // further down, comes up empty.
+  // 80 only as a last resort: a fixed fallback must not masquerade as a found port.
   const primaryPort = dockerfilePort !== null ? dockerfilePort : inferredPort;
 
   const portNamesPattern = ['PORT', 'FRONTEND_PORT', 'VITE_PORT', 'REACT_APP_PORT', 'NUXT_PORT'].join('|');
-  // Passing a hardcoded 80 here as "the" default reintroduces the exact
-  // problem above one level down: findPortsInDir returns it verbatim as a
-  // "found" port whenever its own regex scan comes up empty, indistinguishable
-  // from a real detection - so it would still end up ranked ahead of a
-  // genuinely-detected compose port. Pass null instead so an empty scan stays
-  // empty; the actual fallback to 80 only happens once, below, if nothing at
-  // all was found anywhere.
-  // When the frontend's build context IS the repo root, scanning it walks
-  // straight through every sibling service's source as well, and their listen
-  // ports come back as the frontend's own. Exclude the top-level directory
-  // each OTHER buildable service lives under.
   const frontendScanExcludes = [];
   if (path.resolve(frontendPath) === path.resolve(baseDir)) {
     const composeBuilds = await findBuildableComposeServices(baseDir);
@@ -1061,9 +826,6 @@ async function analyzeFrontend(baseDir, backendPath = null) {
   const builtFromFrontend = await composeServicesBuiltFrom(baseDir, frontendPath, [...exactDirs, path.basename(frontendPath)]);
   const composePorts = await findPortsInCompose(baseDir, [...builtFromFrontend, ...exactDirs, path.basename(frontendPath)]);
 
-  // A compose-declared dockerfile name wins: findDockerfile only guesses, and
-  // when the context is the repo root there are often several Dockerfiles
-  // around to guess wrongly between.
   const dockerfile = composeDockerfile || await findDockerfile(frontendPath);
   const needsRootContext = dockerfile ? await dockerfileNeedsRootContext(baseDir, frontendPath, dockerfile) : false;
 
@@ -1076,12 +838,7 @@ async function analyzeFrontend(baseDir, backendPath = null) {
   return { hasFrontend: true, frontendPath, ports, dockerfile, needsRootContext };
 }
 
-
-// excludeDirNames matters when serviceDir IS the repository root (a service
-// whose docker-compose build context is "."): without it the scan walks every
-// sibling service's source too, and their secrets are reported as this
-// service's - which is how a static frontend ended up being handed the
-// database password.
+// When the service is the repo root, exclude sibling services' directories.
 async function extractUsedEnvVars(serviceDir, excludeDirNames = []) {
   const { walkDir, logDebug } = require('./fsHelper');
   const envVars = new Set();
@@ -1099,23 +856,14 @@ async function extractUsedEnvVars(serviceDir, excludeDirNames = []) {
     const envVarRegex = /(?:process\.env\.|process\.env\[['"`]|os\.Getenv\(['"`]|getenv\(['"`]|System\.getenv\(['"`]|Environment\.GetEnvironmentVariable\(['"`]\$?|\$ENV\[['"`]|\$_ENV\[['"`]|\$\b)([a-zA-Z_][a-zA-Z0-9_]+)/g;
     const destructureRegex = /(?:const|let|var)\s*\{([^}]+)\}\s*=\s*process\.env/g;
 
-    // Python's os.environ (both subscript and .get) and Ruby's ENV - neither
-    // is spelled like any of the call forms above, so every Python/Ruby
-    // service previously looked like it read no environment at all.
+    // Python os.environ and Ruby ENV.
     const pythonRubyEnvRegex = /(?:os\.environ(?:\.get)?\s*[[(]\s*['"]|\bENV\s*(?:\.fetch\s*\(\s*)?\[?\s*['"])([A-Za-z_][A-Za-z0-9_]*)/g;
-    // Go struct tags: `env:"DB_HOST"` / `envconfig:"DB_HOST"` - the whole
-    // point of those libraries is that there is no Getenv call to find.
+    // Go struct tags (env:"X"): there is no Getenv call to find.
     const goStructTagRegex = /\b(?:env|envconfig)\s*:\s*"([A-Z_][A-Z0-9_]*)"/g;
 
     for (const file of files) {
       if (file.includes('node_modules') || file.includes('.git') || file.includes('dist') || file.includes('build')) continue;
       try {
-        // `fs` here is `require('fs').promises`, which has no readFileSync -
-        // calling it threw silently into the catch below on every single
-        // file, so this function always returned an empty list regardless of
-        // project or language. That meant every downstream consumer (which
-        // secrets actually get wired as container env vars) silently saw "no
-        // env vars are used anywhere", for every project.
         const fileContent = await fs.readFile(file, 'utf8');
 
         let match;
@@ -1141,33 +889,19 @@ async function extractUsedEnvVars(serviceDir, excludeDirNames = []) {
           }
         }
 
-        // Spring Boot (and anything else using the same placeholder syntax)
-        // resolves ${DB_PASSWORD} / ${DB_HOST:localhost} straight out of the
-        // environment from a config FILE - there is no call anywhere in the
-        // Java source to find. Without this, a Spring service reported zero
-        // used env vars, so every secret it needs was collected into
-        // deploy/.env and GitHub Secrets but never wired into the container,
-        // and the app died at startup on an unresolvable placeholder.
+        // Spring reads ${VAR} placeholders from config files.
         const base = path.basename(file);
         if (/^application(-[\w.]+)?\.(ya?ml|properties)$/.test(base) || /^bootstrap(-[\w.]+)?\.(ya?ml|properties)$/.test(base)) {
           const springPlaceholderRegex = /\$\{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*(?::[^}]*)?\}/g;
           let springMatch;
           while ((springMatch = springPlaceholderRegex.exec(fileContent)) !== null) {
-            // Spring's own relaxed-binding names (spring.datasource.url) are
-            // properties, not environment variables; only the SCREAMING_SNAKE
-            // form is something the container can actually be given.
+            // Only the SCREAMING_SNAKE form can be set as a container env var.
             const name = springMatch[1];
             if (/^[A-Z][A-Z0-9_]*$/.test(name)) envVars.add(name);
           }
         }
 
-        // Python's pydantic-settings (and plain pydantic BaseSettings before
-        // it) never calls os.getenv()/os.environ[] at all - a class field
-        // like "SECRET_KEY: str" inside a `class Settings(BaseSettings):` is
-        // automatically populated from the identically-named environment
-        // variable purely by field name. None of the call-based patterns
-        // above can see that, so every such field silently looked "unused"
-        // and never got wired into the container's env at all.
+        // pydantic BaseSettings fields are env vars without any os.getenv call.
         if (file.endsWith('.py') && /from\s+pydantic(?:_settings)?\s+import[^\n]*BaseSettings|class\s+\w+\s*\(\s*BaseSettings\s*\)/.test(fileContent)) {
           const pydanticFieldRegex = /^[ \t]+([A-Z][A-Z0-9_]*)\s*:\s*\S/gm;
           let fieldMatch;
@@ -1182,20 +916,8 @@ async function extractUsedEnvVars(serviceDir, excludeDirNames = []) {
   return Array.from(envVars);
 }
 
-// True if `servicePath` is a module of a Maven multi-module reactor rooted at
-// `baseDir` (a root pom.xml with <packaging>pom</packaging> that lists this
-// directory under <modules>). Such a module's own pom.xml inherits <parent>
-// from the root pom, which Maven resolves via the default "../pom.xml"
-// relative lookup - so the module can only be built with the *repo root* as
-// Docker build context (not the module's own directory, which wouldn't
-// include the parent pom at all).
-// True if `dockerfileName` (inside `servicePath`) has a COPY/ADD instruction
-// whose source only exists relative to the repo root (`baseDir`), not
-// relative to the service's own directory - e.g. a backend Dockerfile that
-// also builds and embeds a sibling frontend/ directory into the same image
-// (a common monorepo pattern). Such a Dockerfile can only be built with the
-// repo root as Docker build context; using the service's own directory as
-// context would make those COPY sources unreachable and the build would fail.
+// True if the Dockerfile COPYs something that exists only relative to the repo root, so the root
+// must be the build context.
 async function dockerfileNeedsRootContext(baseDir, servicePath, dockerfileName) {
   try {
     let content = await fs.readFile(path.join(servicePath, dockerfileName), 'utf8');
@@ -1240,11 +962,7 @@ async function isMavenReactorModule(baseDir, servicePath) {
   }
 }
 
-// Flarops copies its own Go dashboard into the target repo. Once generated it
-// lives under deploy/ (already ignored), but when Flarops runs against its own
-// source tree the copy sits at dashboard/ - recognised here by its module
-// path rather than by blacklisting the name "dashboard", which is an entirely
-// reasonable name for a user's own service.
+// Never treat Flarops' own dashboard copy as one of the project's services.
 async function isFlaropsOwnDashboard(servicePath) {
   try {
     const goMod = await fs.readFile(path.join(servicePath, 'go.mod'), 'utf8');
@@ -1254,12 +972,6 @@ async function isFlaropsOwnDashboard(servicePath) {
   }
 }
 
-// Builds one service entry. Kept separate from discovery so a service found
-// via docker-compose (possibly nested under services/, or built from the repo
-// root) is analysed exactly the same way as one found by scanning directories.
-// Top-level directory names that belong to some OTHER buildable service.
-// Needed whenever a service's own context is the repository root, so scans
-// rooted there don't absorb their siblings' ports, env vars and secrets.
 async function rootContextExcludes(baseDir, claimedPaths = []) {
   const excludes = new Set();
   let composeBuilds = {};
@@ -1276,18 +988,9 @@ async function rootContextExcludes(baseDir, claimedPaths = []) {
 }
 
 /**
- * One entry of the additionalServices[] list: a service this repository builds
- * that is neither the primary backend nor the primary frontend.
- *
- * The shape is declared in one place because it is filled in two very
- * different ones. The DISCOVERY fields below come from this file and describe
- * what was found on disk; the DEPLOYMENT fields are written later by
- * bin/commands/init.js as it scans docker-compose, wires databases and
- * resolves route ownership. Before this factory existed the deployment fields
- * simply appeared, each guarded by its own `s.x = s.x || []` at whichever
- * write site happened to run first - so whether a field was an array, a Set,
- * null or absent depended on which code path a given project took, and every
- * template had to defend against all four.
+ * One entry of the additionalServices[] list. DISCOVERY fields come from this file; DEPLOYMENT
+ * fields are filled in later by bin/commands/init.js, but every field has its final type from
+ * the start (see makeServiceEntry).
  *
  * @typedef {Object} ServiceEntry
  *
@@ -1325,13 +1028,6 @@ async function rootContextExcludes(baseDir, claimedPaths = []) {
  * @property {?string[]}         command        compose `command:` override, carried to the pod as args.
  */
 
-// Every deployment field gets its final TYPE here even though its value is
-// filled in later, so a consumer can read `service.secretKeys.length` without
-// asking first whether this particular project's code path happened to create
-// it. The three fields defaulting to null rather than an empty container are
-// the ones whose emptiness is meaningful: an absent database, an absent
-// command and an absent build-args block are each rendered differently from
-// empty ones.
 function makeServiceEntry(discovered) {
   return {
     ...discovered,
@@ -1353,10 +1049,6 @@ function makeServiceEntry(discovered) {
 }
 
 async function buildServiceEntry(baseDir, dirPath, name, composeNames, siblingExcludes, composeDockerfile, { sharesDirectory = false } = {}) {
-  // A compose service names its OWN Dockerfile, and several services routinely
-  // share one build context with a different one each ("Dockerfile.api" and
-  // "Dockerfile.worker" over the same ./app). findDockerfile can only ever
-  // return one of them, so the compose declaration wins whenever there is one.
   const dockerfile = composeDockerfile || await findDockerfile(dirPath);
   if (!dockerfile) return null;
   if (await isFlaropsOwnDashboard(dirPath)) return null;
@@ -1365,13 +1057,8 @@ async function buildServiceEntry(baseDir, dirPath, name, composeNames, siblingEx
   const dirPorts = await findPortsInDir(baseDir, dirPath, portNamesPattern, null, siblingExcludes || []);
   const composePorts = await findPortsInCompose(baseDir, composeNames);
 
-  // A directory shared with another service - a worker or a cron runner
-  // beside the API, on the same image - holds THAT service's ports and routes
-  // too. Read from source, the worker inherited the API's /api/health and the
-  // port-80 fallback, its liveness probe hit a process that serves no HTTP,
-  // and it restarted forever. For such a service only what compose states
-  // about it is evidence; with no port declared it has no port, and gets no
-  // Service and no probes.
+  // A directory shared with another service holds THAT service's ports and routes too, so only what
+  // compose states about this one counts; with no port it gets no Service and no probes.
   let ports = Array.from(new Set([...(sharesDirectory ? [] : dirPorts), ...composePorts])).filter(p => p !== null);
   if (ports.length === 0 && !sharesDirectory) ports = [80]; // fallback
 
@@ -1379,38 +1066,19 @@ async function buildServiceEntry(baseDir, dirPath, name, composeNames, siblingEx
   const healthRoute = (composeHealth && composeHealth.route)
     || (sharesDirectory ? null : (await findFrameworkHealthRoute(dirPath) || await findHealthRoute(dirPath)));
   const healthPort = composeHealth ? composeHealth.port : null;
-  // Same reasoning for the variables it reads: scanning a shared directory
-  // finds what EVERY service built from it reads, so a cron runner was wired
-  // the worker's WORKER_TOKEN. Compose is the whole truth about a compose
-  // service's environment anyway - its container gets environment: and
-  // env_file and nothing else - and both are wired from the compose scan in
-  // init.js regardless of this list.
+  // Same for env vars: compose's environment:/env_file are the whole truth for a compose service.
   const usedEnvVars = sharesDirectory ? [] : await extractUsedEnvVars(dirPath, siblingExcludes || []);
 
   const { analyzeBackendExposedRoutes } = require('./routeAnalyzer');
-  // No port, no Service - and an Ingress rule cannot point at nothing.
+  // No port, no Service - and no Ingress route to it.
   const exposedRoutes = ports.length > 0 ? await analyzeBackendExposedRoutes(dirPath) : [];
   const isReactorModule = await isMavenReactorModule(baseDir, dirPath);
 
   return makeServiceEntry({
     name,
-    // Set here rather than in init.js, where it used to be filled in only
-    // after the compose scan. The root-context check that decides whether the
-    // repository needs a .dockerignore runs well before that point and reads
-    // this field, so for an additionalService both of its arms compared
-    // against undefined and never fired - the one case the check was added
-    // for (a compose service declaring "context: .") was exactly the one it
-    // could not see.
     relativePath: path.relative(baseDir, dirPath),
-    // init.js sanitizes `name` into an RFC-1123 k8s name ("My_Service" ->
-    // "my-service"), after which matching it against a raw docker-compose
-    // service key silently stopped working and that service's whole
-    // environment: block was dropped. Keep the original spelling so the
-    // compose scan can still recognise it.
+    // The compose key may differ from the sanitized name; keep the original for matching.
     originalName: name,
-    // The compose key can differ from the directory name entirely (a service
-    // in services/auth-service declared as "auth", say), and it is what every
-    // env/depends_on lookup in init.js keys off.
     composeName: composeNames.find(n => n !== name) || name,
     path: dirPath,
     ports,
@@ -1429,31 +1097,12 @@ async function analyzeAdditionalServices(baseDir, knownPaths, claimedComposeName
   const seen = new Set();
   const candidates = [];
 
-  // Identity is the (context, dockerfile) PAIR, not the context alone. Keyed
-  // on the directory only, a compose file declaring two services over one
-  // context - the common "api" + "worker" split, same source, different
-  // Dockerfile - had the second silently dropped: it never reached werf.yaml,
-  // never got a Deployment, and nothing said so.
-  // Contexts docker-compose already accounted for. The directory scan below
-  // must not revisit one: it would re-add the same source a third time under
-  // the folder's name, with whichever Dockerfile findDockerfile happens to
-  // pick first.
   const composeContexts = new Set();
-  // A compose-declared candidate is identified by its compose key, which the
-  // file guarantees is unique; a scan-discovered one by its directory. Keyed
-  // on the directory for both, a compose file declaring two services over one
-  // context - the common "api" + "worker" split, whether they differ by
-  // Dockerfile or only by command - had the second silently dropped: it never
-  // reached werf.yaml, never got a Deployment, and nothing said so.
+  // A compose candidate is identified by its compose key, a scanned one by its directory: several
+  // compose services may share one context.
   const addCandidate = (dirPath, name, composeName, dockerfile, fromCompose) => {
     const resolved = path.resolve(dirPath);
-    // A claimed path is one already generated as the primary backend or
-    // frontend - but compose can declare SEVERAL services over that same
-    // context ("api" and "worker" sharing ./app, different Dockerfiles). Only
-    // the one whose compose key matches what was claimed is a duplicate; the
-    // others are distinct services, and short-circuiting on the path alone
-    // dropped them silently, which is the very case the keying below exists
-    // to handle.
+    // A claimed context can still back other compose services; only the claimed key is a duplicate.
     if (claimed.has(resolved) && !fromCompose) return;
     if (claimed.has(resolved) && fromCompose && claimedComposeNames.has(composeName)) return;
     const key = fromCompose ? 'compose\u0000' + composeName : 'dir\u0000' + resolved;
@@ -1462,27 +1111,17 @@ async function analyzeAdditionalServices(baseDir, knownPaths, claimedComposeName
     candidates.push({ dirPath: resolved, name, composeName, dockerfile: dockerfile || null });
   };
 
-  // 1. docker-compose is the authoritative inventory of what this repository
-  // builds. It is also the ONLY way to find a service that lives nested under
-  // services/ or apps/ (a directory scan stops at the top level, and the
-  // parent folder holds no Dockerfile of its own to notice), or one built
-  // from the repo root.
+  // 1. docker-compose is the authoritative inventory of what the repository builds.
   let composeBuilds = {};
   try {
     composeBuilds = await findBuildableComposeServices(baseDir);
   } catch (e) { logDebug(e); }
 
-  // How many compose services build from each context. A directory that backs
-  // exactly one service can lend it its name; a directory shared by several
-  // cannot, or they would all be called the same thing and collide as
-  // Kubernetes objects.
+  // A directory backing several services cannot lend them its name.
   const contextUseCount = {};
   for (const info of Object.values(composeBuilds)) {
     contextUseCount[info.context] = (contextUseCount[info.context] || 0) + 1;
   }
-  // Directory basenames are not unique across a monorepo either
-  // (services/a/api and services/b/api), so a basename claimed by more than
-  // one context cannot name any of them.
   const basenameUseCount = {};
   for (const info of Object.values(composeBuilds)) {
     const base = path.basename(info.context);
@@ -1492,28 +1131,19 @@ async function analyzeAdditionalServices(baseDir, knownPaths, claimedComposeName
   for (const [composeName, info] of Object.entries(composeBuilds)) {
     const rel = path.relative(baseDir, info.context);
     const base = path.basename(info.context);
-    // A service built from the repo ROOT has no directory of its own to be
-    // named after - basename(baseDir) is the repository's name, not the
-    // service's - so it keeps its compose key. So does one whose directory
-    // backs several services, or whose basename another context also claims:
-    // the compose key is the only name guaranteed unique in the file.
+    // Root-context and shared-context services keep their compose key as a name.
     const canUseDirName = rel !== '' && contextUseCount[info.context] === 1 && basenameUseCount[base] === 1;
     const name = canUseDirName ? base : composeName;
     composeContexts.add(path.resolve(info.context));
-    // The directory HOLDING a compose-declared Dockerfile is accounted for as
-    // well. "context: ." with "dockerfile: services/api/Dockerfile" is one
-    // service, but the scan below found services/api/Dockerfile again and
-    // generated a second copy of it - with a second database of its own.
+    // A compose-declared Dockerfile's directory is accounted for, so the scan does not find it again.
     if (info.dockerfile && path.dirname(info.dockerfile) !== '.') {
       composeContexts.add(path.resolve(info.context, path.dirname(info.dockerfile)));
     }
     addCandidate(info.context, name, composeName, info.dockerfile, true);
   }
 
-  // 2. Directory scan, for services docker-compose doesn't declare (or a
-  // project with no compose file at all). One level deep as before, plus the
-  // immediate children of a top-level directory that has no Dockerfile
-  // itself - the services/, apps/, packages/ monorepo layout.
+  // 2. Directory scan for services compose does not declare: one level, plus children of a
+  // Dockerfile-less top-level directory (services/, apps/).
   try {
     const entries = await fs.readdir(baseDir, { withFileTypes: true });
     for (const entry of entries) {
@@ -1539,17 +1169,12 @@ async function analyzeAdditionalServices(baseDir, knownPaths, claimedComposeName
     }
   } catch (e) { logDebug(e); }
 
-  // A service whose context is the repo root would otherwise have every
-  // sibling service's source scanned as its own (see the same guard in
-  // analyzeFrontend).
   const rootSiblingExcludes = await rootContextExcludes(baseDir, Array.from(claimed));
 
   for (const candidate of candidates) {
     const isRootContext = path.resolve(candidate.dirPath) === path.resolve(baseDir);
     const composeNames = Array.from(new Set([candidate.composeName, candidate.name].filter(Boolean)));
-    // Another service builds from the same directory - the backend, the
-    // frontend, or a sibling compose service. Then the directory's source
-    // describes all of them at once and cannot say anything about this one.
+    // Another service builds from the same directory.
     const sharesDirectory = claimed.has(candidate.dirPath) || (contextUseCount[candidate.dirPath] || 0) > 1;
     try {
       const entry = await buildServiceEntry(

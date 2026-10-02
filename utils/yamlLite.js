@@ -1,22 +1,5 @@
-// A reader for the YAML subset flarops.yaml is written in.
-//
-// Flarops carries no runtime dependencies, and this file is the one piece of
-// generated output a PERSON edits by hand - so unlike the ad-hoc scans
-// elsewhere in the codebase, it has to fail loudly on input it cannot
-// represent rather than quietly returning something plausible. Everything it
-// refuses is reported with a line number.
-//
-// Supported: nested mappings by indentation, sequences of scalars and of
-// mappings, quoted and bare scalars, integers, booleans, null, comments and
-// blank lines, flow collections ([1, 2] and {a: 1}), and anchors/aliases
-// (&name, *name, << merge keys). Not supported, and rejected rather than
-// guessed at: tabs, multi-line block scalars (| and >), multiple documents.
-//
-// Anchors are here because they are ordinary YAML that any other tool accepts,
-// and refusing them would make flarops.yaml a file that only this parser can
-// read. They also used to be worse than unsupported: "env: *shared" with
-// nothing indented under it parsed as the STRING "*shared", and the env block
-// it produced had one variable per character of that string.
+// A reader for the YAML subset flarops.yaml uses: no dependencies, and errors with line numbers
+// rather than a plausible wrong answer.
 
 class YamlError extends Error {
   constructor(message, line) {
@@ -52,9 +35,6 @@ function parseScalar(raw, lineNo) {
   return text;
 }
 
-
-// Splits "a, b, {c: d}" at top-level commas only - quotes and nested brackets
-// hold their contents together.
 function splitFlow(body, lineNo) {
   if (body.trim() === '') return [];
   const parts = [];
@@ -76,8 +56,6 @@ function splitFlow(body, lineNo) {
   return parts;
 }
 
-// [1, 2] and {a: 1} - the shapes an agent writes without thinking about it,
-// and which docker-compose files are full of.
 function parseFlowCollection(text, lineNo, resolve) {
   const body = text.slice(1, -1);
   if (text[0] === '[') {
@@ -92,9 +70,7 @@ function parseFlowCollection(text, lineNo, resolve) {
   return out;
 }
 
-// A node referenced by an alias is copied rather than shared: sync writes
-// through these objects, and two services silently pointing at one object
-// would make an edit to either change both.
+// Aliased nodes are copied, not shared: sync writes through these objects.
 function deepCopy(value) {
   if (Array.isArray(value)) return value.map(deepCopy);
   if (value && typeof value === 'object') {
@@ -103,9 +79,7 @@ function deepCopy(value) {
   return value;
 }
 
-// Strips a trailing comment, but only one introduced by whitespace-then-# and
-// not inside quotes - "#" is a perfectly ordinary character in a password or a
-// URL fragment.
+// Only whitespace-then-# outside quotes starts a comment; "#" is ordinary in passwords and URLs.
 function stripComment(line) {
   let quote = null;
   for (let i = 0; i < line.length; i++) {
@@ -140,12 +114,8 @@ function parse(text) {
   });
 
   let pos = 0;
-  // &name -> the node it labelled, for *name to copy later.
   const anchors = new Map();
 
-  // Turns the text to the right of a "key:" or a "- " into a value, handling
-  // the three things that can appear there besides a plain scalar: an anchor
-  // that labels it, an alias that stands for one, and a flow collection.
   function resolveInline(text, lineNo) {
     const trimmed = text.trim();
     if (trimmed.startsWith('*')) {
@@ -157,9 +127,6 @@ function parse(text) {
     }
     if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
       const closer = trimmed[0] === '[' ? ']' : '}';
-      // Without this an unclosed "[1, 2" falls through to parseScalar and
-      // becomes the literal string "[1, 2" - a wrong answer where the author
-      // can only have meant a list.
       if (!trimmed.endsWith(closer)) {
         throw new YamlError(`unclosed flow collection - expected a ${closer}`, lineNo);
       }
@@ -168,15 +135,11 @@ function parse(text) {
     return parseScalar(trimmed, lineNo);
   }
 
-  // Splits a leading "&name" off, returning [anchorName, whatIsLeft].
   function takeAnchor(text) {
     const m = String(text).match(/^&(\S+)\s*([\s\S]*)$/);
     return m ? [m[1], m[2]] : [null, text];
   }
 
-  // Reads every row at exactly `indent` (and their children) as one collection.
-  // Which KIND of collection is decided by the first row, and a later row of
-  // the other kind at the same indent is an error rather than a silent choice.
   function parseBlock(indent) {
     const isSequence = rows[pos].text.startsWith('- ') || rows[pos].text === '-';
     return isSequence ? parseSequence(indent) : parseMapping(indent);
@@ -193,10 +156,7 @@ function parse(text) {
       const m = row.text.match(/^([^:]+?)\s*:(?:\s+(.*))?$/);
       if (!m) throw new YamlError(`expected "key: value", found ${JSON.stringify(row.text)}`, row.lineNo);
       const key = parseScalar(m[1], row.lineNo);
-      // A repeated key is not a duplicate entry but a silently discarded one -
-      // the last wins and the earlier is lost without a word. In a file whose
-      // whole purpose is to declare what gets deployed, that is a change the
-      // author did not make and cannot see.
+      // A repeated key would silently drop the earlier value.
       if (seen.has(key)) throw new YamlError(`duplicate key ${JSON.stringify(String(key))}`, row.lineNo);
       seen.add(key);
       pos++;
@@ -212,8 +172,7 @@ function parse(text) {
       }
       if (anchor) anchors.set(anchor, value);
 
-      // "<<: *base" merges the aliased mapping in rather than storing it under
-      // the literal key "<<". Keys already written win, as YAML specifies.
+      // "<<: *base" merges the aliased mapping; keys already written win.
       if (key === '<<') {
         if (!value || typeof value !== 'object' || Array.isArray(value)) {
           throw new YamlError('<< must merge a mapping', row.lineNo);
@@ -246,8 +205,6 @@ function parse(text) {
         continue;
       }
 
-      // "- key: value" opens a mapping whose remaining keys are indented to
-      // where that key starts, two columns past the dash.
       if (/^[^:'"\[{]+:(\s|$)/.test(inline)) {
         const childIndent = indent + 2;
         rows.splice(pos, 0, { indent: childIndent, text: inline, lineNo: row.lineNo });

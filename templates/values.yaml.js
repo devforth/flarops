@@ -1,18 +1,8 @@
-// Renders deploy/helm/values.yaml.
-//
-// Extracted so `flarops sync` emits exactly what `flarops init` does. These
-// are the knobs an operator turns without regenerating anything, and a second
-// copy of this emitter would have meant a service declared by hand in
-// flarops.yaml quietly acquiring a different shape from one init discovered -
-// which is the very thing sync exists to prevent.
-//
-// `context` is mutated: generateEnvString sets hasLocalhostWarnings on it when
-// any value still points at localhost, and the caller reports that once.
+// Renders deploy/helm/values.yaml; init and sync both use it.
 
 const { yamlEscapeDoubleQuoted, generateEnvString } = require('../utils/yamlWrite.js');
 const { normalizeRoutes } = require('../utils/routes.js');
 
-// Routes are written as objects so a transformation can travel with the path.
 const renderRoutes = (list, indent) => {
   const routes = normalizeRoutes(list);
   if (routes.length === 0) return `${' '.repeat(indent)}[]`;
@@ -36,9 +26,8 @@ ${s.secretKeys.map(k => '      - ' + k).join('\n')}
     healthPort: ${s.healthPort || 'null'}
     exposedRoutes:
 ${renderRoutes(s.exposedRoutes, 6)}
-    # false when this project's own API gateway already covers these routes
-    # (see detectServiceIsGateway) - set to true to also expose them directly,
-    # bypassing the gateway.
+    # false when this project's own API gateway already covers these routes -
+    # set to true to also expose them directly, bypassing the gateway.
     exposeDirectly: ${s.suppressDirectIngress ? 'false' : 'true'}
 ${s.command ? `    command:\n${s.command.map(a => '      - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}${(s.db && !s.db.shared) ? `    db:
       type: "${yamlEscapeDoubleQuoted(s.db.type)}"
@@ -52,9 +41,6 @@ ${s.command ? `    command:\n${s.command.map(a => '      - "' + yamlEscapeDouble
     }
   }
 
-  // Supporting services (see utils/composeSupport.js) carry a literal image
-  // from docker-compose rather than one werf builds, so the image belongs in
-  // values.yaml where it can be re-pinned without regenerating anything.
   let supportServicesYaml = '';
   if (config.supportServices && config.supportServices.length > 0) {
     supportServicesYaml = '\n# Third-party components declared in docker-compose that the application\n' +
@@ -120,15 +106,8 @@ ${additionalServicesYaml}${supportServicesYaml}
 apiRoutes:
 ${renderRoutes(config.apiRoutes, 2)}
 
-# instanceType and volumeSize are deliberately NOT set here. They are declared
-# once, in deploy/terraform/variables.tf, and CI reads them back out of
-# Terraform's outputs into these keys at deploy time (see the workflow's
-# buildValuesScript). Writing them here as well would mean three copies of the
-# same fact - chart, Terraform and dashboard - that drift the first time
-# someone resizes the fleet and only edits one of them.
-#
-# region is the exception: Terraform cannot be its source, because the region
-# has to be known before Terraform can initialise its own S3 backend.
+# instanceType and volumeSize are filled in by CI from Terraform's outputs -
+# change them in deploy/terraform/variables.tf, not here.
 aws:
   region: "${yamlEscapeDoubleQuoted(config.awsRegion)}"
   instanceType: null
@@ -136,15 +115,11 @@ aws:
 dashboard:
   replicas: 1
   storage: "1Gi"
-# Populated by CI from the registry credentials (see the workflow's
-# buildValuesScript) so private images can be pulled. Left null here on
-# purpose - nothing secret belongs in a committed file.
+# Filled in by CI from the registry credentials. Leave null: nothing secret
+# belongs in this committed file.
 imagePullSecret: null
-# Set by the PR-capsule workflow to the node the dashboard's capacity oracle
-# picked, and read by EVERY workload of the capsule. The stateful ones must
-# stay there - their local-path volumes live on that node's disk - and the
-# rest stay with them, so that tearing a capsule down leaves its node idle and
-# the worker can be reclaimed. Empty in production, which is not pinned.
+# Set by the PR-capsule workflow to the node a capsule is placed on. Leave
+# empty here.
 dataNodeSelector: {}
 `;
 

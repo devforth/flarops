@@ -1,17 +1,10 @@
-// Same layout concern as templates/database/deployment.js: Postgres 18+
-// needs its volume mounted one level up (/var/lib/postgresql, not
-// .../data) so the image can manage its own version-specific subdirectory.
-// See https://github.com/docker-library/postgres/pull/1259.
 function getPostgresMajorVersion(image) {
   const tag = (image || '').split(':')[1] || '';
   const match = tag.match(/^(\d+)/);
   return match ? parseInt(match[1], 10) : null;
 }
 
-// A dedicated database for one additional service (e.g. a Java service on
-// MySQL alongside a Node service on MongoDB) - mirrors
-// templates/database/deployment.js, but named after and scoped to this one
-// service instead of being the project's single shared "database".
+// A dedicated database for one additional service; mirrors templates/database/deployment.js.
 const { renderProbes } = require('../database/deployment.js');
 
 module.exports = (service) => {
@@ -78,9 +71,6 @@ metadata:
     app: {{ .Values.projectName }}
     component: ${resourceName}
 spec:
-  # A normal ClusterIP, for the reasons set out in templates/database/service.js:
-  # clusterIP is immutable, and a headless Service resolves to nothing at all
-  # while its pod is unready.
   selector:
     app: {{ .Values.projectName }}
     component: ${resourceName}
@@ -116,11 +106,6 @@ spec:
         - name: {{ .Values.projectName }}-registry
 {{- end }}
 {{- if .Values.dataNodeSelector }}
-      # Pinned because the volume is. k3s's default local-path StorageClass
-      # writes to one node's disk and its PersistentVolume carries node
-      # affinity, so a database pod that moves can never reach its data again.
-      # Every other workload of the capsule is pinned to the same node too (so
-      # that closing the pull request leaves that node idle and reclaimable).
       nodeSelector:
 {{ toYaml .Values.dataNodeSelector | indent 8 }}
 {{- end }}
@@ -134,13 +119,6 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           env:${envBlock}${renderProbes(db.type)}
-          # No resource requests or limits are set here on purpose. A generated
-          # figure is a guess about someone else's workload, and the two ways it
-          # can be wrong are both bad: too low and the pod is OOM-killed or
-          # throttled under load, too high and the scheduler reserves capacity
-          # nothing uses, which is exactly the capacity the capsule placement
-          # maths is trying to account for. Set them per service in
-          # deploy/helm/values.yaml when the real numbers are known.
           volumeMounts:
             - name: data
               mountPath: ${volumeMountPath}

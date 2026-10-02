@@ -68,7 +68,6 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
     return null;
   }
 
-  // 1. Determine Framework
   let packageJson = {};
   try {
     const pkgPath = path.join(frontendDir, 'package.json');
@@ -79,18 +78,7 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
 
   const allDeps = { ...(packageJson.dependencies || {}), ...(packageJson.devDependencies || {}) };
 
-  // Angular's esbuild-based builder (@angular-devkit/build-angular) has no
-  // built-in support for `process.env.*` or `import.meta.env.*` - it isn't a
-  // recognized global, so referencing it fails the TypeScript build outright
-  // (TS2591), unlike CRA/Vite/Vue-CLI where this is a real bundler feature.
-  // There's no equivalent build-time env var syntax for Angular to fall back
-  // to, so instead of injecting an env var reference, hardcoded backend URLs
-  // are rewritten straight to their relative path (dropping scheme/host/port
-  // entirely) - this is exactly what the env-var path degrades to anyway
-  // once deployed (see the .env.local/.gitignore handling below: the real
-  // host is only used for local dev and is never present in the committed,
-  // CI-built bundle), so going there directly keeps Angular working without
-  // ever emitting code its compiler rejects.
+  // Angular's builder supports neither process.env nor import.meta.env, so URLs are made relative instead.
   const isAngular = !!(allDeps['@angular/core'] || allDeps['@angular-devkit/build-angular']);
 
   let envVarSyntax = 'process.env.API_URL';
@@ -124,13 +112,11 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
   let backendDetectedUrl = null;
   const discoveredRoutes = new Set();
   
-  // Try to find an existing API env var in the code
   const existingEnvVars = {};
   for (const filePath of filesToScan) {
     if (!['.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte'].includes(path.extname(filePath))) continue;
     let content = await fsPromises.readFile(filePath, 'utf8');
     
-    // Look for process.env.XXXXX or import.meta.env.XXXXX
     const envRegex = /(?:process\.env\.|import\.meta\.env\.)([A-Z0-9_]+)/g;
     let match;
     while ((match = envRegex.exec(content)) !== null) {
@@ -143,7 +129,6 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
   }
   
   if (Object.keys(existingEnvVars).length > 0) {
-    // Sort by count
     const sorted = Object.entries(existingEnvVars).sort((a, b) => b[1] - a[1]);
     envVarKey = sorted[0][0];
     if (envVarKey.startsWith('VITE_') || envVarKey.startsWith('PUBLIC_')) {
@@ -161,18 +146,11 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
     let modified = false;
 
     for (const port of backendPorts) {
-      // Matches 'http://localhost:8000/some/path' or 'http://api.domain.com:8000/some/path'
       const regex = new RegExp(`(['"\`])(https?:\\/\\/[^\\/:\`"']+:${port})(.{0,100}?)\\1`, 'g');
       
       content = content.replace(regex, (match, quote, base, rest, offset, whole) => {
-        // Already the FALLBACK of an environment read
-        // ("process.env.API_URL ?? 'http://localhost:8000'") - the code is
-        // configurable as it stands. Rewriting it anyway turned the literal
-        // into the identifier API_URL, and when that line was itself the
-        // "const API_URL = ..." declaration (which is also why no new
-        // declaration was injected) the result was
-        // "const API_URL = process.env.API_URL ?? API_URL": a TypeScript build
-        // error, and a ReferenceError at runtime whenever the variable is unset.
+        // Already an env fallback ("process.env.X ?? 'http://...'"): rewriting it would make the variable
+        // refer to itself.
         const before = whole.slice(Math.max(0, offset - 40), offset);
         if (/(\?\?|\|\|)\s*\(?\s*$/.test(before)) return match;
 
@@ -214,7 +192,6 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
     }
   }
 
-  // 3. Create or update .env.local
   if (!isAngular && refactoredFilesCount > 0 && backendDetectedUrl) {
     const envLocalPath = path.join(frontendDir, '.env.local');
     const envEntry = `${envVarKey}=${backendDetectedUrl}\n`;
@@ -228,7 +205,6 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
       await fsPromises.writeFile(envLocalPath, `# Added by Flarops\n${envEntry}`);
     }
 
-    // 4. Ensure .env.local is ignored in .dockerignore and .gitignore
     const ignoreFiles = ['.dockerignore', '.gitignore'];
     for (const ignoreFile of ignoreFiles) {
       const ignorePath = path.join(frontendDir, ignoreFile);
@@ -269,7 +245,6 @@ async function refactorBackendDbUrl(backendDir, doModify = false) {
     let modified = false;
     let fileHasHardcoded = false;
 
-    // Detect existing process.env variables (looking for anything DB related)
     const envRegex = /process\.env\.([A-Z0-9_]*(?:DB|DATABASE|MONGO|POSTGRES|MYSQL)[A-Z0-9_]*(?:URL|URI|CONNECTION|STRING)?)/gi;
     let match;
     while ((match = envRegex.exec(content)) !== null) {
@@ -278,7 +253,6 @@ async function refactorBackendDbUrl(backendDir, doModify = false) {
       discoveredVars.add(key);
     }
 
-    // Refactor hardcoded strings
     const hardcodedRegex = /(['"`])((?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|mariadb):\/\/[^'"`]+)\1/g;
     
     let hdMatch;
@@ -291,7 +265,6 @@ async function refactorBackendDbUrl(backendDir, doModify = false) {
       }
     }
     
-    // Reset regex lastIndex since we used it in a while loop
     hardcodedRegex.lastIndex = 0;
 
     if (fileHasHardcoded && doModify) {
@@ -332,7 +305,6 @@ async function refactorNginxConf(frontendDir, backendPorts) {
     let modified = false;
 
     for (const port of backendPorts) {
-      // Matches proxy_pass http://kanban-app:8080/...
       const regex = new RegExp(`(proxy_pass\\s+https?:\\/\\/)([^\\/\\s:]+)(:${port})`, 'gi');
       content = content.replace(regex, (match, prefix, host, portStr) => {
         if (host.toLowerCase() !== 'api') {

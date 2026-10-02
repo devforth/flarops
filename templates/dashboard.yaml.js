@@ -15,13 +15,6 @@ kind: ClusterRole
 metadata:
   name: {{ .Values.projectName }}-dashboard-role-{{ .Values.werf.env }}
 rules:
-# nodes/proxy is deliberately NOT here. The API server maps a GET on a proxy
-# subresource to "get", and the kubelet serves /exec on GET as well as POST, so
-# that one verb also authorizes
-#   GET /api/v1/nodes/<node>/proxy/exec/<ns>/<pod>/<container>?command=sh
-# on every container in the cluster - and RBAC cannot narrow a subresource to
-# one path. It was needed only for the node disk gauge, which now comes from
-# the DaemonSet below instead.
 - apiGroups: [""]
   resources: ["nodes", "pods", "namespaces", "persistentvolumeclaims"]
   verbs: ["get", "list", "watch"]
@@ -42,10 +35,6 @@ subjects:
   name: flarops-dashboard
   namespace: {{ .Release.Namespace }}
 ---
-# configmaps are only ever read from the "default" namespace (see
-# dashboard/collector.go's GetConfigMaps("default") call) - scoped to a
-# namespaced Role instead of the cluster-wide ClusterRole above, so a
-# compromised dashboard pod can't enumerate configmaps in every namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -82,14 +71,6 @@ spec:
       storage: {{ .Values.dashboard.storage | default "1Gi" }}
 ---
 {{- if eq .Values.werf.env "production" }}
-# Reports one node's disk usage and nothing else. It replaces the dashboard's
-# former "get nodes/proxy", which reached the kubelet's stats/summary and, with
-# the same verb, exec on every container in the cluster (see the ClusterRole
-# above and dashboard/nodeagent.go).
-#
-# It mounts the host root READ-ONLY and is given no ServiceAccount token and no
-# API access at all: it answers two integers over the pod network. That is a
-# far smaller thing to hold than the authority it removes.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -106,8 +87,6 @@ spec:
         app: flarops-node-agent
     spec:
       automountServiceAccountToken: false
-      # The figures are for the node, so the agent has to be on every node -
-      # including any the operator has tainted.
       tolerations:
         - operator: Exists
       containers:
@@ -167,10 +146,6 @@ spec:
       labels:
         app: flarops-dashboard
       annotations:
-        # Rotating the dashboard credential rewrites the Secret but changes
-        # nothing about this Deployment, so without this the pod kept running
-        # on the old hash and the new password simply did not work until
-        # someone deleted the pod by hand.
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (list "DASHBOARD_PASSWORD_HASH")) }}
     spec:
       serviceAccountName: flarops-dashboard
@@ -190,28 +165,17 @@ spec:
           capabilities:
             drop: ["ALL"]
         env:
-        # The dashboard refuses to start without this (see loadAuthConfig in
-        # dashboard/auth.go) rather than falling back to serving the cluster's
-        # internals unauthenticated. Only the PBKDF2 hash travels here; the
-        # password itself was shown once by "flarops init" and stored nowhere.
         - name: DASHBOARD_PASSWORD_HASH
           valueFrom:
             secretKeyRef:
               name: {{ .Values.projectName }}-secrets
               key: DASHBOARD_PASSWORD_HASH
-        # Traefik terminates TLS and proxies to this pod, so the peer address
-        # is the ingress controller and the real client is only in
-        # X-Forwarded-For - which login rate limiting is keyed on.
         - name: DASHBOARD_TRUST_PROXY
           value: "1"
         - name: DOMAIN
           value: {{ .Values.domain | quote }}
         - name: DB_PATH
           value: "/data/flarops_metrics.db"
-        # The cost model used to hardcode this project's own region, instance
-        # type and root volume size, so spend was wrong for anyone running a
-        # different shape. Pass the real values the infrastructure was
-        # provisioned with instead.
         - name: AWS_REGION
           value: {{ .Values.aws.region | quote }}
         - name: FLAROPS_DEFAULT_INSTANCE_TYPE
@@ -252,12 +216,6 @@ kind: Ingress
 metadata:
   name: flarops-dashboard
   annotations:
-    # Same reasoning as templates/01-ingress.js: no cert-manager issuer and no
-    # tls: block, because the generated security group never opens 443. This
-    # one mattered more than the application's - the dashboard's session
-    # cookies carry the __Host- prefix and Secure, which a browser refuses to
-    # store on an http:// origin, so declaring TLS that cannot be served left
-    # the dashboard impossible to log into rather than merely unencrypted.
     traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
     kubernetes.io/ingress.class: traefik
 spec:

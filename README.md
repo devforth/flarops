@@ -8,6 +8,29 @@ Flarops reads your repository and writes the whole deployment for it: a Kubernet
 npm install -g flarops
 ```
 
+or run it without installing: `npx flarops init`.
+
+## Before you start
+
+**Your project**
+
+- A Git repository. Flarops runs from its root.
+- A `Dockerfile` for every service you want deployed. A service without one is not built.
+- A `docker-compose.yml` is not required, but it is the best input: services, ports, environment, commands, volumes and dependencies are read from it.
+
+**On your machine**
+
+- Node.js 18 or newer, `git`, Docker (for `docker login`) and `ssh-keygen`.
+- The AWS CLI. If it is missing, Flarops installs a signature-verified copy into `~/.local` — on Linux x86_64 only, and that needs `curl`, `unzip` and `gpg`. On other platforms install it yourself first.
+
+**Accounts**
+
+- **AWS** — an access key that can create a VPC, EC2 instances, an Elastic IP, security groups and an S3 bucket.
+- **A container registry** — Docker Hub or any other. Images are pushed there and pulled by the cluster.
+- **GitHub** — the repository, with Actions enabled. Deploys run there.
+- **A domain** — required: the dashboard and every pull-request environment get addresses derived from it.
+- **Cloudflare** (optional, recommended) — manages the DNS records and provides HTTPS (see below).
+
 ## The two commands
 
 Flarops has two commands, and the difference between them is the thing worth understanding first.
@@ -58,7 +81,7 @@ Applying flarops.yaml:
   GitHub Secret STRIPE_KEY: now required by the chart
 ```
 
-Then commit what it changed (`flarops.yaml`, `deploy/`, `werf.yaml`, `.github/workflows/`) and push. The pipeline deploys from what is in Git, so an uncommitted change does not reach the cluster.
+Then commit what it changed (`flarops.yaml`, `deploy/`, `werf.yaml`, `werf-giterminism.yaml`, `.github/workflows/`) and push. The pipeline deploys from what is in Git, so an uncommitted change does not reach the cluster.
 
 **Sync is a merge, not a regeneration.** `init` learned things by reading your code that you cannot reasonably be asked to write down again — the database URLs it builds for each container, a migration step it found, SQL that seeds the database on first start. Those live in `deploy/.flarops-state.json` (committed, and not meant to be edited). Your edits are laid over them, so changing one line does not erase the rest.
 
@@ -197,6 +220,8 @@ A volume makes the service restart by stopping the old pod before starting the n
   command: ["node", "dist/worker.js"]
 ```
 
+A development-server command from `docker-compose.yml` (`--reload`, `--watch`, `npm run dev`, `next dev`, `nodemon`, …) is not carried over when the image has a `CMD` of its own — the image's command runs instead, and `init` says so. Set `command` here if production needs something else.
+
 ### A task, not a service
 
 Something that runs once and finishes — creating queue topics, seeding a store — is not a service. Declared as one it would exit, be restarted, exit again, forever.
@@ -251,6 +276,8 @@ A secret is missing from step 3 → the pod cannot start. A secret exists but no
 
 Values from `.env.example`, `.env.sample` and `.env.template` are never used: those files are committed, so their values are public. Their keys still count — the secret is wired and listed — but its value is left empty, marked `<- no value found; you must supply one`. The same goes for an obvious placeholder in a real `.env` (`changeme`, `your-…-here`, `replace_me`). A database password taken from one of those, or set to the engine's default (`postgres`, `root`, `admin`), is replaced with a random one. `init` lists every value it set aside.
 
+**Variables Flarops cannot see are yours to add.** It reads `.env` files, `environment:` and `env_file:` in `docker-compose.yml`, and the variables your source reads directly. Anything else — fields of a settings class (pydantic `BaseSettings`, …), variables a library reads by itself (`AUTH_SECRET` for next-auth, …), values only your README mentions — add to `flarops.yaml` (`env` or `secretEnvs`) and run `sync`. A required variable that is missing usually shows up as a container that exits at start.
+
 Some values appear more than once with a note to give them the same value. That happens when your `docker-compose.yml` read one credential into several variables — they have to match, or the services will not authenticate to each other.
 
 ## First deployment
@@ -268,7 +295,7 @@ None of these change anything on their own — they are written into the generat
 | `Enter docker registry` | Leave empty for Docker Hub. |
 | `Enter username for <registry>` | |
 | `Enter password for <registry>` | Hidden. Used immediately for `docker login`, then stored in `deploy/.env`. |
-| `Enter project domain` | Press Enter to deploy without a domain. |
+| `Enter project domain` | Required, asked again until it is a valid domain name. The dashboard and the pull-request environments are addressed under it. |
 | `Enter Cloudflare API Token` | Only if you enabled Cloudflare DNS. Hidden. |
 | `Enter Cloudflare Zone ID` | Only if you enabled Cloudflare DNS. |
 | `Enter project AWS Access Key ID` | Press Enter to use your default `~/.aws/credentials`. |
@@ -337,7 +364,7 @@ Everything under `deploy/helm/` is written by Flarops. Edit `flarops.yaml` and r
 
 ## The dashboard
 
-Deployed alongside your application at `dashboard.<your-domain>`, showing every node, every PR environment, memory allocation and running AWS spend.
+Deployed alongside your application, showing every node, every PR environment, memory allocation and running AWS spend. Its address is `dashboard.` plus your domain without its first label: `dashboard.example.com` for both `example.com` and `app.example.com`.
 
 It needs the password `init` printed. Only the hash reaches the cluster, and the dashboard refuses to start without a credential rather than coming up open.
 
@@ -345,9 +372,40 @@ Memory figures account for what Kubernetes reserves for itself, so "free" means 
 
 ## Pull request environments
 
-Opening a pull request deploys it to its own address at `<project>-pr-<number>.<domain>`, with the production database cloned into it. Closing the PR removes it and reclaims any machine left idle.
+Opening a pull request deploys it to its own address, with the production database cloned into it: `pr-<number>.example.com` for the domain `example.com`, or `app-pr-<number>.example.com` for `app.example.com`. Closing the PR removes it and reclaims any machine left idle.
 
-Before deploying, the pipeline asks the dashboard whether the environment fits and which machine has room. If none does, it adds one. Pull request pipelines run one at a time, so two of them cannot be sent to the same machine before either has landed.
+Before deploying, the pipeline asks the dashboard which machine has room for the environment, sized by what the same application uses in production right now. If none has room, it adds a worker machine — after waiting for any that another pull request is already adding. A "yes" reserves the machine until the environment appears, so two pull requests cannot be sent to the same room. All of one environment's pods run on its machine, so closing the PR leaves that machine empty and it can be removed.
+
+A pull request environment runs with the production secrets and a copy of the production data. That is intended for **private repositories**, where everyone who can open a pull request is trusted. Pull requests from forks receive no secrets, and their pipelines fail.
+
+## What it deploys
+
+| Layer | What you get |
+| --- | --- |
+| Infrastructure | AWS: one VPC with a public subnet, an EC2 instance (`t3a.medium`, Ubuntu 22.04 amd64, 40 GB gp3 root volume) behind an Elastic IP. Terraform state in S3 with native locking. |
+| Cluster | k3s `v1.36.4+k3s1`, pinned: one server node, plus worker nodes added and removed for pull-request environments. Traefik (built into k3s) is the ingress; volumes use k3s's local-path storage. |
+| Build and deploy | GitHub Actions run Terraform, then werf: it builds the images, pushes them to your registry and deploys the Helm chart. A push to `main` deploys production. |
+| DNS and HTTPS | With Cloudflare, the deploy creates DNS records for your domain and its wildcard, proxied through Cloudflare, which serves HTTPS. The cluster itself serves plain HTTP on port 80. |
+| Databases | PostgreSQL, MySQL, MariaDB or MongoDB as a StatefulSet. The image your `docker-compose.yml` pins is used; otherwise `postgres:18-alpine`, `mysql:26`, `mariadb:13` or `mongo:8`. |
+| Dashboard | A small Go service with SQLite on a 1 Gi volume. It reads EC2 prices from `instances.vantage.sh`, so it needs outbound internet access. |
+
+**All of this is yours to change.** The generated files are ordinary Terraform and Helm, and you can edit them to fit what you need:
+
+- `deploy/terraform/variables.tf` — instance type, root volume size, region, k3s version, domain.
+- `deploy/terraform/main.tf` — the rest of the infrastructure: the AMI, the security group rules, disk encryption, the network.
+- `deploy/helm/` — the chart: `values.yaml` and one template per service (probes, resource limits, storage sizes, Ingress annotations).
+
+Terraform files are never touched again after `init`, so edit them freely. The chart is different: `flarops sync` rewrites `deploy/helm/`, so a hand edit there lasts only until the next sync. Anything `flarops.yaml` can express — replicas, ports, env, secrets, routes, volumes, commands — belongs in `flarops.yaml`; edit the chart directly only for what it cannot, and re-apply the edit after each sync.
+
+## Good to know before you rely on it
+
+- **One server, one disk.** The control plane, production and its database run on a single EC2 instance, and volumes live on its root disk. Nothing is replicated and nothing is backed up automatically — set up database backups yourself.
+- **Open ports.** The security group allows 22 (SSH), 80 (HTTP) and 6443 (Kubernetes API) from anywhere. Narrow them in `deploy/terraform/main.tf` if you need to.
+- **HTTPS comes from Cloudflare.** Port 443 is not open. Without Cloudflare's proxy the application is plain HTTP, and the dashboard cannot be logged into: its session cookies are only sent over HTTPS.
+- **The root volume is not encrypted** unless you turn it on in `deploy/terraform/main.tf`.
+- **Terraform is written once.** `init` generates `deploy/terraform/`; `sync` does not touch it, and keeping it up to date is up to you. Changes to the AMI or to the instance's startup script reach new instances only — replace one deliberately (`terraform apply -replace=aws_instance.server`), remembering that its disk holds the cluster's data.
+- **It costs money.** EC2 instances, their volumes, the Elastic IP and the S3 bucket are billed to your AWS account. A worker added for a pull request is billed until the PR is closed and the worker is reclaimed.
+- **amd64 only.** The instances and the k3s install are x86_64.
 
 ## Features
 

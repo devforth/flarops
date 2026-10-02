@@ -1,17 +1,12 @@
-// The deployment state `flarops init` worked out, persisted for `flarops sync`.
-//
-// Written to deploy/.flarops-state.json and meant to be COMMITTED: sync runs
-// on a fresh clone and in CI, where nothing from the original init survives.
-// It holds names, paths, ports and key names - never a credential's value.
+// What init worked out, persisted for sync in deploy/.flarops-state.json (committed).
+// Names, paths and ports only - never a secret's value.
 
 const fs = require('fs');
 const path = require('path');
 
 const STATE_FILE = path.join('deploy', '.flarops-state.json');
 
-// A Set does not survive JSON, and forcedSecretKeys is one. Anything else that
-// is not plain data would be lost the same way, so it is converted here rather
-// than discovered missing later.
+// A Set does not survive JSON.
 function serializable(value) {
   if (value instanceof Set) return Array.from(value);
   if (Array.isArray(value)) return value.map(serializable);
@@ -25,10 +20,7 @@ function statePath(currentDir) {
   return path.join(currentDir, STATE_FILE);
 }
 
-// A service's `path` is an ABSOLUTE path on the machine init ran on. This file
-// is committed and read again on a fresh clone and in CI, where that path
-// names nothing - so it is dropped on the way out and rebuilt from
-// relativePath, which carries the same fact without the machine attached.
+// `path` is absolute and machine-specific; it is rebuilt from relativePath on read.
 function writeState(currentDir, config) {
   const state = serializable(config);
   for (const service of state.additionalServices || []) delete service.path;
@@ -40,8 +32,6 @@ function readState(currentDir) {
   if (!fs.existsSync(file)) return null;
   try {
     const state = JSON.parse(fs.readFileSync(file, 'utf8'));
-    // forcedSecretKeys comes back as an array; the templates that read it
-    // expect a Set.
     for (const service of state.additionalServices || []) {
       service.forcedSecretKeys = new Set(service.forcedSecretKeys || []);
       service.path = path.resolve(currentDir, service.relativePath || '.');

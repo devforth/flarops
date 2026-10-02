@@ -1,21 +1,13 @@
 module.exports = (config) => {
 const { secretRefs, urlEncodedRef, alreadyEmitted } = require('../generic/env.js');
 
-  // A shared credential (see tryWireSharedCredential in init.js) whose env
-  // var name on the frontend doesn't match the canonical secret key it was
-  // generated under - the container-side name and the Secret's own key are
-  // independent, exactly like generic/deployment.js's extraSecretEnvMappings.
   const extraSecretEnvBlock = secretRefs(config && config.frontendExtraSecretEnvMappings);
   const hasExtraSecretEnv = extraSecretEnvBlock.length > 0;
-  // The keys above are rendered straight into the manifest (their container-
-  // side names differ from the Secret keys), so they are invisible to the
-  // secretKeys list the checksum otherwise reads - name them explicitly or a
-  // rotation of one of them would not roll this pod.
+  // Keys rendered directly must be named for the checksum, or rotating them would not roll the pod.
   const quoteKeys = (keys) => keys.filter(Boolean).map(k => JSON.stringify(k)).join(' ');
   const frontendExtraKeyList = quoteKeys(
     ((config && config.frontendExtraSecretEnvMappings) || []).map(m => m.secretKey)
   );
-
 
   return `
 apiVersion: apps/v1
@@ -41,12 +33,6 @@ spec:
     spec:
       automountServiceAccountToken: false
 {{- if $.Values.dataNodeSelector }}
-      # The whole capsule sits on the node its placement chose, not only its
-      # database. Left to the scheduler, a capsule's stateless pods spread over
-      # every node with room, so closing one pull request freed no node at all:
-      # each still carried another capsule's api or worker, and the teardown
-      # that reclaims idle workers never found one idle. Production leaves this
-      # empty and is not pinned.
       nodeSelector:
 {{ toYaml $.Values.dataNodeSelector | indent 8 }}
 {{- end }}
@@ -87,13 +73,6 @@ spec:
 {{- end }}
 {{- end }}${extraSecretEnvBlock}
 {{- end }}
-          # No resource requests or limits are set here on purpose. A generated
-          # figure is a guess about someone else's workload, and the two ways it
-          # can be wrong are both bad: too low and the pod is OOM-killed or
-          # throttled under load, too high and the scheduler reserves capacity
-          # nothing uses, which is exactly the capacity the capsule placement
-          # maths is trying to account for. Set them per service in
-          # deploy/helm/values.yaml when the real numbers are known.
           livenessProbe:
             httpGet:
               path: /

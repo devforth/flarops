@@ -1,9 +1,4 @@
-// Directories that never contain the project's own application code. The
-// JS-centric entries were the original list; everything after them is
-// dependency or build output for another ecosystem, which used to be walked
-// and scanned exactly like first-party source - so a vendored library's own
-// ports, routes and env var reads were attributed to the user's service (and
-// on a large Go/Java repo, scanning them dominated the run time).
+// Directories that never contain the project's own application code.
 const IGNORED_DIRS = new Set([
   'node_modules',
   '.git',
@@ -17,11 +12,7 @@ const IGNORED_DIRS = new Set([
   'out',
   'deploy',
   '.keys',
-  // A repository's OWN deployment manifests describe infrastructure, not the
-  // application's source configuration - reading them back attributes a
-  // Service's targetPort or a ConfigMap's SERVER_PORT to whichever service
-  // happens to be scanned, and a project that already ships k8s/ or a Helm
-  // chart had those numbers turn up as its containers' listen ports.
+  // A repository's own deployment manifests: read back, their ports would be taken for the app's.
   'k8s',
   'kubernetes',
   'manifests',
@@ -29,21 +20,16 @@ const IGNORED_DIRS = new Set([
   'charts',
   'terraform',
   '.terraform',
-  // Go, PHP
   'vendor',
-  // Maven, Gradle, Rust, sbt
   'target',
   '.gradle',
-  // Python
   'venv',
   '.venv',
   '__pycache__',
   '.pytest_cache',
   '.tox',
   'site-packages',
-  // .NET
   'obj',
-  // CocoaPods
   'Pods'
 ]);
 
@@ -52,21 +38,7 @@ const DB_PASSWORD_REGEX = /^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS
 
 const COMMON_API_PREFIXES = ['/api', '/graphql', '/backend', '/v1', '/v2', '/rpc', '/trpc', '/socket.io'];
 
-// Directories that never contain a deployable service of this project, even
-// when they hold a Dockerfile.
-//
-// Two kinds of entry: dependency/build output (vendor, target, venv), and a
-// repository's own deployment manifests - a k8s/ or helm/ folder routinely
-// ships a Dockerfile per component for reference, and treating those as
-// services generates duplicates of things already deployed from their real
-// source.
-//
-// The list must only hold names that cannot plausibly be a user's own
-// service. "dashboard" and "templates" used to be here to stop Flarops' own
-// embedded copies from being detected, but both are perfectly ordinary
-// service names, so a real dashboard/ microservice was silently never
-// deployed. Flarops' own copy lives under deploy/ once generated, and is
-// recognised by module name otherwise - see isFlaropsOwnDashboard.
+// Directories that never hold a deployable service, even when they contain a Dockerfile.
 const SERVICE_SCAN_IGNORED_DIRS = new Set([
   'node_modules', 'deploy', 'dist', 'build', 'vendor', 'target', 'venv', '.venv',
   'k8s', 'kubernetes', 'manifests', 'helm', 'charts', 'terraform', '.terraform',
@@ -81,17 +53,7 @@ const DB_PORTS = {
   sqlite: 0
 };
 
-
-// Any address that means "this machine" - written as a bare host, as a URL, or
-// as a subdomain of localhost, which docker-compose setups with a local proxy
-// produce ("db.localhost", "proxy.localhost").
-//
-// Deliberately looser than the pattern used to REWRITE a value. Rewriting
-// needs certainty about what an address should become; reporting only needs to
-// know the value will not work in a cluster, where all of these resolve to the
-// container itself. Reporting a value Flarops cannot resolve is the whole
-// point: someone has to change it, and they can only do that if they are told
-// which one.
+// Any address meaning "this machine". Looser than the rewrite pattern on purpose: it only flags.
 const LOOPBACK_HOST_REGEX = /(^|[^A-Za-z0-9.-])(?:[A-Za-z0-9-]+\.)*localhost\b|\b127\.0\.0\.1\b|\b0\.0\.0\.0\b|\[::1\]/i;
 
 module.exports = {

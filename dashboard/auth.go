@@ -1,19 +1,7 @@
 package main
 
-// Authentication for the dashboard.
-//
-// The dashboard publishes the whole cluster's shape - every node, pod,
-// namespace, PVC and the project's running spend - on a public hostname
-// (dashboard.<domain>, see templates/dashboard.yaml.js). Before this file it
-// was served to anyone who guessed that name. Everything here exists to make
-// that impossible, and to fail closed rather than open when it is
-// misconfigured.
-//
-// Threat model this is written against: an unauthenticated attacker on the
-// internet who can reach the login page, plus a malicious third-party site
-// trying to ride a logged-in operator's browser (CSRF / cross-site WebSocket
-// hijacking). It is NOT a multi-user system - there is exactly one operator
-// credential, provisioned by `flarops init`.
+// Authentication for the dashboard: one operator credential, fail-closed when misconfigured, and
+// protected against brute force, CSRF and cross-site WebSocket hijacking.
 
 import (
 	"crypto/hmac"
@@ -50,23 +38,13 @@ const (
 	sessionCookieInsecure = "flarops_session"
 	csrfCookieInsecure    = "flarops_csrf"
 
-	// PBKDF2-HMAC-SHA256 at OWASP's recommended iteration count. Chosen over
-	// Argon2id to keep golang.org/x/crypto out of every generated project -
-	// one more module whose own toolchain floor would dictate the
-	// Dockerfile's (originally the reason; it no longer binds, since the
-	// Dockerfile now pins a current Go, but the dependency still buys
-	// nothing the standard library cannot do here). The password this
-	// protects is machine-generated with ~144 bits of entropy, which is far
-	// out of reach of any offline attack at this cost; the KDF is here for
-	// the case where an operator later replaces it with one of their own.
+	// PBKDF2-HMAC-SHA256 at OWASP's iteration count, on the standard library alone.
 	pbkdf2Iterations = 600000
 	pbkdf2KeyLen     = 32
 	pbkdf2SaltLen    = 16
 
 	maxLoginBodyBytes = 4 << 10
 
-	// How stale a session's recorded activity may get before it is written
-	// back. See sessionIsValid.
 	sessionActivityWriteInterval = time.Minute
 )
 
@@ -96,17 +74,13 @@ func (c *authConfig) csrfCookieName() string {
 	return csrfCookieInsecure
 }
 
-// ---------------------------------------------------------------- password
-
 type passwordHash struct {
 	iterations int
 	salt       []byte
 	key        []byte
 }
 
-// PBKDF2-HMAC-SHA256 (RFC 8018 section 5.2) over the standard library's HMAC.
-// Implemented here rather than imported so the dashboard keeps building with
-// nothing but the Go standard library plus the dependencies it already had.
+// PBKDF2 (RFC 8018 5.2) over crypto/hmac.
 func pbkdf2Key(password, salt []byte, iterations, keyLen int) []byte {
 	prf := hmac.New(sha256.New, password)
 	hashLen := prf.Size()
@@ -141,11 +115,7 @@ func pbkdf2Key(password, salt []byte, iterations, keyLen int) []byte {
 	return dk[:keyLen]
 }
 
-// Encoded form: pbkdf2-sha256$i=600000$<b64 salt>$<b64 key>
-// Only the hash ever leaves the machine that ran `flarops init` - it travels
-// as a GitHub secret into a Kubernetes Secret and finally this process's
-// environment. Whoever reads any of those still has to break PBKDF2 to get a
-// usable password.
+// Encoded form: pbkdf2-sha256$i=<n>$<b64 salt>$<b64 key>.
 func parsePasswordHash(encoded string) (*passwordHash, error) {
 	parts := strings.Split(strings.TrimSpace(encoded), "$")
 	if len(parts) != 4 {
@@ -163,8 +133,7 @@ func parsePasswordHash(encoded string) (*passwordHash, error) {
 	if err != nil || iterations < 1 {
 		return nil, fmt.Errorf("malformed iteration count %q", value)
 	}
-	// An attacker who could rewrite the environment could otherwise set i=1
-	// and turn the stored hash into a trivially crackable one.
+	// A rewritten environment must not be able to weaken the hash.
 	if iterations < 100000 {
 		return nil, fmt.Errorf("iteration count %d is below the 100000 minimum", iterations)
 	}
@@ -184,17 +153,7 @@ func parsePasswordHash(encoded string) (*passwordHash, error) {
 	return &passwordHash{iterations: iterations, salt: salt, key: key}, nil
 }
 
-// Each verification is deliberately expensive, so running them one at a time
-// keeps a burst of login attempts from monopolising the container's CPU.
-//
-// Serialising alone was not enough to bound that cost. The failure counters
-// below are incremented only AFTER a verification finishes, so a burst of
-// concurrent requests all read a counter of zero, all pass the rate check,
-// and all queue up here - the limiter capped the number of ANSWERED attempts,
-// never the number of queued ones, and the queue had no bound at all. Waiters
-// are counted, and anything arriving past the cap is turned away without
-// running the KDF, which is what actually bounds the work a single burst can
-// buy.
+// Verifications run one at a time, and at most this many may wait: the KDF is the expensive part.
 const maxQueuedVerifications = 4
 
 var (
@@ -202,9 +161,7 @@ var (
 	verifyWaiting atomic.Int32
 )
 
-// ErrVerifierBusy is returned rather than a plain "wrong password": the
-// credential was never examined, so reporting it as a failure would let an
-// attacker lock the operator out by keeping the queue full.
+// Not a failed attempt: the credential was never examined.
 var errVerifierBusy = errors.New("password verifier is saturated")
 
 func (h *passwordHash) verify(password string) (bool, error) {
@@ -221,8 +178,6 @@ func (h *passwordHash) verify(password string) (bool, error) {
 	return subtle.ConstantTimeCompare(candidate, h.key) == 1, nil
 }
 
-// ------------------------------------------------------------------ config
-
 func durationFromEnv(name string, fallback time.Duration) time.Duration {
 	raw := os.Getenv(name)
 	if raw == "" {
@@ -236,10 +191,7 @@ func durationFromEnv(name string, fallback time.Duration) time.Duration {
 	return d
 }
 
-// A missing or unparseable credential is fatal, never a reason to serve the
-// dashboard unauthenticated: the whole point of this file is that there is no
-// configuration mistake that quietly puts the cluster's internals back on the
-// public internet.
+// No configuration mistake may serve the dashboard unauthenticated.
 func loadAuthConfig() (*authConfig, error) {
 	encoded := os.Getenv("DASHBOARD_PASSWORD_HASH")
 	if strings.TrimSpace(encoded) == "" {
@@ -265,10 +217,8 @@ func loadAuthConfig() (*authConfig, error) {
 		hash:       hash,
 		sessionTTL: durationFromEnv("DASHBOARD_SESSION_TTL", 12*time.Hour),
 		idleTTL:    durationFromEnv("DASHBOARD_IDLE_TTL", 2*time.Hour),
-		// Flarops always publishes the dashboard through Traefik, so the peer
-		// address is the ingress pod and the real client only appears in
-		// X-Forwarded-For. Off by default so a directly-exposed deployment
-		// can't have its rate limiting bypassed by a forged header.
+		// Behind Traefik the client is in X-Forwarded-For; off by default so a forged header cannot bypass
+		// rate limiting on a directly exposed deployment.
 		trustProxy:    os.Getenv("DASHBOARD_TRUST_PROXY") == "1",
 		secureCookies: os.Getenv("DASHBOARD_ALLOW_INSECURE_COOKIES") != "1",
 		csrfKey:       csrfKey,
@@ -281,8 +231,6 @@ func loadAuthConfig() (*authConfig, error) {
 	}
 	return cfg, nil
 }
-
-// ---------------------------------------------------------------- sessions
 
 func initAuthSchema() error {
 	_, err := db.Exec(`
@@ -297,12 +245,7 @@ func initAuthSchema() error {
 	return err
 }
 
-// The CSRF key used to live only in this process's memory. Sessions outlive
-// the process - they are rows in SQLite on a persistent volume - so every
-// restart left already-logged-in operators holding sessions whose CSRF tokens
-// no longer verified, and logout answered them 403 until they cleared their
-// cookies. Keeping the key beside the sessions it authenticates makes the two
-// survive together, and lets a second replica agree with the first.
+// The CSRF key lives beside the sessions it authenticates, so both survive a restart.
 func loadOrCreateCSRFKey() ([]byte, error) {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dashboard_auth_keys (name TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
 		return nil, fmt.Errorf("could not open the auth key store: %w", err)
@@ -321,8 +264,7 @@ func loadOrCreateCSRFKey() ([]byte, error) {
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("could not seed CSRF key: %w", err)
 	}
-	// INSERT OR IGNORE, then re-read: two replicas starting at once must end
-	// up on the same key rather than each overwriting the other's.
+	// Two replicas starting at once must agree on one key.
 	if _, err := db.Exec(
 		`INSERT OR IGNORE INTO dashboard_auth_keys (name, value) VALUES ('csrf', ?)`,
 		base64.RawStdEncoding.EncodeToString(key),
@@ -347,8 +289,7 @@ func randomToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-// Sessions are stored by hash for the same reason passwords are: a read of
-// the SQLite file on the PVC must not hand over a working session.
+// Sessions are stored by hash: reading the database must not hand over a working session.
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
@@ -370,9 +311,7 @@ func createSession() (string, error) {
 	return token, nil
 }
 
-// Enforces BOTH bounds server-side: an absolute lifetime the cookie cannot
-// outlive, and an idle window. A stolen cookie is therefore useful for at
-// most idleTTL of inactivity, regardless of what the client claims.
+// Both an absolute lifetime and an idle window, enforced server-side.
 func sessionIsValid(token string) bool {
 	if token == "" {
 		return false
@@ -392,11 +331,7 @@ func sessionIsValid(token string) bool {
 		return false
 	}
 
-	// Written only when it is actually stale. Every request passes through
-	// here, static assets included, so refreshing on each one meant a SQLite
-	// write per asset on a ReadWriteOnce volume to move a timestamp by
-	// milliseconds. The idle window is measured in hours; a minute of
-	// granularity costs it nothing.
+	// Written only when stale: every request passes through here.
 	if now.Sub(lastSeen.UTC()) > sessionActivityWriteInterval {
 		if _, err := db.Exec(`UPDATE dashboard_sessions SET last_seen = ? WHERE token_hash = ?`, now, hashToken(token)); err != nil {
 			log.Println("auth: could not refresh session activity:", err)
@@ -429,12 +364,7 @@ func startSessionPurge() {
 	}()
 }
 
-// -------------------------------------------------------------------- CSRF
-
-// For a logged-in session the CSRF token is derived from the session token
-// rather than stored, so there is no second secret to leak and no way for the
-// two to drift apart. SameSite=Strict already blocks the cross-site POST;
-// this is the layer that still holds if a browser ever doesn't honour it.
+// Derived from the session token: no second secret to store.
 func sessionCSRFToken(sessionToken string) string {
 	mac := hmac.New(sha256.New, auth.csrfKey)
 	mac.Write([]byte(sessionToken))
@@ -445,16 +375,12 @@ func csrfTokenMatches(expected, got string) bool {
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(got)) == 1
 }
 
-// ---------------------------------------------------------- rate limiting
-
 type windowCounter struct {
 	count int
 	start time.Time
 }
 
-// Fixed-window failure counter. Deliberately counts only FAILURES, so an
-// operator using the dashboard normally never approaches the limit while a
-// brute-force run hits it within seconds.
+// Counts only failures.
 type attemptLimiter struct {
 	mu       sync.Mutex
 	window   time.Duration
@@ -510,19 +436,8 @@ func (l *attemptLimiter) cleanup() {
 	}
 }
 
-// The per-IP limiter is the credential protection: it caps a single source at
-// 10 guesses per quarter hour, and an attacker who trips it only locks out
-// themselves.
-//
-// The global limiter is deliberately NOT set anywhere near as tight. A hard
-// global lockout protects against distributed guessing, but it is also a
-// lever any anonymous client can pull to lock the operator out of their own
-// dashboard - and cheaply, since it needs only as many requests as the
-// threshold. Set well above anything a real operator generates, it stays what
-// it should be: a backstop that bounds how much CPU the deliberately
-// expensive PBKDF2 verification can be made to burn, rather than a second
-// credential control. The password Flarops issues carries ~144 bits of
-// entropy, so distributed guessing is not the threat this needs to stop.
+// Per-IP limiting is the credential protection; the global limiter is only a CPU backstop, so it
+// cannot be used to lock the operator out.
 var (
 	perIPLimiter  = newAttemptLimiter(10, 15*time.Minute)
 	globalLimiter = newAttemptLimiter(500, 15*time.Minute)
@@ -538,10 +453,7 @@ func startLimiterCleanup() {
 	}()
 }
 
-// With one trusted proxy in front (Traefik), the RIGHTMOST X-Forwarded-For
-// entry is the address that proxy actually observed - everything to its left
-// is whatever the client claimed and must not be trusted for rate limiting,
-// or an attacker would simply rotate a forged header to get unlimited tries.
+// With one trusted proxy, only the rightmost X-Forwarded-For entry is real.
 func clientIP(r *http.Request) string {
 	if auth.trustProxy {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
@@ -559,20 +471,13 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// ---------------------------------------------------------------- handlers
-
 type loginPageData struct {
 	Nonce     string
 	CSRFToken string
 	Error     string
 }
 
-// URL-safe alphabet on purpose: standard base64's "+" and "/" are escaped by
-// html/template inside an attribute value ("+" becomes "&#43;"), so the nonce
-// on the tag would no longer be byte-identical to the one in the header.
-// Browsers decode the entity before matching, but a CSP that only works
-// because of that is one parser change away from silently failing open.
-// "-" and "_" are valid in a CSP nonce and need no escaping.
+// URL-safe alphabet: html/template would escape "+" in the nonce attribute.
 func newNonce() string {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
@@ -655,20 +560,12 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
 
-	// Checked BEFORE the password is verified: the key derivation is
-	// deliberately expensive, so an unthrottled login endpoint would be a CPU
-	// exhaustion vector on top of being brute-forceable.
+	// Rate limit before the expensive verification.
 	if wait := perIPLimiter.retryAfter(ip); wait > 0 {
 		tooManyAttempts(w, wait)
 		return
 	}
-	// The global limiter deliberately does NOT gate the request here any more.
-	// Consulted before the credential was examined, it let distributed noise
-	// lock the operator out of their own dashboard with a correct password -
-	// 500 failures cost about three minutes of wall time against a fifteen
-	// minute window, so a handful of addresses kept it permanently tripped.
-	// Its real job is bounding CPU, and the verifier queue above does that
-	// directly. It stays as a signal.
+	// The global limiter only logs; gating on it would let distributed noise lock the operator out.
 	if wait := globalLimiter.retryAfter("global"); wait > 0 {
 		log.Printf("auth: global failure rate is elevated (%s remaining in window)", wait.Truncate(time.Second))
 	}
@@ -679,13 +576,10 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Double-submit: the token in the form has to match the one in a cookie
-	// that only a same-site request could have sent back.
+	// Double-submit CSRF check.
 	csrfCookie := cookieValue(r, auth.csrfCookieName())
 	csrfField := r.PostFormValue("csrf_token")
 	if csrfCookie == "" || !csrfTokenMatches(csrfCookie, csrfField) {
-		// Nothing sensitive is revealed here - this is almost always a stale
-		// tab rather than an attack, so re-issue and let the operator retry.
 		fresh, err := randomToken()
 		if err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -699,21 +593,11 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	username := r.PostFormValue("username")
 	password := r.PostFormValue("password")
 
-	// Both comparisons always run, and the key derivation is performed even
-	// when the username is wrong, so response time never reveals which half of
-	// the credential was correct.
+	// Both halves are always checked, so timing reveals neither.
 	usernameOK := subtle.ConstantTimeCompare([]byte(username), []byte(auth.username)) == 1
 	passwordOK, verifyErr := auth.hash.verify(password)
 	if errors.Is(verifyErr, errVerifierBusy) {
-		// Not counted as a failed attempt: the credential was never read, and
-		// counting it would let a burst of anonymous requests exhaust the
-		// operator's own allowance.
-		//
-		// It IS counted against the source address, though. Turning requests
-		// away for free meant an attacker could keep the queue full
-		// indefinitely at no cost, which denied the operator the login they
-		// were being protected for - the refusal was as effective a lockout as
-		// the one it prevents.
+		// Charged to the source address, or the queue could be kept full for free.
 		perIPLimiter.recordFailure(ip)
 		tooManyAttempts(w, 5*time.Second)
 		return
@@ -734,8 +618,7 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Session fixation: the session is only ever created AFTER the credential
-	// is proven, so a token planted beforehand can never become authenticated.
+	// A session exists only after the credential is proven (no fixation).
 	token, err := createSession()
 	if err != nil {
 		log.Println("auth: could not create session:", err)
@@ -762,10 +645,7 @@ type logoutPageData struct {
 	CSRFToken string
 }
 
-// GET renders a confirmation form; only POST destroys the session. A logout
-// reachable by GET can be triggered by any third-party page embedding an
-// <img src=".../logout">, which is a nuisance rather than a breach but is
-// trivially avoidable.
+// Only POST logs out: a GET could be triggered by any page.
 func handleLogout(w http.ResponseWriter, r *http.Request) {
 	sessionToken := cookieValue(r, auth.sessionCookieName())
 
@@ -806,14 +686,9 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ------------------------------------------------------------- middleware
-
 func requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !sessionIsValid(cookieValue(r, auth.sessionCookieName())) {
-			// The WebSocket endpoint gets a status rather than a redirect -
-			// a 303 to an HTML page is meaningless to a WebSocket client and
-			// would just surface as an opaque handshake failure.
 			if r.URL.Path == "/ws" {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
@@ -838,12 +713,7 @@ func strictPageCSP(nonce string) string {
 	}, "; ")
 }
 
-// The dashboard page itself carries a large inline <style>/<script> pair that
-// predates this work, so it still needs 'unsafe-inline'. Everything else is
-// locked down, and the page is now reachable only with a session.
-// Only the characters a host (with optional port, including a bracketed IPv6
-// literal) can legally contain. r.Host arrives from the client, and it is
-// about to be written into a response header.
+// The dashboard page still needs 'unsafe-inline'; everything else is locked down.
 var safeHostRegexp = regexp.MustCompile(`^[A-Za-z0-9.\-:\[\]]{1,255}$`)
 
 func appPageCSP(r *http.Request) string {
@@ -852,19 +722,8 @@ func appPageCSP(r *http.Request) string {
 		"style-src 'self' 'unsafe-inline'",
 		"script-src 'self' 'unsafe-inline'",
 		"img-src 'self' data:",
-		// "ws:" and "wss:" are scheme sources - they match EVERY host, not
-		// just this one. Next to the 'unsafe-inline' this page still needs,
-		// that left an injected script free to stream whatever it read to a
-		// socket anywhere on the internet. 'self' already covers a same-origin
-		// ws:// or wss:// connection, which is the only one this page opens.
-		// The WebSocket origin is named EXPLICITLY rather than left to 'self'.
-		// CSP Level 3 says 'self' matches a same-host wss:// URL, and the
-		// earlier version of this line relied on that - but Firefox does not
-		// implement it, and it reports the resulting block as
-		// NS_ERROR_UNKNOWN_HOST rather than as a CSP violation, so the live
-		// dashboard simply never received an update and nothing said why.
-		// Naming the host keeps the policy exactly as tight (no scheme
-		// wildcard, no third-party host) while actually working.
+		// Name the socket origin explicitly: scheme sources (ws:/wss:) match every host, and Firefox does not
+		// match 'self' for wss.
 		"connect-src 'self'" + socketSource(r),
 		"form-action 'self'",
 		"frame-ancestors 'none'",
@@ -872,9 +731,6 @@ func appPageCSP(r *http.Request) string {
 	}, "; ")
 }
 
-// The one socket this page opens: same host, same port, and wss only when the
-// page itself was served over TLS. An unparseable Host contributes nothing, so
-// a malformed request cannot widen the policy.
 func socketSource(r *http.Request) string {
 	if r == nil || !safeHostRegexp.MatchString(r.Host) {
 		return ""
@@ -904,16 +760,10 @@ func securityHeaders(next http.Handler, csp func(*http.Request) string) http.Han
 	})
 }
 
-// A WebSocket handshake is not subject to the same-origin policy, so without
-// this check any third-party page an authenticated operator visits could open
-// wss://dashboard.../ws with their cookies attached and stream the entire
-// cluster state. SameSite=Strict blocks that in modern browsers; this closes
-// it regardless of cookie policy.
+// A WebSocket handshake is not covered by the same-origin policy.
 func originIsSameHost(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		// Non-browser clients (and same-origin navigations in some cases)
-		// omit Origin entirely; those carry no ambient cross-site authority.
 		return true
 	}
 	u, err := url.Parse(origin)

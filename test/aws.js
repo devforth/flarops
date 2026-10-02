@@ -1,17 +1,10 @@
-// Checks for the state-bucket dialogue in utils/awsHelper.js, against a fake
-// `aws` that answers the way the real CLI does.
-//
-// The case that matters: HeadBucket on a name owned by ANOTHER account returns
-// a bare "(403) Forbidden" - the same answer a wrong key gets. Treated as bad
-// credentials, it ended init on a plain name collision, before it ever asked
-// for a different name.
+// Checks for the state-bucket dialogue against a fake `aws` CLI: a bucket owned by another account
+// answers HeadBucket with the same bare 403 as a wrong key.
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-// Answers by subcommand. `taken` is a bucket that exists in someone else's
-// account; every other name does not exist yet.
 function fakeAws(dir, { credentialsValid }) {
   const file = path.join(dir, 'aws');
   fs.writeFileSync(file, `#!/bin/sh
@@ -60,7 +53,6 @@ async function run(check) {
   try {
     const creds = { accessKey: 'AKIATEST', secretKey: 'secret' };
 
-    // A name owned by another account: ask for another one, do not abort.
     const asked = [];
     const taken = await withExitTrapped(() => handleS3Bucket(
       fakeAws(dir, { credentialsValid: true }), 'taken', creds,
@@ -71,7 +63,6 @@ async function run(check) {
       /already taken by another AWS account/.test(taken.said) && !/UNAUTHORIZED/.test(taken.said), taken.said);
     check('the new name is the one used', taken.result && taken.result.bucket === 'mine', JSON.stringify(taken.result));
 
-    // Genuinely wrong credentials still stop, with the reason.
     const bad = await withExitTrapped(() => handleS3Bucket(
       fakeAws(dir, { credentialsValid: false }), 'anything', creds, async () => 'x', 'us-west-2'));
     check('wrong credentials still stop init', bad.exitCode === 1, bad.said);

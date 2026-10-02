@@ -1,22 +1,5 @@
-// A one-shot task: something that runs to completion and stops.
-//
-// Creating Kafka topics, seeding a store, registering a webhook - a stack has
-// tasks that are not services. Declared as a service with `replicas: 1`, such
-// a task becomes a Deployment, which is a promise that one copy is always
-// running: the container exits, Kubernetes restarts it, and it lands in
-// CrashLoopBackOff forever, doing its work over and over on the way. Nothing
-// about that is visible in the declaration, which is why it needs a field of
-// its own.
-//
-// Rendered as a Helm hook so it runs on every install and upgrade, in the same
-// release, with the same values and the same Secret as everything else.
-// `before-hook-creation` deletes the previous Job first, because a Job's pod
-// template is immutable and the name is fixed - without it the second deploy
-// fails on a conflict. The task must therefore be safe to run again, which is
-// the normal shape for this kind of work (`--if-not-exists`, an upsert, a
-// no-op on a store that is already seeded).
+// A one-shot task: a Helm hook Job, re-run on every deploy, removed before the next run.
 const { secretRefs, urlEncodedRef, alreadyEmitted } = require('./env.js');
-
 
 module.exports = (service, { valuesRef }) => {
   const extraSecretEnvBlock = secretRefs(service.extraSecretEnvMappings);
@@ -43,8 +26,6 @@ metadata:
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-delete-policy": before-hook-creation
 spec:
-  # Bounded. A task that cannot succeed should stop and be visible, not retry
-  # until someone notices the bill.
   backoffLimit: 4
 {{- $svc := ${valuesRef} }}
   template:
@@ -56,12 +37,6 @@ spec:
       restartPolicy: OnFailure
       automountServiceAccountToken: false
 {{- if $.Values.dataNodeSelector }}
-      # The whole capsule sits on the node its placement chose, not only its
-      # database. Left to the scheduler, a capsule's stateless pods spread over
-      # every node with room, so closing one pull request freed no node at all:
-      # each still carried another capsule's api or worker, and the teardown
-      # that reclaims idle workers never found one idle. Production leaves this
-      # empty and is not pinned.
       nodeSelector:
 {{ toYaml $.Values.dataNodeSelector | indent 8 }}
 {{- end }}

@@ -5,14 +5,8 @@ const { walkDir, logDebug } = require('./fsHelper');
 const { DB_PORTS, IGNORED_DIRS } = require('./constants');
 const { defaultImageFor } = require('./dbDefaults');
 
-// If the project's own docker-compose.yml pins a specific image/tag for the
-// database (e.g. "image: mysql:5.6"), that wins over the version pinned in
-// utils/dbDefaults.js. The project's application code (driver versions, auth
-// plugin assumptions, SQL dialect quirks) was written and tested against
-// whatever version the author actually pinned - replacing it with a newer one
-// can break compatibility outright (e.g. an old mysql-connector-java client
-// that can't speak MySQL 8's default caching_sha2_password auth plugin / TLS
-// requirements).
+// An image pinned in the project's own compose file wins over utils/dbDefaults.js: the code was
+// written against that version.
 async function findPinnedDbImageTag(baseDir, dbType) {
   const composeFiles = listComposeFiles(baseDir);
   const engineNames = {
@@ -35,8 +29,6 @@ async function findPinnedDbImageTag(baseDir, dbType) {
   }
   return null;
 }
-
-
 
 function testRegex(content, regexString) {
   const regex = new RegExp(`^(?!\\s*(?:#|\\/\\/)).*${regexString}`, 'im');
@@ -137,11 +129,6 @@ async function checkRequirementsTxt(backendPath) {
   return null;
 }
 
-// Dependency manifests for every ecosystem other than npm/pip. Without these,
-// a Java, Go, Ruby, PHP, .NET or modern-Python (pyproject.toml) service had no
-// first-party signal for its database at all and fell through to the
-// project-wide compose/env scan - which can only ever name ONE database for
-// the whole repo, no matter how many services and engines it actually has.
 const DEPENDENCY_MANIFEST_MARKERS = [
   { file: 'pyproject.toml', rules: [
     [/psycopg|asyncpg|sqlalchemy/i, 'postgres'],
@@ -195,8 +182,6 @@ async function checkDependencyManifests(backendPath) {
     }
   }
 
-  // .NET project files are named after the project, so they have to be
-  // discovered rather than looked up by a fixed name.
   try {
     const entries = await fs.readdir(backendPath);
     for (const entry of entries) {
@@ -211,10 +196,7 @@ async function checkDependencyManifests(backendPath) {
   return null;
 }
 
-// Example/template files (and documentation comments) are full of stand-in
-// values - "<database>", "your-user", "changeme". Taking one as real config
-// produces a database the application can never reach, so treat these the
-// same as an unresolved ${...} reference: not a usable value.
+// Stand-in values from example files ("<database>", "changeme") are not configuration.
 function isUsableValue(value) {
   if (!value) return false;
   const v = String(value).trim();
@@ -226,18 +208,7 @@ function isUsableValue(value) {
   return true;
 }
 
-// Credentials for ONE specific compose database service, read from that
-// service's own block.
-//
-// extractDbCredentials below scans docker-compose.yml as a flat blob and
-// takes the first match in the file. In a project running several databases
-// that is simply whichever service was listed first: a microservice's own
-// Postgres was created with POSTGRES_DB set to an unrelated component's
-// database name, so the StatefulSet initialised a database the application
-// never connects to and the pod failed on startup against a schema that did
-// not exist. When the caller knows exactly which compose service backs this
-// database - which it does whenever depends_on named it - read the block
-// that actually describes it.
+// Credentials from ONE compose database service's own block; extractDbCredentials scans the whole file.
 async function extractCredentialsFromComposeService(baseDir, composeServiceName, dbType) {
   if (!composeServiceName) return { user: null, name: null };
   const services = await parseComposeServices(baseDir);
@@ -282,12 +253,7 @@ async function extractDbCredentials(baseDir, backendPath, dbType) {
   let dbUser = null;
   let dbName = null;
 
-  // When the caller already knows which engine it's asking about, only match
-  // that engine's own env var names/URL scheme. A project can genuinely
-  // contain more than one database (a different one per service) - matching
-  // every engine's keys unconditionally means whichever one happens to
-  // appear first in a shared file (e.g. docker-compose.yml) wins the
-  // credentials for a completely unrelated database.
+  // Knowing the engine, match only its own variable names and URL scheme - a project can run several.
   const perTypeUserKeys = {
     postgres: 'POSTGRES_USER', postgresql: 'POSTGRES_USER',
     mysql: 'MYSQL_USER', mariadb: 'MARIADB_USER',
@@ -308,11 +274,7 @@ async function extractDbCredentials(baseDir, backendPath, dbType) {
   const userRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${userKeys})[ \\t]*[:=][ \\t]*["']?([^"'\\s#]+|[^"'\\n]+)["']?`, 'im');
   const nameRegex = new RegExp(`^(?!\\s*(?:#|\\/\\/))\\s*(?:-\\s*)?(?:${nameKeys})[ \\t]*[:=][ \\t]*["']?([^"'\\s#]+|[^"'\\n]+)["']?`, 'im');
 
-  // Every character class here excludes whitespace on purpose. With "[^@]*"
-  // the match could run past the end of its own line hunting for an "@"
-  // somewhere else in the file, so a credential-less URL like
-  // "jdbc:postgresql://keycloak-postgres:5432/keycloak" paired its HOST with
-  // an unrelated "@" further down and reported the host as the database user.
+  // Character classes exclude whitespace so a match cannot run past the end of its line.
   const schemeRegexes = {
     postgres: /postgres(?:ql)?:\/\/([^:\/\s@]+):[^@\s]*@[^\/\s]+\/([^?\s]+)/i,
     postgresql: /postgres(?:ql)?:\/\/([^:\/\s@]+):[^@\s]*@[^\/\s]+\/([^?\s]+)/i,
@@ -325,11 +287,7 @@ async function extractDbCredentials(baseDir, backendPath, dbType) {
     try {
       const rawContent = await fs.readFile(file, 'utf8');
 
-      // The userRegex/nameRegex below already refuse commented-out lines, but
-      // the URL match did not - so a documentation comment like
-      // "# mongodb://<user>:<password>@<host>:<port>/<database>" was read as
-      // real credentials and "<database>" became the database name. Strip
-      // whole-line comments before matching anything.
+      // Commented-out lines (documentation) are not credentials.
       const content = rawContent
         .split('\n')
         .filter(line => !/^\s*(?:#|\/\/)/.test(line))
@@ -367,8 +325,6 @@ async function extractDbCredentials(baseDir, backendPath, dbType) {
   return { user: dbUser, name: dbName };
 }
 
-// Maps a docker-compose image reference to the database engine it runs, or
-// null when it isn't a database at all.
 function composeImageDbType(image) {
   if (!image) return null;
   const img = String(image).toLowerCase();
@@ -379,22 +335,8 @@ function composeImageDbType(image) {
   return null;
 }
 
-// Which compose database service, if any, may serve as the PROJECT'S primary
-// database - the one Flarops generates as the shared "database" StatefulSet.
-//
-// The old project-wide fallback simply took the first database image anywhere
-// in docker-compose.yml, which in any multi-service repo is a coin flip: a
-// microservice stack routinely runs several databases, and the first one
-// listed is as likely to be an infrastructure component's private store
-// (Keycloak's own schema, SonarQube's, a metrics backend's) as it is to be
-// the application's. Picking that one produces a primary database named after
-// somebody else's internals, and every service that really does share a
-// database then gets pointed at it.
-//
-// depends_on states ownership explicitly: a database another service declares
-// a dependency on is THAT service's database, not the project's - unless the
-// service declaring it is the backend itself. A database nothing depends on
-// has no stated owner and stays a valid project-wide candidate.
+// Which compose database may be the project's shared "database": one the backend depends on, or
+// one no other service owns.
 async function findComposeDatabaseCandidates(baseDir, backendPath) {
   const services = await parseComposeServices(baseDir);
   const names = Object.keys(services);
@@ -418,8 +360,6 @@ async function findComposeDatabaseCandidates(baseDir, backendPath) {
     ? names.find(n => services[n].context && path.resolve(services[n].context) === resolvedBackend)
     : null;
 
-  // Prefer a database the backend itself depends on; otherwise accept only
-  // databases with no stated owner at all.
   const backendOwned = dbServices.filter(d => backendService && (ownersOf[d] || []).includes(backendService));
   const unowned = dbServices.filter(d => (ownersOf[d] || []).length === 0);
   const available = backendOwned.length > 0 ? backendOwned : unowned;
@@ -429,9 +369,6 @@ async function findComposeDatabaseCandidates(baseDir, backendPath) {
 
 async function checkDockerCompose(baseDir) {
   const composeFiles = listComposeFiles(baseDir);
-  // Match "image: postgres:15" as well as an org-prefixed/forked image like
-  // "image: jmreif/mongodb" - the DB engine name doesn't have to be the first
-  // path segment of the image reference.
   for (const file of composeFiles) {
     try {
       const content = await fs.readFile(path.join(baseDir, file), 'utf8');
@@ -449,20 +386,7 @@ async function checkDockerCompose(baseDir) {
   return null;
 }
 
-// Finds a Dockerfile that BUILDS a database, by reading what it is built FROM.
-//
-// The search below this one looks for conventional directory names ("db/",
-// "postgres/", anything whose own name contains an engine keyword). That misses
-// any layout nobody thought of - "inventory/postgres/Dockerfile" has the
-// keyword one level too deep, under a parent that carries none - and the cost
-// of missing it is not a missing feature but two databases: the project gets a
-// stock image it never asked for as its database, AND the directory is picked
-// up separately by the service scan and deployed a second time as an ordinary
-// web service, on port 80, with no credentials and no volume.
-//
-// "FROM postgres:17" is not a hint about where the file sits; it is the file
-// stating what it builds. It also names the ENGINE, which is the same evidence
-// a compose "image:" line gives and is trusted the same way.
+// Finds a Dockerfile that builds a database by what it is built FROM, wherever it sits.
 async function findDbDockerfileByBaseImage(baseDir) {
   const dockerfileIn = async (dir) => {
     try {
@@ -471,8 +395,6 @@ async function findDbDockerfileByBaseImage(baseDir) {
     } catch (e) { return null; }
   };
 
-  // Exactly the directories analyzeAdditionalServices scans, so anything it
-  // could turn into a service is examined here first.
   const candidates = [];
   try {
     for (const entry of await fs.readdir(baseDir, { withFileTypes: true })) {
@@ -493,9 +415,7 @@ async function findDbDockerfileByBaseImage(baseDir) {
     if (!dockerfile) continue;
     let content;
     try { content = await fs.readFile(path.join(dir, dockerfile), 'utf8'); } catch (e) { continue; }
-    // The first FROM is the base; a later one would be a build stage, and a
-    // multi-stage build whose FINAL stage is a database is vanishingly rare
-    // next to the cost of guessing wrong on a builder stage.
+    // Only the first FROM: later ones are build stages.
     const from = content.match(/^\s*FROM\s+([^\s]+)/im);
     if (!from) continue;
     const engine = composeImageDbType(from[1]);
@@ -505,7 +425,6 @@ async function findDbDockerfileByBaseImage(baseDir) {
 }
 
 async function checkLocalDbDockerfile(baseDir) {
-  // Fixed conventional names first (fast path)...
   const possibleDirs = ['db', 'database', 'postgres', 'mysql', 'mongo', 'sql', 'data', 'docker/db', 'docker/database', 'docker/postgres', 'docker/mysql', 'storage'];
   for (const dir of possibleDirs) {
     const fullPath = path.join(baseDir, dir);
@@ -518,9 +437,6 @@ async function checkLocalDbDockerfile(baseDir) {
     } catch(e) { logDebug(e); }
   }
 
-  // ...then fall back to any top-level directory whose name merely *contains* a
-  // DB engine keyword (e.g. "docker-mongodb", "postgres-init"), which the fixed
-  // list above misses entirely.
   const dbNameKeywords = ['postgres', 'postgresql', 'mysql', 'mariadb', 'mongo', 'redis'];
   try {
     const entries = await fs.readdir(baseDir, { withFileTypes: true });
@@ -537,7 +453,6 @@ async function checkLocalDbDockerfile(baseDir) {
         if (dockerfileMatch) {
           return path.join(entry.name, dockerfileMatch);
         }
-        // Dockerfile may live one level deeper (e.g. docker-mongodb/docker/Dockerfile)
         for (const sub of files) {
           const subPath = path.join(fullPath, sub);
           try {
@@ -556,16 +471,6 @@ async function checkLocalDbDockerfile(baseDir) {
   return null;
 }
 
-// Parses every top-level service block under `services:` in a compose file
-// into { name, image, context, dependsOn }. This is a plain, general
-// structural parse (not tied to any particular service name), so it can
-// answer "what does service X depend on" for any service in the project -
-// which the existing name-specific helpers above (findPortsInCompose etc.)
-// can't do.
-// Pulls the service names out of a compose service's depends_on block,
-// accepting both the short list form ("- name") and the long map form
-// ("name:" followed by an indented "condition:"). The block ends at the first
-// line indented no deeper than depends_on itself.
 function extractDependsOn(block) {
   const lines = block.split('\n');
   const deps = [];
@@ -576,7 +481,6 @@ function extractDependsOn(block) {
       const start = line.match(/^(\s*)depends_on:\s*(.*)$/);
       if (!start) continue;
       blockIndent = start[1].length;
-      // Inline flow sequence: depends_on: [a, b]
       const inline = start[2].trim();
       if (inline.startsWith('[')) {
         for (const part of inline.replace(/^\[|\]$/g, '').split(',')) {
@@ -595,8 +499,6 @@ function extractDependsOn(block) {
     const listItem = line.match(/^\s*-\s*["']?([a-zA-Z0-9_.-]+)["']?\s*$/);
     if (listItem) { deps.push(listItem[1]); continue; }
 
-    // Map form: only the direct children of depends_on are service names -
-    // anything deeper is that entry's own "condition:"/"restart:" settings.
     const mapKey = line.match(/^(\s*)["']?([a-zA-Z0-9_.-]+)["']?:\s*$/);
     if (mapKey && mapKey[1].length === blockIndent + 2) deps.push(mapKey[2]);
   }
@@ -628,16 +530,7 @@ async function parseComposeServices(baseDir) {
       const imageMatch = block.match(/^\s*image:\s*["']?([^\s"'#]+)["']?/m);
       const contextMatch = block.match(/context:\s*["']?([^\s"'#]+)["']?/) ||
         block.match(/build:\s*["']?(\.[^\s"'#{][^\s"'#]*)["']?\s*$/m);
-      // depends_on has two spellings and only the short one was handled. The
-      // long form -
-      //   depends_on:
-      //     order-postgres:
-      //       condition: service_healthy
-      // - is what any compose file using healthchecks writes, and it was
-      // parsed as no dependencies at all. Everything keyed off depends_on
-      // (which service owns which database, above all) silently saw an empty
-      // graph for exactly the projects that describe themselves most
-      // carefully. Read the block by indentation and accept both spellings.
+      // depends_on in both the list and the long (condition:) form.
       const dependsOn = extractDependsOn(block);
       services[name] = {
         name,
@@ -652,13 +545,7 @@ async function parseComposeServices(baseDir) {
   return {};
 }
 
-// A service's docker-compose `depends_on:` list is a direct, explicit
-// statement of which other container it needs at runtime - when one of
-// those dependencies is itself a known database image, that's a much
-// stronger and more precise signal for "this specific service's database"
-// than any generic env-var/compose-wide scan (which can only ever name ONE
-// database for the whole project, no matter how many services and databases
-// it actually contains).
+// depends_on naming a database image is a direct statement of which database a service uses.
 async function analyzeServiceDatabaseFromCompose(baseDir, servicePath) {
   const services = await parseComposeServices(baseDir);
   const resolvedServicePath = path.resolve(servicePath);
@@ -668,26 +555,13 @@ async function analyzeServiceDatabaseFromCompose(baseDir, servicePath) {
   for (const depName of owning.dependsOn) {
     const dep = services[depName];
     if (!dep || !dep.image) continue;
-    // composeServiceName lets the caller rewrite hostnames that point at this
-    // exact compose service (e.g. "order-postgres") to the dedicated
-    // StatefulSet generated for it, instead of to the shared "database".
     const dbType = composeImageDbType(dep.image);
     if (dbType) return { hasDb: true, dbType, port: DB_PORTS[dbType], image: dep.image, composeServiceName: depName };
   }
   return null;
 }
 
-// Spring Boot binds `spring.datasource.url`/`.username`/`.password` from the
-// env vars SPRING_DATASOURCE_URL/_USERNAME/_PASSWORD automatically (its
-// "relaxed binding" convention) - no source code change is needed to make it
-// pick up a different database than whatever application.properties
-// hardcodes. Detecting this lets Flarops wire a Spring service's own database
-// purely through env vars, the same way it already relies on Django's/
-// FastAPI's own conventions elsewhere.
-// Does this YAML declare the given key path? Written by indentation rather
-// than with a parser, because these files routinely contain "${VAR}"
-// placeholders and profile separators a strict parser rejects. A dotted key
-// ("spring.datasource.url: ...") carries its own path and is handled too.
+// Spring binds SPRING_DATASOURCE_URL/_USERNAME/_PASSWORD from the environment by itself.
 function yamlHasKeyPath(content, wanted) {
   const stack = [];
   for (const rawLine of content.split('\n')) {
@@ -724,16 +598,7 @@ async function detectSpringDatasourceConfig(servicePath) {
     if (!/^application(-\w+)?\.(properties|ya?ml)$/.test(base)) continue;
     try {
       const content = await fs.readFile(file, 'utf8');
-      // Both spellings count. Only the flat one was recognised, so any Spring
-      // service writing the ordinary nested YAML -
-      //   spring:
-      //     datasource:
-      //       url: ...
-      // - was treated as "not a Spring datasource service" and never had its
-      // URL, username and password wired to the database Flarops generated
-      // for it. The StatefulSet came up with a generated password while the
-      // application went on authenticating with whatever the unresolved
-      // placeholder held.
+      // Both spellings: flat (spring.datasource.url) and nested YAML.
       if (/spring\.datasource\.url/.test(content)) return true;
       if (yamlHasKeyPath(content, ['spring', 'datasource', 'url'])) return true;
     } catch (e) { logDebug(e); }
@@ -741,13 +606,7 @@ async function detectSpringDatasourceConfig(servicePath) {
   return false;
 }
 
-// The Mongo counterpart of detectSpringDatasourceConfig. Spring Boot binds
-// SPRING_DATA_MONGODB_URI from the environment by the same relaxed-binding
-// convention, so a Mongo-backed service can be pointed at the database
-// Flarops generated for it purely through env - but nothing looked for it,
-// so those services kept whatever connection string docker-compose held:
-// a container that no longer exists, with credentials that were never the
-// ones the generated StatefulSet was initialised with.
+// The Mongo counterpart: SPRING_DATA_MONGODB_URI.
 async function detectSpringDataMongoConfig(servicePath) {
   if (!servicePath) return false;
   let isJava = true;
@@ -779,57 +638,40 @@ async function analyzeDatabase(baseDir, backendPath) {
   let result = null;
 
   if (backendPath) {
-    // Priority 1: ORM Configs
     const ormResult = await checkORM(baseDir, backendPath);
     if (ormResult) result = ormResult;
 
-    // Priority 2: Package.json Dependencies
     if (!result) {
       const pkgResult = await checkPackageJson(backendPath);
       if (pkgResult) result = pkgResult;
     }
 
-    // Priority 2.5: Python requirements.txt
     if (!result) {
       const reqResult = await checkRequirementsTxt(backendPath);
       if (reqResult) result = reqResult;
     }
 
-    // Priority 2.55: every other ecosystem's dependency manifest (pyproject,
-    // pom.xml, build.gradle, go.mod, Gemfile, composer.json, *.csproj).
     if (!result) {
       const manifestResult = await checkDependencyManifests(backendPath);
       if (manifestResult) result = manifestResult;
     }
 
-    // Priority 2.6: docker-compose depends_on (see
-    // analyzeServiceDatabaseFromCompose) - a precise, per-service signal,
-    // checked before the generic/project-wide fallbacks below so it doesn't
-    // get shadowed by whichever database happens to match first in those.
     if (!result) {
       const composeDepResult = await analyzeServiceDatabaseFromCompose(baseDir, backendPath);
       if (composeDepResult) result = composeDepResult;
     }
   }
 
-  // Priority 3: Environment Variables (real .env)
   if (!result) {
     const envResult = await checkEnvVars(baseDir, backendPath, ['.env']);
     if (envResult) result = envResult;
   }
 
-  // Priority 4: Environment Variables (fallback .env.example)
   if (!result) {
     const envExampleResult = await checkEnvVars(baseDir, backendPath, ['.env.example']);
     if (envExampleResult) result = envExampleResult;
   }
 
-  // Priority 5: docker-compose.yml. Constrained by depends_on ownership (see
-  // findComposeDatabaseCandidates): when every database in the compose file
-  // already belongs to some other service, the project has no shared primary
-  // database and inventing one from a stranger's store is worse than
-  // reporting none - the services that own those databases each get their own
-  // through analyzeServiceDatabaseFromCompose instead.
   let composeCandidates = null;
   if (!result) {
     composeCandidates = await findComposeDatabaseCandidates(baseDir, backendPath);
@@ -853,20 +695,7 @@ async function analyzeDatabase(baseDir, backendPath) {
   }
 
   if (result) {
-    // A driver library names a WIRE PROTOCOL, not a server. mysql2 is the
-    // correct client for MariaDB as well as MySQL, so a backend depending on
-    // it says nothing about which of the two actually runs - yet the
-    // dependency scan above settles the engine before docker-compose, which
-    // states it outright, is ever consulted. A project running "mariadb:11"
-    // was therefore generated as MySQL: the pinned-image lookup then failed to
-    // match (it searches for the engine it was told), the newest numeric tag
-    // was fetched from Docker Hub instead, and the chart pulled a nonexistent
-    // mysql tag. The readiness probe and the PR-capsule clone commands, which
-    // branch on the engine, were wrong for the same reason.
-    //
-    // Only applied when the compose file is unanimous: several engines side by
-    // side say nothing about which one this result refers to, and a result
-    // that already carries its own image came from compose to begin with.
+    // A driver names a wire protocol, not a server (mysql2 talks to MariaDB too); the compose image decides.
     if (!result.image) {
       const forEngine = composeCandidates || await findComposeDatabaseCandidates(baseDir, backendPath);
       if (forEngine) {
@@ -886,9 +715,6 @@ async function analyzeDatabase(baseDir, backendPath) {
       }
     }
 
-    // init.js needs to know WHICH compose service became the primary database,
-    // so it can rewrite hostnames pointing at that one service (and only that
-    // one) to the generated "database" Service.
     if (!result.composeServiceName) {
       const candidates = composeCandidates || await findComposeDatabaseCandidates(baseDir, backendPath);
       if (candidates) {
@@ -904,21 +730,13 @@ async function analyzeDatabase(baseDir, backendPath) {
 
     const ownCreds = await extractCredentialsFromComposeService(baseDir, result.composeServiceName, result.dbType);
     const creds = await extractDbCredentials(baseDir, backendPath, result.dbType);
-    // The owning service's own block wins; the project-wide scan only fills
-    // in what that block did not state.
     result.dbUser = ownCreds.user || creds.user;
     result.dbName = ownCreds.name || creds.name;
     const pinnedImage = await findPinnedDbImageTag(baseDir, result.dbType);
-    // The project's own pin wins; otherwise the version pinned in
-    // utils/dbDefaults.js. Nothing is looked up over the network - see the
-    // note on ENGINES there.
-    // Kept apart from the resolved image: only a tag the PROJECT pinned is
-    // something the operator chose, and only that is worth telling them about
-    // when a locally-built image supersedes it.
+    // Only a tag the PROJECT pinned is reported as pinned.
     result.pinnedImage = pinnedImage || null;
     result.image = pinnedImage || defaultImageFor(result.dbType);
     
-    // What a Dockerfile is built FROM beats where it happens to sit.
     const byBaseImage = await findDbDockerfileByBaseImage(baseDir);
     const localDbDockerfile = byBaseImage ? byBaseImage.dockerfile : await checkLocalDbDockerfile(baseDir);
     if (byBaseImage && byBaseImage.engine !== result.dbType) {
@@ -937,7 +755,6 @@ async function analyzeDatabase(baseDir, backendPath) {
     return result;
   }
 
-  // Fallback: No definitive markers found, assume no DB
   return { hasDb: false };
 }
 
@@ -986,18 +803,10 @@ async function analyzeBackendForDbKeys(backendPath) {
     try {
       const content = await fs.readFile(file, 'utf8');
       
-      // Names that belong to the SERVER this process runs, not to any database
-      // it connects to. A bare PORT was being classified as the database port,
-      // and init.js then overwrote it with 5432/3306/27017 - so the container
-      // listened on the database's port while the Service, the probe and the
-      // Ingress all pointed at the real one, and readiness never passed.
+      // PORT and friends are the server's own listen port, not the database's.
       const LISTEN_PORT_KEYS = /^(port|server_port|app_port|http_port|https_port|listen_port|web_port|service_port)$/;
 
-      // The canonical per-engine names, which the generic patterns below miss
-      // entirely: POSTGRES_USER does not contain "db_user", and POSTGRES_DB
-      // does not match /^database$|^db$/. Both were silently unclassified, so
-      // the API container was wired with a host, a port and a password but no
-      // user and no database name.
+      // The engines' own variable names (POSTGRES_USER, POSTGRES_DB, ...) that the generic patterns miss.
       const ENGINE_USER_KEYS = /^(postgres_user|pguser|mysql_user|mariadb_user|mongo_initdb_root_username)$/;
       const ENGINE_NAME_KEYS = /^(postgres_db|pgdatabase|mysql_database|mariadb_database|mongo_initdb_database)$/;
 
@@ -1015,16 +824,7 @@ async function analyzeBackendForDbKeys(backendPath) {
         processKey(match[1]);
       }
 
-      // Spring (and anything else using the same placeholder syntax) reads its
-      // database connection straight out of a config FILE - there is no
-      // System.getenv call anywhere in the Java source for the scan above to
-      // find. Without this, a Spring backend reported no database keys at all,
-      // so nothing wired DB_HOST/DB_PORT/DB_NAME/DB_USER into its container:
-      // the pod came up with a password and no address to use it against.
-      //
-      // Restricted to SCREAMING_SNAKE names so Spring's own property
-      // references (${spring.datasource.url}) aren't mistaken for environment
-      // variables.
+      // Spring reads the connection from a config file via ${...} placeholders, not from getenv calls.
       const base = path.basename(file);
       if (/^(application|bootstrap)(-[\w.]+)?\.(ya?ml|properties)$/.test(base)) {
         const springPlaceholderRegex = /\$\{\s*([A-Z][A-Z0-9_]*)\s*(?::[^}]*)?\}/g;

@@ -1,26 +1,11 @@
-// Persistent volumes for a service, as one PersistentVolumeClaim each.
-//
-// Shared because both kinds of service need them and only one had them: a
-// support service (an image this repository pulls) could carry volumes from
-// docker-compose, while a service this repository BUILDS had no way to ask for
-// storage at all - not from flarops.yaml and not from the chart.
-//
-// The size is written into the claim rather than read from values.yaml. A
-// volume's size is a property of what the service stores, it is declared in
-// flarops.yaml beside the path it mounts at, and a PVC cannot be shrunk once
-// bound - so keeping it a chart value, editable independently of the
-// declaration that explains it, would only invite a change that silently does
-// nothing.
+// One PersistentVolumeClaim per declared volume. The size is written into the claim, not values.yaml:
+// a bound PVC cannot be shrunk.
 const DEFAULT_SIZE = '5Gi';
 
-// A claim name has to be a valid Kubernetes object name, and the service and
-// volume names it is built from are whatever the author wrote.
 function claimNameFor(serviceName, volumeName) {
   return `${serviceName}-${volumeName}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
 }
 
-// `indent` is how deep the container's volumeMounts sit in the template that
-// calls this - the two templates nest differently.
 function renderVolumes(service, { mountIndent = 12, volumeIndent = 8, fallbackSize = null } = {}) {
   const list = Array.isArray(service.volumes) ? service.volumes : [];
   if (list.length === 0) return { pvcs: '', volumeMounts: '', volumes: '' };

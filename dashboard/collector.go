@@ -36,8 +36,7 @@ type NodeStatsSummary struct {
 	} `json:"pods"`
 }
 
-// nodeAgentClient is shared: one connection pool for the whole fleet, and a
-// short timeout so one wedged agent cannot stall a collection cycle.
+// Shared client with a short timeout: one wedged agent cannot stall a cycle.
 var nodeAgentClient = &http.Client{Timeout: 3 * time.Second}
 
 func fetchNodeDisk(podIP string) (nodeDisk, error) {
@@ -78,8 +77,7 @@ func startCollector(k8s *K8sClient) {
 				hub.broadcast <- lastData
 			}
 		} else {
-			// The capacity oracle reports this exact view rather than querying
-			// Kubernetes again, so it and the dashboard can never disagree.
+			// The capacity oracle reports this exact view.
 			publishSnapshot(data)
 			b, marshalErr := json.Marshal(data)
 			if marshalErr != nil {
@@ -95,28 +93,14 @@ func startCollector(k8s *K8sClient) {
 }
 
 func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, error) {
-	// No hardcoded fallback: the chart always passes DOMAIN, and inventing
-	// someone else's domain here only produced capsule URLs that pointed at a
-	// completely unrelated deployment.
 	baseDomain := os.Getenv("DOMAIN")
 
-	// Region, instance type and root volume size all come from the same values
-	// the infrastructure was actually provisioned with (see
-	// templates/dashboard.yaml.js) rather than from constants matching one
-	// particular project.
 	defaultRegion := os.Getenv("AWS_REGION")
 	if defaultRegion == "" {
 		defaultRegion = "us-west-2"
 	}
 
-	// Both of these describe the shape of the infrastructure, which is
-	// declared exactly once in deploy/terraform/variables.tf and handed to the
-	// chart from Terraform's own outputs at deploy time. Carrying a default
-	// here would be a third copy of that fact, and the one nobody thinks to
-	// update - so an empty value stays empty and the cost simply comes out
-	// without that component, rather than confidently priced against a machine
-	// nobody is running. It is only ever a fallback in the first place: a real
-	// node reports its own type through the instance-type label below.
+	// Instance type and volume size come from Terraform's outputs via the chart.
 	defaultInstanceType := os.Getenv("FLAROPS_DEFAULT_INSTANCE_TYPE")
 
 	ebsGB := 0.0
@@ -143,7 +127,6 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		Queue: []CapsuleState{},
 	}
 
-	// One listing per cycle, reused for every node below.
 	nodeAgentIPs, agentErr := k8s.GetNodeAgentIPs()
 	if agentErr != nil {
 		log.Println("collector: could not list node agents:", agentErr)
@@ -221,10 +204,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 			}
 		}
 
-		// Ready, uncordoned, and carrying no NoSchedule taint. All three are
-		// invisible in capacity figures alone: a node being drained by the
-		// PR-capsule scale-down job reports its full memory and almost no
-		// usage right up until it is deleted.
+		// Ready, uncordoned and without a NoSchedule taint.
 		ready := false
 		for _, cond := range n.Status.Conditions {
 			if cond.Type == corev1.NodeReady {
@@ -255,8 +235,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		eipRate := 0.005 / float64(len(nodes))
 		hourlyRate := ec2Rate + ebsRate + eipRate
 
-		// Disk comes from the node agent on that node. A node without a
-		// running agent simply reports zero rather than being guessed at.
+		// Disk comes from the node agent; a node without one reports zero.
 		diskTotal := 0
 		diskUsed := 0
 		if ip, ok := nodeAgentIPs[n.Name]; ok {
@@ -335,7 +314,6 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 				nodeName = p.Spec.NodeName
 			}
 
-			// Add container info
 			for _, c := range p.Spec.Containers {
 				ram := 0
 				cpu := 0
@@ -346,10 +324,8 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 					}
 				}
 
-				// parse resources requests
 				reqMib := int(c.Resources.Requests.Memory().Value() / (1024 * 1024))
 				if reqMib == 0 {
-					// Fallback if not specified in requests
 					reqMib = 256
 				}
 				cap.ReqRam += reqMib
@@ -384,13 +360,11 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		}
 	}
 
-	// Read pending ConfigMaps from default namespace
 	cms, err := k8s.GetConfigMaps("default")
 	if err == nil {
 		for _, cm := range cms {
 			if strings.HasPrefix(cm.Name, "queue-") {
 				ns := strings.TrimPrefix(cm.Name, "queue-")
-				// Check if we already have it in Queue from pods
 				alreadyInQueue := false
 				for _, q := range data.Queue {
 					if q.ID == ns {
@@ -431,17 +405,12 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	data.Fleet.SlotsUsed = len(data.Hosts)
 	data.Fleet.SlotsMax = len(data.Hosts) + 1
 
-	// Add other AWS costs (EIP and EBS)
 	eipCostPerHour := 0.005 // 1 EIP attached to server
-	// Root volume size per host comes from FLAROPS_EBS_GB: (GB * 0.08) / 730 hours
 	ebsCostPerHour := float64(len(data.Hosts)) * (ebsGB * 0.08) / 730.0
 
-	// The runRate we accumulated from h.Rate ALREADY includes EC2 + EIP + EBS
-	// We calculate Breakdown by subtracting what we know.
 	eipRunRate := eipCostPerHour * 24.0
 	ebsRunRate := ebsCostPerHour * 24.0
 
-	// Get spend stats from DB
 	spendStats, err := getSpendStats(runRate, len(data.Hosts))
 	if err != nil {
 		log.Println("Error getting spend stats:", err)
@@ -474,7 +443,6 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		}
 	}
 
-	// Calculate CostLife for capsules
 	capsulesCostLife := getCapsulesCostLife(runRate)
 	for i, h := range data.Hosts {
 		for j, c := range h.Capsules {
@@ -500,7 +468,6 @@ func getCapsuleDomain(ns, baseDomain string) string {
 		}
 		return prSuffix + "." + baseDomain
 	}
-	// fallback for main branch or unknown formats
 	idx = strings.Index(ns, "-production")
 	if idx != -1 {
 		return baseDomain
