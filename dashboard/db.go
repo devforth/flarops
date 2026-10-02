@@ -107,7 +107,7 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 	runRate := totalHourlyRate * 24.0
 
 	daysInMonth := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, now.Location()).Day()
-	projected := mtd + runRate * float64(daysInMonth - now.Day())
+	projected := mtd + runRate*float64(daysInMonth-now.Day())
 
 	dayOfMonth := now.Day()
 	curDays := make([]int, dayOfMonth)
@@ -134,7 +134,7 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 				dailyCosts[d] = cost
 			}
 		}
-		
+
 		cumulative := 0.0
 		for i := 1; i <= dayOfMonth; i++ {
 			cumulative += dailyCosts[i]
@@ -150,7 +150,7 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 		WHERE timestamp >= ? AND timestamp < ?
 		GROUP BY day
 	`, startOfPrevMonth, startOfMonth)
-	
+
 	if err == nil {
 		defer rowsPrev.Close()
 		dailyCostsPrev := make(map[int]float64)
@@ -186,11 +186,14 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 		RunRate:    runRate,
 		Projected:  projected,
 		MonthLabel: now.Month().String(),
-		PrevLabel:  now.AddDate(0, -1, 0).Month().String(),
-		Days:       curDays,
-		Cur:        curVals,
-		Prev:       prevVals,
-		DeltaPct:   deltaPct,
+		// From the FIRST of the month: AddDate normalises an overflowing day,
+		// so on 31 October "one month back" is 31 September = 1 October, and
+		// the previous month was labelled with the current one.
+		PrevLabel: time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -1, 0).Month().String(),
+		Days:      curDays,
+		Cur:       curVals,
+		Prev:      prevVals,
+		DeltaPct:  deltaPct,
 	}, nil
 }
 

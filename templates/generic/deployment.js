@@ -1,5 +1,6 @@
 const { renderVolumes } = require('./volumes.js');
 const { secretRefs, urlEncodedRef, alreadyEmitted } = require('./env.js');
+const { dbUrlScheme } = require('../../utils/dbDefaults.js');
 
 // Percent-encodes a value that is spliced into a URL at GENERATION time. The
 // password cannot be done here - it is only a name until the container starts -
@@ -83,7 +84,7 @@ module.exports = (service) => {
       // password.
       ownDbUrlBlock += `
             - name: ${urlVar.key}
-              value: "${scheme}://${urlComponent(db.user)}:$(${db.passwordKey}_URLENCODED)@${dbHost}:${db.port}/${urlComponent(dbName)}${authSuffix}"`;
+              value: "${dbUrlScheme(db.type, urlVar.scheme)}://${urlComponent(db.user)}:$(${db.passwordKey}_URLENCODED)@${dbHost}:${db.port}/${urlComponent(dbName)}${authSuffix}"`;
     }
   }
 
@@ -126,6 +127,16 @@ spec:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat ((index .Values.additionalServices (index .Values.additionalServicesIndices "${service.name}" | int)).secretKeys | default list) (list ${extraKeyList})) "password" ((.Values.database | default dict).password | default "")) }}
     spec:
       automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      # The whole capsule sits on the node its placement chose, not only its
+      # database. Left to the scheduler, a capsule's stateless pods spread over
+      # every node with room, so closing one pull request freed no node at all:
+      # each still carried another capsule's api or worker, and the teardown
+      # that reclaims idle workers never found one idle. Production leaves this
+      # empty and is not pinned.
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+{{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:
         - name: {{ .Values.projectName }}-registry

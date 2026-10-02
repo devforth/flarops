@@ -1,3 +1,5 @@
+const ciSsh = require('./ciSsh');
+
 module.exports = function deployYmlTemplate(config) {
   const repoString = config.dockerRegistry
     ? `\${{ env.DOCKER_REGISTRY }}/\${{ env.PROJECT_NAME }}`
@@ -159,30 +161,16 @@ jobs:
       - name: Fetch Kubeconfig from EC2
         working-directory: deploy/terraform
         run: |
+          set -euo pipefail
+          # Without the line above, an empty "terraform output" leaves EC2_IP
+          # unset and every ssh below silently targets "ubuntu@", which fails
+          # in a way the last command of the step (a sed over an empty file)
+          # reports as success. It goes first because GitHub puts the script's
+          # first line in the step header, where half a comment reads as noise.
+
           export EC2_IP=$(terraform output -raw public_ip)
 
-          echo "Waiting for K3s to be ready on $EC2_IP..."
-          # Bounded. An unbounded loop here waited out GitHub's six-hour job
-          # limit whenever k3s failed to install (bad AMI, apt or network
-          # trouble in user_data), with the EC2 instance already created and
-          # billing and every later push queued behind it.
-          for attempt in $(seq 1 60); do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$EC2_IP "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
-              break
-            fi
-            if [ "$attempt" -eq 60 ]; then
-              echo "::error::k3s did not finish installing within 10 minutes. Check cloud-init on the server ($EC2_IP): /var/log/cloud-init-output.log"
-              exit 1
-            fi
-            echo "Waiting for k3s.yaml... ($attempt/60)"
-            sleep 10
-          done
-
-          mkdir -p ~/.kube
-          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
-          chmod 600 ~/.kube/config
-
-          sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+${ciSsh.fetchKubeconfig()}
 
       - name: Setup Werf
         uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d # branch v2 @ 2026-05-21

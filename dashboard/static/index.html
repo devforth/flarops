@@ -1592,6 +1592,10 @@
     /** Marks a rounded figure as having exact detail behind it. */
     const exact = (html, title) => '<span class="exact" title="' + title + '">' + html + "</span>";
     const usd = val => "$" + (val || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    /* "October" -> "Oct". The labels come from the server; the chart used to
+       print "Aug" and "Jul" whatever month it was. Escaped like any other
+       server string. */
+    const monShort = label => esc(String(label || "").slice(0, 3));
     const usd0 = n => "$" + Math.round(n || 0).toLocaleString("en-US");
     const pct = (a, b) => b === 0 ? 0 : Math.round((a / b) * 100);
 
@@ -1749,7 +1753,7 @@
         const bh = Math.max(2, padT + ih - y(v)), x = cx(i) - bar / 2, last = i === n - 1;
         g += '<rect class="bar" data-i="' + i + '" x="' + x.toFixed(1) + '" y="' + y(v).toFixed(1) +
           '" width="' + bar.toFixed(1) + '" height="' + bh.toFixed(1) + '" rx="3" fill="var(--brass' +
-          (last ? "" : "-2") + ')" opacity="' + (last ? 1 : 0.88) + '"><title>Aug ' + SPEND.days[i] +
+          (last ? "" : "-2") + ')" opacity="' + (last ? 1 : 0.88) + '"><title>' + monShort(SPEND.monthLabel) + " " + SPEND.days[i] +
           ": " + usd(v) + "</title></rect>";
       });
 
@@ -1782,7 +1786,7 @@
     }
     function chartTable() {
       const rows = SPEND.days.map((d, i) =>
-        "<tr><td>Aug " + d + "</td><td>" + usd(SPEND.cur[i]) + "</td><td>" + usd(SPEND.prev[i]) + "</td></tr>").join("");
+        "<tr><td>" + monShort(SPEND.monthLabel) + " " + d + "</td><td>" + usd(SPEND.cur[i]) + "</td><td>" + usd(SPEND.prev[i]) + "</td></tr>").join("");
 
       let breakdownHTML = "";
       if (SPEND.breakdown) {
@@ -2014,9 +2018,9 @@
       if (!b) return;
       const i = +b.dataset.i, d = SPEND.days[i], c = SPEND.cur[i], p = SPEND.prev[i];
       const diff = ((c - p) / p) * 100;
-      tip.innerHTML = '<div class="t-d">Aug ' + d + (i === SPEND.days.length - 1 ? " · today" : "") + "</div>" +
+      tip.innerHTML = '<div class="t-d">' + monShort(SPEND.monthLabel) + " " + d + (i === SPEND.days.length - 1 ? " · today" : "") + "</div>" +
         '<div class="t-r"><i>this month</i><span>' + usd(c) + "</span></div>" +
-        '<div class="t-r"><i>Jul ' + d + "</i><span>" + usd(p) + "</span></div>" +
+        '<div class="t-r"><i>' + monShort(SPEND.prevLabel) + " " + d + "</i><span>" + usd(p) + "</span></div>" +
         '<div class="t-r"><i>change</i><span style="color:var(--' + (diff >= 0 ? "hot" : "ok") + ')">' +
         (diff >= 0 ? "+" : "") + diff.toFixed(0) + "%</span></div>";
       tip.style.opacity = "1";

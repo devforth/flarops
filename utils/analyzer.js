@@ -535,6 +535,40 @@ function findHealthCheckInComposeBlock(serviceBlock) {
   return { route: route.replace(/[?#].*$/, ''), port: urlMatch[1] ? parseInt(urlMatch[1], 10) : null };
 }
 
+// The compose service that BUILDS from `dir` - the one whose ports and
+// healthcheck describe what actually runs from that directory. Port and
+// healthcheck lookups used to go by name alone (the directory's basename and
+// a few conventional words), so "flask-api: build: ./backend" with
+// ports: ["5000:80"] was never read: nothing called "backend" existed in
+// compose, and the 3000 default won for an app listening on 80.
+//
+// Several services can build from one directory - an API and the workers
+// that share its image. Then the one named like the directory wins, failing
+// that the only one that publishes ports (workers rarely do); when even that
+// is ambiguous the answer is none, and the name-based lookup stands alone as
+// it did before.
+async function composeServicesBuiltFrom(baseDir, dir, conventionalNames = []) {
+  let builds;
+  try { builds = await findBuildableComposeServices(baseDir); } catch (e) { return []; }
+  const built = Object.entries(builds)
+    .filter(([, info]) => path.resolve(info.context) === path.resolve(dir))
+    .map(([name]) => name);
+  if (built.length <= 1) return built;
+
+  const named = built.filter(name => conventionalNames.includes(name));
+  if (named.length > 0) return named;
+
+  const blocks = {};
+  for (const file of listComposeFiles(baseDir)) {
+    try {
+      Object.assign(blocks, splitComposeServiceBlocks(await fs.readFile(path.join(baseDir, file), 'utf8')));
+      break;
+    } catch (e) { /* not this one */ }
+  }
+  const publishing = built.filter(name => blocks[name] && composePortEntries(blocks[name]).length > 0);
+  return publishing.length === 1 ? publishing : [];
+}
+
 async function findHealthCheckFromCompose(baseDir, serviceNames) {
   const composeFiles = listComposeFiles(baseDir);
   for (const file of composeFiles) {
@@ -773,12 +807,24 @@ async function analyzeBackend(baseDir) {
 
   const portNamesPattern = ['PORT', 'SERVER_PORT', 'APP_PORT', 'API_PORT', 'HTTP_PORT', 'BACKEND_PORT', 'LISTEN_PORT', 'NODE_PORT', 'SERVICE_PORT'].join('|');
   const dirPorts = await findPortsInDir(baseDir, backendPath, portNamesPattern, 3000, scanExcludeDirNames);
-  const composePorts = await findPortsInCompose(baseDir, [...partialDirs, path.basename(backendPath)]);
+  const builtFromBackend = await composeServicesBuiltFrom(baseDir, backendPath, [...partialDirs, path.basename(backendPath)]);
+  const composePorts = await findPortsInCompose(baseDir, [...builtFromBackend, ...partialDirs, path.basename(backendPath)]);
 
-  const dockerfile = await findDockerfile(backendPath);
+  // The Dockerfile compose names for this service, when it names one - the
+  // frontend and every additional service already worked this way. With only
+  // findDockerfile, a backend declared with "dockerfile: Dockerfile.prod"
+  // beside a development Dockerfile was built from the development one.
+  let composeDockerfile = null;
+  if (builtFromBackend.length > 0) {
+    try {
+      const builds = await findBuildableComposeServices(baseDir);
+      composeDockerfile = (builds[builtFromBackend[0]] || {}).dockerfile || null;
+    } catch (e) { logDebug(e); }
+  }
+  const dockerfile = composeDockerfile || await findDockerfile(backendPath);
   // Most authoritative first: the probe the compose author actually wrote,
   // then a framework's conventional endpoint, then a route literal in source.
-  const composeHealth = await findHealthCheckFromCompose(baseDir, [path.basename(backendPath), ...partialDirs]);
+  const composeHealth = await findHealthCheckFromCompose(baseDir, [...builtFromBackend, path.basename(backendPath), ...partialDirs]);
   const healthRoute = (composeHealth && composeHealth.route)
     || await findFrameworkHealthRoute(backendPath)
     || await findHealthRoute(backendPath, scanExcludeDirNames);
@@ -1012,7 +1058,8 @@ async function analyzeFrontend(baseDir, backendPath = null) {
   }
 
   const dirPorts = (await findPortsInDir(baseDir, frontendPath, portNamesPattern, primaryPort, frontendScanExcludes)).filter(p => p !== null);
-  const composePorts = await findPortsInCompose(baseDir, [...exactDirs, path.basename(frontendPath)]);
+  const builtFromFrontend = await composeServicesBuiltFrom(baseDir, frontendPath, [...exactDirs, path.basename(frontendPath)]);
+  const composePorts = await findPortsInCompose(baseDir, [...builtFromFrontend, ...exactDirs, path.basename(frontendPath)]);
 
   // A compose-declared dockerfile name wins: findDockerfile only guesses, and
   // when the context is the repo root there are often several Dockerfiles
@@ -1305,7 +1352,7 @@ function makeServiceEntry(discovered) {
   };
 }
 
-async function buildServiceEntry(baseDir, dirPath, name, composeNames, siblingExcludes, composeDockerfile) {
+async function buildServiceEntry(baseDir, dirPath, name, composeNames, siblingExcludes, composeDockerfile, { sharesDirectory = false } = {}) {
   // A compose service names its OWN Dockerfile, and several services routinely
   // share one build context with a different one each ("Dockerfile.api" and
   // "Dockerfile.worker" over the same ./app). findDockerfile can only ever
@@ -1318,18 +1365,31 @@ async function buildServiceEntry(baseDir, dirPath, name, composeNames, siblingEx
   const dirPorts = await findPortsInDir(baseDir, dirPath, portNamesPattern, null, siblingExcludes || []);
   const composePorts = await findPortsInCompose(baseDir, composeNames);
 
-  let ports = Array.from(new Set([...dirPorts, ...composePorts])).filter(p => p !== null);
-  if (ports.length === 0) ports = [80]; // fallback
+  // A directory shared with another service - a worker or a cron runner
+  // beside the API, on the same image - holds THAT service's ports and routes
+  // too. Read from source, the worker inherited the API's /api/health and the
+  // port-80 fallback, its liveness probe hit a process that serves no HTTP,
+  // and it restarted forever. For such a service only what compose states
+  // about it is evidence; with no port declared it has no port, and gets no
+  // Service and no probes.
+  let ports = Array.from(new Set([...(sharesDirectory ? [] : dirPorts), ...composePorts])).filter(p => p !== null);
+  if (ports.length === 0 && !sharesDirectory) ports = [80]; // fallback
 
   const composeHealth = await findHealthCheckFromCompose(baseDir, composeNames);
   const healthRoute = (composeHealth && composeHealth.route)
-    || await findFrameworkHealthRoute(dirPath)
-    || await findHealthRoute(dirPath);
+    || (sharesDirectory ? null : (await findFrameworkHealthRoute(dirPath) || await findHealthRoute(dirPath)));
   const healthPort = composeHealth ? composeHealth.port : null;
-  const usedEnvVars = await extractUsedEnvVars(dirPath, siblingExcludes || []);
+  // Same reasoning for the variables it reads: scanning a shared directory
+  // finds what EVERY service built from it reads, so a cron runner was wired
+  // the worker's WORKER_TOKEN. Compose is the whole truth about a compose
+  // service's environment anyway - its container gets environment: and
+  // env_file and nothing else - and both are wired from the compose scan in
+  // init.js regardless of this list.
+  const usedEnvVars = sharesDirectory ? [] : await extractUsedEnvVars(dirPath, siblingExcludes || []);
 
   const { analyzeBackendExposedRoutes } = require('./routeAnalyzer');
-  const exposedRoutes = await analyzeBackendExposedRoutes(dirPath);
+  // No port, no Service - and an Ingress rule cannot point at nothing.
+  const exposedRoutes = ports.length > 0 ? await analyzeBackendExposedRoutes(dirPath) : [];
   const isReactorModule = await isMavenReactorModule(baseDir, dirPath);
 
   return makeServiceEntry({
@@ -1440,6 +1500,13 @@ async function analyzeAdditionalServices(baseDir, knownPaths, claimedComposeName
     const canUseDirName = rel !== '' && contextUseCount[info.context] === 1 && basenameUseCount[base] === 1;
     const name = canUseDirName ? base : composeName;
     composeContexts.add(path.resolve(info.context));
+    // The directory HOLDING a compose-declared Dockerfile is accounted for as
+    // well. "context: ." with "dockerfile: services/api/Dockerfile" is one
+    // service, but the scan below found services/api/Dockerfile again and
+    // generated a second copy of it - with a second database of its own.
+    if (info.dockerfile && path.dirname(info.dockerfile) !== '.') {
+      composeContexts.add(path.resolve(info.context, path.dirname(info.dockerfile)));
+    }
     addCandidate(info.context, name, composeName, info.dockerfile, true);
   }
 
@@ -1480,6 +1547,10 @@ async function analyzeAdditionalServices(baseDir, knownPaths, claimedComposeName
   for (const candidate of candidates) {
     const isRootContext = path.resolve(candidate.dirPath) === path.resolve(baseDir);
     const composeNames = Array.from(new Set([candidate.composeName, candidate.name].filter(Boolean)));
+    // Another service builds from the same directory - the backend, the
+    // frontend, or a sibling compose service. Then the directory's source
+    // describes all of them at once and cannot say anything about this one.
+    const sharesDirectory = claimed.has(candidate.dirPath) || (contextUseCount[candidate.dirPath] || 0) > 1;
     try {
       const entry = await buildServiceEntry(
         baseDir,
@@ -1488,6 +1559,7 @@ async function analyzeAdditionalServices(baseDir, knownPaths, claimedComposeName
         composeNames,
         isRootContext ? rootSiblingExcludes : [],
         candidate.dockerfile,
+        { sharesDirectory },
       );
       if (entry) services.push(entry);
     } catch (e) { logDebug(e); }

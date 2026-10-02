@@ -164,7 +164,18 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
       // Matches 'http://localhost:8000/some/path' or 'http://api.domain.com:8000/some/path'
       const regex = new RegExp(`(['"\`])(https?:\\/\\/[^\\/:\`"']+:${port})(.{0,100}?)\\1`, 'g');
       
-      content = content.replace(regex, (match, quote, base, rest) => {
+      content = content.replace(regex, (match, quote, base, rest, offset, whole) => {
+        // Already the FALLBACK of an environment read
+        // ("process.env.API_URL ?? 'http://localhost:8000'") - the code is
+        // configurable as it stands. Rewriting it anyway turned the literal
+        // into the identifier API_URL, and when that line was itself the
+        // "const API_URL = ..." declaration (which is also why no new
+        // declaration was injected) the result was
+        // "const API_URL = process.env.API_URL ?? API_URL": a TypeScript build
+        // error, and a ReferenceError at runtime whenever the variable is unset.
+        const before = whole.slice(Math.max(0, offset - 40), offset);
+        if (/(\?\?|\|\|)\s*\(?\s*$/.test(before)) return match;
+
         modified = true;
         backendDetectedUrl = base; // Record what we found to use in .env.local
 

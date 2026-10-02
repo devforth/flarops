@@ -12,6 +12,9 @@ services:
       DB_HOST: db
       SELF_CALLBACK_URL: http://localhost:5000/hooks
       METRICS_ENDPOINT: http://localhost:9411/spans
+      PUBLIC_DOMAIN: localhost
+      ALLOWED_ORIGINS: "http://localhost,http://admin.localhost"
+      BIND_ADDRESS: 127.0.0.1
     depends_on: [db]
   frontend:
     build: ./frontend

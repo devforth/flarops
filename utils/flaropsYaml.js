@@ -125,6 +125,10 @@ function serviceBlock(name, opts) {
   if (portsStr) {
     lines.push('  ports:');
     lines.push(portsStr);
+  } else if (Array.isArray(opts.ports)) {
+    // Written explicitly: left out, sync would read the absence as "use the
+    // default" and give a worker that listens on nothing port 80 and a Service.
+    lines.push('  ports: []');
   }
 
   // build args

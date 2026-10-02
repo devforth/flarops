@@ -33,6 +33,77 @@ module.exports = function writeTerraform({
 }) {
 
 
+  // The head of both bootstrap scripts, shared verbatim by the server and the
+  // workers. Four spaces of indent, because it is pasted inside a Terraform
+  // <<-EOF whose body sits at that column.
+  const bootstrapPreamble = `    # Everything this script prints goes to one file. Until now the only trace
+    # a failed bootstrap left behind was /var/log/cloud-init-output.log, which
+    # nothing ever fetched - so a node that failed to install k3s looked
+    # exactly like one still working on it, from every angle CI could see.
+    # The deploy workflow prints this log back into the job output when its
+    # wait gives up.
+    #
+    # Deliberately no "set -x": this log is published into a CI job, and
+    # xtrace would put the cluster join token in it.
+    exec > >(tee -a /var/log/flarops-bootstrap.log) 2>&1
+    set -Eeuo pipefail
+
+    mkdir -p /var/lib/flarops
+    # The sentinel CI polls for. Without it "k3s is not up yet" and "k3s will
+    # never be up" are the same observation from outside, so a bootstrap that
+    # died in its first ten seconds was still only reported a quarter of an
+    # hour later, after the full timeout had been sat out.
+    trap 'echo "flarops: bootstrap FAILED at line $LINENO"' ERR
+    # The sentinel is written from the EXIT trap, not the ERR one. An explicit
+    # "exit 1" - the installer download giving up after its last retry - is not
+    # a failed command, so ERR never fires for it, and the node would sit there
+    # broken with no sentinel while CI waited out the whole timeout.
+    trap 'flarops_rc=$?; if [ "$flarops_rc" != 0 ]; then touch /var/lib/flarops/bootstrap-failed; fi' EXIT
+`;
+
+  // Fetch the k3s installer. See the comments inside for why this is neither a
+  // pipe nor a single source.
+  const installerDownload = `    # Downloaded to a file and then run, rather than piped straight into sh.
+    # "curl -sfL https://get.k3s.io | ... sh -" swallowed every failure it had:
+    # on a network error or an HTTP 5xx, curl exits non-zero having written
+    # nothing, the sh on the right of the pipe reads an empty script and exits
+    # 0, and the pipeline's status is sh's. cloud-init then reported success on
+    # an instance with no k3s on it, and nothing anywhere recorded an error.
+    #
+    # Two sources, tried in order, and the pinned one comes first on purpose.
+    # raw.githubusercontent.com serves the installer exactly as it shipped with
+    # var.k3s_version, while get.k3s.io always serves master's copy, which can
+    # drift from the version it is being asked to install. It also removes a
+    # dependency rather than adding one: the installer downloads the k3s binary
+    # itself from github.com either way, so a node that cannot reach GitHub
+    # cannot be built at all - whereas get.k3s.io is a separate service that
+    # fails on its own. On 2026-09-29 it answered every request with Cloudflare
+    # error 1101, and every node built during that window got no k3s.
+    #
+    # The retries cover the transient case on top of that: DNS and the default
+    # route are seconds old when this runs, and there is no second chance -
+    # user_data executes on first boot only.
+    K3S_INSTALLER_URLS="https://raw.githubusercontent.com/k3s-io/k3s/\${var.k3s_version}/install.sh https://get.k3s.io"
+
+    downloaded=""
+    for attempt in $(seq 1 5); do
+      for url in $K3S_INSTALLER_URLS; do
+        if curl -fsSL --retry 3 --retry-delay 5 --retry-connrefused --max-time 180 \\
+             -o /tmp/k3s-install.sh "$url" && [ -s /tmp/k3s-install.sh ]; then
+          echo "flarops: got the k3s installer from $url"
+          downloaded=yes
+          break
+        fi
+        echo "flarops: $url did not serve the installer"
+      done
+      if [ -n "$downloaded" ]; then break; fi
+      echo "flarops: no source served the k3s installer (attempt $attempt/5)"
+      if [ "$attempt" = 5 ]; then exit 1; fi
+      sleep 15
+    done
+    test -s /tmp/k3s-install.sh
+`;
+
   const cloudflareProviderConfig = cloudflareApiToken && cloudflareZoneId ? `
 provider "cloudflare" {
   api_token = var.cloudflare_api_token
@@ -198,13 +269,35 @@ resource "aws_instance" "server" {
 
   user_data = sensitive(<<-EOF
     #!/bin/bash
+${bootstrapPreamble}
     mkdir -p /home/ubuntu/.ssh
     echo "\${var.ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
     chown -R ubuntu:ubuntu /home/ubuntu/.ssh
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="\${var.k3s_version}" INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --token \${random_password.k3s_token.result} --tls-san \${aws_eip.eip.public_ip}" sh -
+${installerDownload}
+    echo "flarops: installing k3s server \${var.k3s_version}"
+    # The join token travels in K3S_TOKEN rather than in "--token" inside
+    # INSTALL_K3S_EXEC so that it is never part of a command line: this log is
+    # printed back into the CI job output when a bootstrap fails, and an
+    # argument list would put a cluster-admin credential in it.
+    INSTALL_K3S_VERSION="\${var.k3s_version}" \\
+      K3S_TOKEN="\${random_password.k3s_token.result}" \\
+      INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --tls-san \${aws_eip.eip.public_ip}" \\
+      sh /tmp/k3s-install.sh
+
+    # The installer exits once the systemd unit exists, so its own success says
+    # nothing about the cluster being up. CI treats /etc/rancher/k3s/k3s.yaml
+    # as "ready to receive a deploy", and this loop is what makes that true.
+    for attempt in $(seq 1 60); do
+      if [ -f /etc/rancher/k3s/k3s.yaml ]; then break; fi
+      sleep 5
+    done
+    test -f /etc/rancher/k3s/k3s.yaml
+
+    echo "flarops: bootstrap OK"
+    touch /var/lib/flarops/bootstrap-ok
   EOF
   )
 
@@ -270,6 +363,7 @@ resource "aws_instance" "worker" {
 
   user_data = sensitive(<<-EOF
     #!/bin/bash
+${bootstrapPreamble}
     HOSTNAME="\${var.instance_name}-worker-\${each.key}"
     hostnamectl set-hostname $HOSTNAME
 
@@ -279,7 +373,26 @@ resource "aws_instance" "worker" {
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="\${var.k3s_version}" INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" K3S_URL=https://\${aws_instance.server.private_ip}:6443 K3S_TOKEN=\${random_password.k3s_token.result} sh -
+${installerDownload}
+    echo "flarops: installing k3s agent \${var.k3s_version}"
+    INSTALL_K3S_VERSION="\${var.k3s_version}" \\
+      K3S_URL="https://\${aws_instance.server.private_ip}:6443" \\
+      K3S_TOKEN="\${random_password.k3s_token.result}" \\
+      INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" \\
+      sh /tmp/k3s-install.sh
+
+    # A worker has no kubeconfig to wait for, and the agent retries the join on
+    # its own for as long as it takes - so the service being up is the most
+    # this script can honestly assert. Whether the node actually joined is
+    # checked from CI with "kubectl wait node", against the server.
+    for attempt in $(seq 1 60); do
+      if systemctl is-active --quiet k3s-agent; then break; fi
+      sleep 5
+    done
+    systemctl is-active --quiet k3s-agent
+
+    echo "flarops: bootstrap OK"
+    touch /var/lib/flarops/bootstrap-ok
   EOF
   )
 

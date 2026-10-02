@@ -20,6 +20,7 @@ const { generate } = require('./harness');
 const { capture, firstDifference } = require('./snapshot');
 const syncTests = require('./sync');
 const yamlTests = require('./yaml');
+const awsTests = require('./aws');
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 const SNAPSHOTS = path.join(__dirname, 'snapshots');
@@ -389,7 +390,11 @@ async function urlBreakingPasswordSurvives() {
 
   for (const name of names) {
     console.log(`\n  ${name}`);
-    const result = await generate(path.join(FIXTURES, name));
+    // A fixture can answer a prompt differently from the harness default - the
+    // source refactors, which every other fixture declines.
+    const answersFile = path.join(FIXTURES, name, 'answers.json');
+    const answers = fs.existsSync(answersFile) ? JSON.parse(fs.readFileSync(answersFile, 'utf8')) : undefined;
+    const result = await generate(path.join(FIXTURES, name), answers);
     if (!check('generates without throwing', result.ok, result.error && result.error.stack)) continue;
 
     // A fixture may state lines the generation must PRINT. Some of what the
@@ -474,6 +479,12 @@ async function urlBreakingPasswordSurvives() {
 
   console.log('\n  flarops.yaml reader');
   yamlTests.run(check);
+
+  console.log('\n  state bucket dialogue');
+  // The harness swaps utils/awsHelper.js for a stub in the module cache; these
+  // checks need the real one.
+  delete require.cache[require.resolve('../utils/awsHelper.js')];
+  await awsTests.run(check);
 
   console.log('\n  already-initialized project');
   refusesSecondInit();

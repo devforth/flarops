@@ -51,10 +51,11 @@ const (
 	csrfCookieInsecure    = "flarops_csrf"
 
 	// PBKDF2-HMAC-SHA256 at OWASP's recommended iteration count. Chosen over
-	// Argon2id specifically to avoid pulling golang.org/x/crypto into a
-	// generated project: that module now requires a newer Go toolchain than
-	// the dashboard's own Dockerfile pins, so depending on it would force a
-	// toolchain bump on every project Flarops generates. The password this
+	// Argon2id to keep golang.org/x/crypto out of every generated project -
+	// one more module whose own toolchain floor would dictate the
+	// Dockerfile's (originally the reason; it no longer binds, since the
+	// Dockerfile now pins a current Go, but the dependency still buys
+	// nothing the standard library cannot do here). The password this
 	// protects is machine-generated with ~144 bits of entropy, which is far
 	// out of reach of any offline attack at this cost; the KDF is here for
 	// the case where an operator later replaces it with one of their own.

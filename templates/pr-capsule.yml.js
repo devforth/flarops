@@ -1,3 +1,5 @@
+const ciSsh = require('./ciSsh');
+
 module.exports = function prCapsuleYmlTemplate(config) {
   const repoString = config.dockerRegistry
     ? `\${{ env.DOCKER_REGISTRY }}/\${{ env.PROJECT_NAME }}`
@@ -188,20 +190,25 @@ module.exports = function prCapsuleYmlTemplate(config) {
     prDomainLogic = `pr-\${{ github.event.pull_request.number }}.${config.domain}`;
   }
 
-  // The footprint this capsule is planned at, scaled by how many components
-  // the project actually has. It is ALWAYS passed to the capacity oracle.
+  // The FALLBACK footprint a capsule is planned at, scaled by how many
+  // components the project has. The workflow first measures what the same
+  // stack uses in "<project>-production" right now (see the capacity step) and
+  // only falls back to this when metrics-server has nothing yet - a brand new
+  // cluster.
   //
-  // Letting the oracle size the request itself was wrong in both directions.
-  // It sizes from the largest running capsule, and it counts the
-  // "<project>-production" namespace as a capsule - so every pull request was
-  // planned as needing the entire production stack, which produced spurious
-  // "no" verdicts and bought worker nodes nobody needed. Before metrics-server
-  // has measured anything the same code sizes the request at zero, which
-  // floors at 1 MiB and makes any node with a megabyte free look like a fit.
+  // Measured beats estimated by a wide margin: these per-component constants
+  // put a ~275 MiB FastAPI + Next.js capsule at 768 MiB, so the first capsule
+  // made the server look full and every following one bought a worker that
+  // then idled at 20%. The earlier objection to sizing from production - that
+  // it planned every pull request as "the entire production stack" - came from
+  // counting Flarops' own production-only pods (the dashboard, the node agent)
+  // and the largest capsule; the measurement leaves those out, and what is
+  // left IS one copy of the application, which is exactly what a capsule is.
   //
-  // A generated estimate is coarse, but it is an estimate OF THIS CAPSULE, and
-  // it does not swing between those two extremes. The oracle still applies its
-  // own headroom on top.
+  // Letting the oracle size the request itself stays wrong: before
+  // metrics-server has measured anything it sizes at zero, which floors at
+  // 1 MiB and makes any node with a megabyte free look like a fit. The oracle
+  // still applies its own headroom on top of whichever number is passed.
   let requiredMi = 0;
   if (config.hasBackend) requiredMi += 256;
   if (config.hasFrontend) requiredMi += 128;
@@ -310,15 +317,13 @@ jobs:
 
           export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
 
-          mkdir -p ~/.kube
-          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
-          chmod 600 ~/.kube/config
-
-          sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+${ciSsh.fetchKubeconfig()}
 
       - name: Decide where this capsule goes
 ${terraformProviderEnv}        run: |
           set -euo pipefail
+
+${ciSsh.helpers()}
 
           # ---------------------------------------------------------------
           # 1. Is this capsule already placed?
@@ -334,11 +339,13 @@ ${terraformProviderEnv}        run: |
           # where it keeps running.
           # ---------------------------------------------------------------
           # The DATABASE pod's node, specifically - not whichever pod sorts
-          # first. Only stateful workloads carry dataNodeSelector, so api and
-          # frontend routinely sit on other nodes; taking the first pod in the
-          # list returned api's node and re-pinned the database onto it, which
-          # its local-path volume cannot follow. The result was the exact
-          # "volume node affinity conflict" this check exists to prevent.
+          # first. Every workload of a capsule is pinned to one node now, but a
+          # capsule deployed before that has its api and frontend elsewhere;
+          # taking the first pod in the list returned api's node and re-pinned
+          # the database onto it, which its local-path volume cannot follow -
+          # the exact "volume node affinity conflict" this check exists to
+          # prevent. The database's node is the one that cannot move, so the
+          # rest of the capsule joins it there.
           TARGET_NODE=$(kubectl get pods -n "\${{ env.PR_NAMESPACE }}" \\
             -l component=database -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
 
@@ -362,9 +369,28 @@ ${terraformProviderEnv}        run: |
           # templates/pr-capsule.yml.js for why letting the oracle guess it
           # was wrong in both directions.
           # ---------------------------------------------------------------
+          #
+          # What the capsule will really use is best known from the SAME
+          # application running in production, measured now. The generated
+          # estimate (${requiredMi} MiB, per-component constants) ran about
+          # three times over a real capsule: a ~275 MiB stack was planned at
+          # 768, so one capsule made the server look full and the next one
+          # bought a worker that then sat at 20%. The estimate stays as the
+          # fallback for a cluster metrics-server has not measured yet.
+          # Flarops' own production-only pods (dashboard, node agent) are not
+          # part of a capsule and are left out.
+          REQUIRED_MI=$(kubectl top pods -n "\${{ env.MAIN_NAMESPACE }}" --no-headers 2>/dev/null \\
+            | awk '$1 !~ /^flarops-(dashboard|node-agent)/ { v = $3; if (v ~ /Gi$/) { sub(/Gi$/, "", v); v = v * 1024 } else if (v ~ /Ki$/) { sub(/Ki$/, "", v); v = v / 1024 } else { sub(/Mi$/, "", v) } s += v } END { printf "%d", s }' || true)
+          if [ -z "$REQUIRED_MI" ] || [ "$REQUIRED_MI" -lt 64 ]; then
+            echo "No usable measurement of \${{ env.MAIN_NAMESPACE }} yet - planning with the generated estimate of ${requiredMi} MiB."
+            REQUIRED_MI=${requiredMi}
+          else
+            echo "Planning this capsule at $REQUIRED_MI MiB - what the same stack uses in \${{ env.MAIN_NAMESPACE }} right now."
+          fi
+
           ask_capacity() {
             kubectl exec -n "\${{ env.MAIN_NAMESPACE }}" deploy/flarops-dashboard -- \\
-              curl -sS --max-time 10 "http://127.0.0.1:9090/capacity?mib=${requiredMi}&for=\${{ env.PR_ENV_NAME }}"
+              curl -sS --max-time 10 "http://127.0.0.1:9090/capacity?mib=$REQUIRED_MI&for=\${{ env.PR_ENV_NAME }}"
           }
 
           OUT=""
@@ -399,6 +425,55 @@ ${terraformProviderEnv}        run: |
           # others and the number chosen here is the one teardown can later
           # remove on its own.
           # ---------------------------------------------------------------
+          # ---------------------------------------------------------------
+          # 3a. Capacity that is already on its way.
+          #
+          # A worker another capsule run added a moment ago is in Terraform
+          # but not yet a node, so the oracle cannot count it. Two pull
+          # requests opened together therefore each bought a node: the second
+          # asked while the first one's worker was still booting, heard "no",
+          # and added another. Wait for workers that are joining, and ask
+          # again, before paying for one more.
+          # ---------------------------------------------------------------
+          if [ "$VERDICT" = "no" ]; then
+            TF_OUTPUTS=$(terraform -chdir=deploy/terraform output -json 2>/dev/null || echo '{}')
+            KNOWN_SLOTS=$(printf '%s' "$TF_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(' '.join(str(s) for s in (v if isinstance(v,list) else [])))")
+            WORKER_PREFIX=$(printf '%s' "$TF_OUTPUTS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('instance_name',{}).get('value',''))")
+            node_ready() {
+              [ "$(kubectl get node "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)" = "True" ]
+            }
+            JOINING=""
+            if [ -n "$WORKER_PREFIX" ]; then
+              for SLOT in $KNOWN_SLOTS; do
+                if ! node_ready "$WORKER_PREFIX-worker-$SLOT"; then JOINING="$JOINING $WORKER_PREFIX-worker-$SLOT"; fi
+              done
+            fi
+            if [ -n "$JOINING" ]; then
+              echo "Workers still joining:$JOINING - waiting for them before adding another."
+              for attempt in $(seq 1 60); do
+                STILL=""
+                for NODE in $JOINING; do
+                  if ! node_ready "$NODE"; then STILL="$STILL $NODE"; fi
+                done
+                if [ -z "$STILL" ]; then break; fi
+                echo "  still joining:$STILL ($attempt/60)"
+                sleep 10
+              done
+              # Ready comes before metrics-server has measured the node, and
+              # the oracle will not place onto a node it cannot measure.
+              for attempt in 1 2 3 4 5 6 7 8; do
+                OUT=$(ask_capacity 2>/dev/null || true)
+                if [ "$(printf '%s' "$OUT" | head -1)" = "yes" ]; then
+                  VERDICT=yes
+                  TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
+                  echo "$OUT"
+                  break
+                fi
+                sleep 15
+              done
+            fi
+          fi
+
           if [ "$VERDICT" = "no" ]; then
             echo "::warning::No node has room for this capsule. Adding a worker..."
 
@@ -428,12 +503,33 @@ ${terraformProviderEnv}        run: |
             # the cluster, so one stale NotReady node made every scale-up fail
             # after 180s - each attempt leaving behind a brand-new billed
             # instance, because nothing here rolls the apply back.
-            NEW_SLOT=$(printf '%s' "$NEW_SLOTS" | python3 -c "import json,sys; print(sorted(json.load(sys.stdin))[-1])")
+            # The slot that was just added, not the highest one: the lowest free
+            # slot is reused, so with [2] -> [1, 2] the highest is an existing
+            # node and the wait below would pass without the new one joining.
+            NEW_SLOT=$(CURRENT_SLOTS="$CURRENT_SLOTS" NEW_SLOTS="$NEW_SLOTS" python3 -c "import json,os; print(sorted(set(json.loads(os.environ['NEW_SLOTS'])) - set(json.loads(os.environ['CURRENT_SLOTS'])))[0])")
             NEW_NODE="\${INSTANCE_NAME:-}"
             if [ -z "$NEW_NODE" ]; then NEW_NODE=$(terraform -chdir=deploy/terraform output -raw instance_name); fi
             NEW_NODE="\${NEW_NODE}-worker-\${NEW_SLOT}"
             echo "Waiting for $NEW_NODE to join..."
-            ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo k3s kubectl wait --for=condition=Ready node/\${NEW_NODE} --timeout=240s"
+            # The server itself may have been created by this very apply, in
+            # which case it is still running cloud-init - so wait for it to be
+            # a cluster before asking it about a node.
+            flarops_wait_for_k3s "$EC2_IP"
+            # "kubectl wait" fails at once with NotFound for a node that has not
+            # registered yet - and terraform returns seconds after creating the
+            # instance, long before its cloud-init has installed the k3s agent.
+            # So first wait for the Node object to exist, then for it to be Ready.
+            NODE_SEEN=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$EC2_IP" "sudo k3s kubectl get node/\${NEW_NODE}" > /dev/null 2>&1; then NODE_SEEN=yes; break; fi
+              echo "  $NEW_NODE not registered yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$NODE_SEEN" ]; then
+              echo "::error::$NEW_NODE never registered with the cluster within 10 minutes. The instance exists (and is billed) - check its cloud-init log (/var/log/flarops-bootstrap.log on the worker)."
+              exit 1
+            fi
+            flarops_ssh "$EC2_IP" "sudo k3s kubectl wait --for=condition=Ready node/\${NEW_NODE} --timeout=240s"
 
             # The new node is Ready before metrics-server has measured it, and
             # the oracle refuses to place onto a node it cannot measure - so
@@ -547,11 +643,7 @@ ${dbCloningLogic}
 
           export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
 
-          mkdir -p ~/.kube
-          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
-          chmod 600 ~/.kube/config
-
-          sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+${ciSsh.fetchKubeconfig()}
 
       - name: Setup Werf
         uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d # branch v2 @ 2026-05-21
@@ -616,11 +708,26 @@ ${terraformProviderEnv}        run: |
             # counted as a line of output, so an empty node read as holding one
             # pod and was never reclaimed. A node that exists in Terraform but
             # not in Kubernetes then bills forever.
-            if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" --no-headers 2>/tmp/kubectl.err); then
+            if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" -o json 2>/tmp/kubectl.err); then
               echo "  could not query pods on $NODE_NAME ($(cat /tmp/kubectl.err)) - leaving it alone."
               continue
             fi
-            PODS=$(printf '%s' "$RAW" | grep -v '^$' | grep -cv '^kube-system ' || true)
+            # What counts as work on the node: not kube-system, not a pod that
+            # has finished or is already being deleted (the capsule dismissed a
+            # moment ago), and not a DaemonSet's pod. The last one is what kept
+            # every worker forever: Flarops' own node agent is a DaemonSet in
+            # the PRODUCTION namespace, so each worker always held one
+            # "active" pod and none was ever reclaimed. Drain ignores
+            # DaemonSet pods for the same reason - they exist because the node
+            # does, not the other way round.
+            PODS=$(printf '%s' "$RAW" | python3 -c "
+          import json, sys
+          busy = [p for p in json.load(sys.stdin)['items']
+                  if p['metadata']['namespace'] != 'kube-system'
+                  and not p['metadata'].get('deletionTimestamp')
+                  and p.get('status', {}).get('phase') not in ('Succeeded', 'Failed')
+                  and not any(o.get('kind') == 'DaemonSet' for o in p['metadata'].get('ownerReferences', []))]
+          print(len(busy))")
 
             if [ "$PODS" -ne 0 ]; then
               echo "  $PODS active pod(s) - keeping it."

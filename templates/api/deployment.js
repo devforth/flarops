@@ -1,5 +1,5 @@
 const { secretRefs, urlEncodedRef, alreadyEmitted } = require('../generic/env.js');
-
+const { dbUrlScheme } = require('../../utils/dbDefaults.js');
 module.exports = (config) => {
   // A shared credential whose env var name on the primary backend doesn't
   // match the canonical secret key it was generated under - the container-
@@ -57,7 +57,7 @@ module.exports = (config) => {
       // at render time, by the same rule.
       dbUrlEnvBlock += `
             - name: ${urlVar.key}
-              value: "${scheme}://{{ include "flarops.urlencode" .Values.database.user }}:$(${config.dbPasswordKey}_URLENCODED)@database:{{ .Values.dbPort | default ${defaultPort} }}/{{ include "flarops.urlencode" .Values.database.name }}${query}"`;
+              value: "${dbUrlScheme(config.dbType, urlVar.scheme)}://{{ include "flarops.urlencode" .Values.database.user }}:$(${config.dbPasswordKey}_URLENCODED)@database:{{ .Values.dbPort | default ${defaultPort} }}/{{ include "flarops.urlencode" .Values.database.name }}${query}"`;
     }
   }
 
@@ -171,6 +171,16 @@ spec:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.api.secretKeys | default list) (list ${apiExtraKeyList})) "password" ((.Values.database | default dict).password | default "")) }}
     spec:
       automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      # The whole capsule sits on the node its placement chose, not only its
+      # database. Left to the scheduler, a capsule's stateless pods spread over
+      # every node with room, so closing one pull request freed no node at all:
+      # each still carried another capsule's api or worker, and the teardown
+      # that reclaims idle workers never found one idle. Production leaves this
+      # empty and is not pinned.
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+{{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:
         - name: {{ .Values.projectName }}-registry

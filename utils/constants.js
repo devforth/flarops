@@ -81,7 +81,21 @@ const DB_PORTS = {
   sqlite: 0
 };
 
+
+// Any address that means "this machine" - written as a bare host, as a URL, or
+// as a subdomain of localhost, which docker-compose setups with a local proxy
+// produce ("db.localhost", "proxy.localhost").
+//
+// Deliberately looser than the pattern used to REWRITE a value. Rewriting
+// needs certainty about what an address should become; reporting only needs to
+// know the value will not work in a cluster, where all of these resolve to the
+// container itself. Reporting a value Flarops cannot resolve is the whole
+// point: someone has to change it, and they can only do that if they are told
+// which one.
+const LOOPBACK_HOST_REGEX = /(^|[^A-Za-z0-9.-])(?:[A-Za-z0-9-]+\.)*localhost\b|\b127\.0\.0\.1\b|\b0\.0\.0\.0\b|\[::1\]/i;
+
 module.exports = {
+  LOOPBACK_HOST_REGEX,
   IGNORED_DIRS,
   SENSITIVE_REGEX,
   DB_PASSWORD_REGEX,

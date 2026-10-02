@@ -79,7 +79,10 @@ function renderChartTemplates(config, templatesDir) {
       files.push({ file: at(`${s.name}.yaml`), content: jobTemplate(s, { valuesRef: additionalRef(s) }) });
       continue;
     }
-    files.push({ file: at(`${s.name}.yaml`), content: genericServiceTemplate(s) + '\n---\n' + genericDeploymentTemplate(s) });
+    // A workload that listens on nothing - a queue consumer, a scheduler - has
+    // no endpoints, so a Service for it would select pods and route nowhere.
+    const hasPorts = (s.ports || []).length > 0;
+    files.push({ file: at(`${s.name}.yaml`), content: (hasPorts ? genericServiceTemplate(s) + '\n---\n' : '') + genericDeploymentTemplate(s) });
     if (s.db && !s.db.shared) {
       files.push({ file: at(`${s.name}-db.yaml`), content: genericDatabaseTemplate(s) });
     }

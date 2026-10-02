@@ -119,9 +119,8 @@ spec:
       # Pinned because the volume is. k3s's default local-path StorageClass
       # writes to one node's disk and its PersistentVolume carries node
       # affinity, so a database pod that moves can never reach its data again.
-      # Only the stateful workloads carry this - everything else is left to the
-      # scheduler, so a capsule can use room spread across the fleet instead of
-      # demanding that one node hold all of it.
+      # Every other workload of the capsule is pinned to the same node too (so
+      # that closing the pull request leaves that node idle and reclaimable).
       nodeSelector:
 {{ toYaml .Values.dataNodeSelector | indent 8 }}
 {{- end }}

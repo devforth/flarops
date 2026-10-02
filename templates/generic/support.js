@@ -166,6 +166,16 @@ ${hasVolumes ? `  strategy:
         checksum/config: ${require('crypto').createHash('sha256').update(JSON.stringify(service.configMapData)).digest('hex').slice(0, 32)}` : ''}
     spec:
       automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      # The whole capsule sits on the node its placement chose, not only its
+      # database. Left to the scheduler, a capsule's stateless pods spread over
+      # every node with room, so closing one pull request freed no node at all:
+      # each still carried another capsule's api or worker, and the teardown
+      # that reclaims idle workers never found one idle. Production leaves this
+      # empty and is not pinned.
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+{{- end }}
 {{- $svc := ${idx} }}
       containers:
         - name: ${service.name}

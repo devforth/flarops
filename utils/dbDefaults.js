@@ -43,5 +43,39 @@ function defaultImageFor(dbType) { return engineOf(dbType).image; }
 function defaultPortFor(dbType) { return engineOf(dbType).port; }
 function passwordKeyFor(dbType) { return engineOf(dbType).passwordKey; }
 
+// The scheme a database URL Flarops builds is written with.
+//
+// The URL is rebuilt against the cluster's own host and password, but the
+// scheme belongs to the application: "postgresql+asyncpg" names a driver,
+// and "postgres" vs "postgresql" is not a matter of taste - SQLAlchemy 1.4+
+// rejects "postgres://" outright (NoSuchModuleError), so a FastAPI backend
+// whose compose file said "postgresql://..." could not even import once the
+// generated URL replaced it. The scheme the project used is kept when it is
+// one of this engine's; otherwise the form every driver accepts is used.
+const URL_SCHEME_FAMILY = {
+  postgres: /^postgres(ql)?(\+[a-z0-9_]+)?$/,
+  postgresql: /^postgres(ql)?(\+[a-z0-9_]+)?$/,
+  mysql: /^(mysql|mariadb)(\+[a-z0-9_]+)?$/,
+  mariadb: /^(mysql|mariadb)(\+[a-z0-9_]+)?$/,
+  // Not mongodb+srv: that form resolves a DNS SRV record instead of host:port,
+  // and the generated URL always names the Service and its port.
+  mongodb: /^mongodb$/,
+};
+const DEFAULT_URL_SCHEME = { postgres: 'postgresql', postgresql: 'postgresql', mysql: 'mysql', mariadb: 'mysql', mongodb: 'mongodb' };
+
+function dbUrlScheme(dbType, recorded) {
+  const type = String(dbType || '').toLowerCase();
+  const family = URL_SCHEME_FAMILY[type];
+  const scheme = String(recorded || '').toLowerCase();
+  if (family && family.test(scheme)) return scheme;
+  return DEFAULT_URL_SCHEME[type] || 'postgresql';
+}
+
+// "postgresql+asyncpg://..." -> "postgresql+asyncpg"; null for anything else.
+function urlSchemeOf(value) {
+  const m = String(value == null ? '' : value).trim().replace(/^["']|["']$/g, '').match(/^([a-z][a-z0-9+.-]*):\/\//i);
+  return m ? m[1].toLowerCase() : null;
+}
+
 module.exports = {
-  defaultImageFor, defaultUserFor, defaultPortFor, passwordKeyFor, ENGINES };
+  defaultImageFor, defaultUserFor, defaultPortFor, passwordKeyFor, dbUrlScheme, urlSchemeOf, ENGINES };

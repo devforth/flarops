@@ -1,0 +1,4 @@
+JWT_SECRET (docker-compose.yml: committed to git, so the value is public)
+STRIPE_KEY (backend/.env.production: committed to git, so the value is public)
+WORKER_TOKEN (backend/worker.env: committed to git, so the value is public)
+worker: backend/missing.env (does not exist)

@@ -1,0 +1,32 @@
+# A laptop compose file in front of a production Dockerfile:
+#  - the backend's command is a hot-reloading dev server, while its image's CMD
+#    runs the migrations first - the CMD must win
+#  - DATABASE_URL names a driver ("postgresql+asyncpg"), which the rebuilt URL
+#    must keep
+#  - the worker's command is a real one and is carried
+#  - the frontend reads its API URL from the environment with a localhost
+#    fallback, which the URL refactor must leave alone
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+  backend:
+    build: ./backend
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app:app@db:5432/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+  worker:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app:app@db:5432/app
+    command: arq app.worker.WorkerSettings
+  frontend:
+    build: ./frontend
+    ports: ["3000:3000"]
+    depends_on: [backend]

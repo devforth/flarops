@@ -1,0 +1,3 @@
+WARNING: Not using the database password from DB_PASSWORD in backend/.env (the database engine's default password)
+STRIPE_API_KEY (backend/.env: placeholder value)
+REFRESH_SECRET (backend/.env.example: example file - committed, so the value is public)

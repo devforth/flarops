@@ -1,0 +1,41 @@
+# One fixture for the compose forms the generator has to read correctly:
+#  - an api named after neither its directory nor any conventional word,
+#    listening on 80, built from a non-default Dockerfile (C-05, item 4)
+#  - a command with a backslash (C-02)
+#  - two services sharing the api's directory, with flow and string commands
+#    (C-03), which must NOT inherit the api's health route or a port (item 1)
+#  - a literal secret in this committed file (item 2)
+#  - env_file, one present and one missing (item 5)
+#  - a named volume and a development bind mount on a worker (item 6)
+#  - a supporting service whose quoted value contains " #" (item 7)
+services:
+  flask-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    ports: ["5000:80"]
+    command:
+      - sh
+      - -c
+      - grep -E '^\d+$' /etc/hostname; exec gunicorn -b 0.0.0.0:80 app:app
+    environment:
+      JWT_SECRET: committed-dev-secret
+      REDIS_HOST: cache
+  worker:
+    build: ./backend
+    command: ["python", "worker.py", "--queue=jobs, urgent"]
+    env_file:
+      - ./backend/worker.env
+      - ./backend/missing.env
+    volumes:
+      - spool:/var/spool/app
+      - ./backend:/app
+  cron:
+    build: ./backend
+    command: "python cron.py --every '5 min'"
+  cache:
+    image: redis:7
+    environment:
+      NOTE: "keep #this"
+volumes:
+  spool:

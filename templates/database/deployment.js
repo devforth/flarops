@@ -206,16 +206,18 @@ spec:
       # Pinned because the volume is. k3s's default local-path StorageClass
       # writes to one node's disk and its PersistentVolume carries node
       # affinity, so a database pod that moves can never reach its data again.
-      # Only the stateful workloads carry this - everything else is left to the
-      # scheduler, so a capsule can use room spread across the fleet instead of
-      # demanding that one node hold all of it.
+      # Every other workload of the capsule is pinned to the same node too (so
+      # that closing the pull request leaves that node idle and reclaimable).
       nodeSelector:
 {{ toYaml .Values.dataNodeSelector | indent 8 }}
 {{- end }}
 {{- if .Values.dbCloneSource }}
       initContainers:
         - name: db-clone
-          image: curlimages/curl:latest
+          # Pinned to a version AND its digest, like every other image Flarops
+          # writes: ":latest" made what downloads the clone source - with the
+          # database's init directory mounted - whatever was pushed last.
+          image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
           command: ["curl"]
           args: ["--fail", "--silent", "--show-error", "--location", "--proto", "=https", "-o", "/docker-entrypoint-initdb.d/dump.sql", "{{ .Values.dbCloneSource }}"]
           volumeMounts:

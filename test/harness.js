@@ -77,6 +77,11 @@ async function generate(fixtureDir, extraAnswers) {
   const work = path.join(parent, path.basename(fixtureDir));
   fs.cpSync(fixtureDir, work, { recursive: true });
   child_process.execFileSync('git', ['init', '-q'], { cwd: work });
+  // A real project keeps .env and .env.local out of git, and init treats
+  // whatever IS committed as public (see untrustedSecretValueReason). Without
+  // this every fixture's .env would read as a committed one. A fixture that
+  // means to test a committed env file uses another name (.env.production).
+  fs.appendFileSync(path.join(work, '.git', 'info', 'exclude'), '.env\n.env.local\n');
   child_process.execFileSync('git', ['add', '-A'], { cwd: work, stdio: 'ignore' });
   child_process.execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'fixture'],
     { cwd: work, stdio: 'ignore' });

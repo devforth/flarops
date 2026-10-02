@@ -149,30 +149,74 @@ jobs:
       - name: Fetch Kubeconfig from EC2
         working-directory: deploy/terraform
         run: |
+          set -euo pipefail
+          # Without the line above, an empty "terraform output" leaves EC2_IP
+          # unset and every ssh below silently targets "ubuntu@", which fails
+          # in a way the last command of the step (a sed over an empty file)
+          # reports as success. It goes first because GitHub puts the script's
+          # first line in the step header, where half a comment reads as noise.
+
           export EC2_IP=$(terraform output -raw public_ip)
 
-          echo "Waiting for K3s to be ready on $EC2_IP..."
-          # Bounded. An unbounded loop here waited out GitHub's six-hour job
-          # limit whenever k3s failed to install (bad AMI, apt or network
-          # trouble in user_data), with the EC2 instance already created and
-          # billing and every later push queued behind it.
-          for attempt in $(seq 1 60); do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$EC2_IP "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
-              break
+          # --- flarops ssh helpers (see templates/ciSsh.js) ---
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
             fi
-            if [ "$attempt" -eq 60 ]; then
-              echo "::error::k3s did not finish installing within 10 minutes. Check cloud-init on the server ($EC2_IP): /var/log/cloud-init-output.log"
-              exit 1
-            fi
-            echo "Waiting for k3s.yaml... ($attempt/60)"
-            sleep 10
-          done
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+          # --- end flarops ssh helpers ---
+
+          flarops_wait_for_k3s "$EC2_IP"
 
           mkdir -p ~/.kube
-          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
+          flarops_ssh "$EC2_IP" "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
           chmod 600 ~/.kube/config
 
+          # The server writes its own kubeconfig pointing at 127.0.0.1; from here the
+          # API server is only reachable at the public address the certificate was
+          # issued for (--tls-san in user_data).
           sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+          # A kubeconfig that reached none of the above is an empty file that every
+          # later kubectl treats as "no context", which reads as a cluster with nothing
+          # in it - the exact shape that made a teardown report success while the
+          # capsule was still running.
+          test -s ~/.kube/config
 
       - name: Setup Werf
         uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d # branch v2 @ 2026-05-21
@@ -312,17 +356,115 @@ jobs:
 
           export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
 
+          # --- flarops ssh helpers (see templates/ciSsh.js) ---
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+          # --- end flarops ssh helpers ---
+
+          flarops_wait_for_k3s "$EC2_IP"
+
           mkdir -p ~/.kube
-          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
+          flarops_ssh "$EC2_IP" "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
           chmod 600 ~/.kube/config
 
+          # The server writes its own kubeconfig pointing at 127.0.0.1; from here the
+          # API server is only reachable at the public address the certificate was
+          # issued for (--tls-san in user_data).
           sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+          # A kubeconfig that reached none of the above is an empty file that every
+          # later kubectl treats as "no context", which reads as a cluster with nothing
+          # in it - the exact shape that made a teardown report success while the
+          # capsule was still running.
+          test -s ~/.kube/config
 
       - name: Decide where this capsule goes
         env:
           TF_VAR_domain: ${{ env.BASE_DOMAIN }}
         run: |
           set -euo pipefail
+
+          # --- flarops ssh helpers (see templates/ciSsh.js) ---
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+          # --- end flarops ssh helpers ---
 
           # ---------------------------------------------------------------
           # 1. Is this capsule already placed?
@@ -338,11 +480,13 @@ jobs:
           # where it keeps running.
           # ---------------------------------------------------------------
           # The DATABASE pod's node, specifically - not whichever pod sorts
-          # first. Only stateful workloads carry dataNodeSelector, so api and
-          # frontend routinely sit on other nodes; taking the first pod in the
-          # list returned api's node and re-pinned the database onto it, which
-          # its local-path volume cannot follow. The result was the exact
-          # "volume node affinity conflict" this check exists to prevent.
+          # first. Every workload of a capsule is pinned to one node now, but a
+          # capsule deployed before that has its api and frontend elsewhere;
+          # taking the first pod in the list returned api's node and re-pinned
+          # the database onto it, which its local-path volume cannot follow -
+          # the exact "volume node affinity conflict" this check exists to
+          # prevent. The database's node is the one that cannot move, so the
+          # rest of the capsule joins it there.
           TARGET_NODE=$(kubectl get pods -n "${{ env.PR_NAMESPACE }}" \
             -l component=database -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
 
@@ -366,9 +510,28 @@ jobs:
           # templates/pr-capsule.yml.js for why letting the oracle guess it
           # was wrong in both directions.
           # ---------------------------------------------------------------
+          #
+          # What the capsule will really use is best known from the SAME
+          # application running in production, measured now. The generated
+          # estimate (768 MiB, per-component constants) ran about
+          # three times over a real capsule: a ~275 MiB stack was planned at
+          # 768, so one capsule made the server look full and the next one
+          # bought a worker that then sat at 20%. The estimate stays as the
+          # fallback for a cluster metrics-server has not measured yet.
+          # Flarops' own production-only pods (dashboard, node agent) are not
+          # part of a capsule and are left out.
+          REQUIRED_MI=$(kubectl top pods -n "${{ env.MAIN_NAMESPACE }}" --no-headers 2>/dev/null \
+            | awk '$1 !~ /^flarops-(dashboard|node-agent)/ { v = $3; if (v ~ /Gi$/) { sub(/Gi$/, "", v); v = v * 1024 } else if (v ~ /Ki$/) { sub(/Ki$/, "", v); v = v / 1024 } else { sub(/Mi$/, "", v) } s += v } END { printf "%d", s }' || true)
+          if [ -z "$REQUIRED_MI" ] || [ "$REQUIRED_MI" -lt 64 ]; then
+            echo "No usable measurement of ${{ env.MAIN_NAMESPACE }} yet - planning with the generated estimate of 768 MiB."
+            REQUIRED_MI=768
+          else
+            echo "Planning this capsule at $REQUIRED_MI MiB - what the same stack uses in ${{ env.MAIN_NAMESPACE }} right now."
+          fi
+
           ask_capacity() {
             kubectl exec -n "${{ env.MAIN_NAMESPACE }}" deploy/flarops-dashboard -- \
-              curl -sS --max-time 10 "http://127.0.0.1:9090/capacity?mib=768&for=${{ env.PR_ENV_NAME }}"
+              curl -sS --max-time 10 "http://127.0.0.1:9090/capacity?mib=$REQUIRED_MI&for=${{ env.PR_ENV_NAME }}"
           }
 
           OUT=""
@@ -403,6 +566,55 @@ jobs:
           # others and the number chosen here is the one teardown can later
           # remove on its own.
           # ---------------------------------------------------------------
+          # ---------------------------------------------------------------
+          # 3a. Capacity that is already on its way.
+          #
+          # A worker another capsule run added a moment ago is in Terraform
+          # but not yet a node, so the oracle cannot count it. Two pull
+          # requests opened together therefore each bought a node: the second
+          # asked while the first one's worker was still booting, heard "no",
+          # and added another. Wait for workers that are joining, and ask
+          # again, before paying for one more.
+          # ---------------------------------------------------------------
+          if [ "$VERDICT" = "no" ]; then
+            TF_OUTPUTS=$(terraform -chdir=deploy/terraform output -json 2>/dev/null || echo '{}')
+            KNOWN_SLOTS=$(printf '%s' "$TF_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(' '.join(str(s) for s in (v if isinstance(v,list) else [])))")
+            WORKER_PREFIX=$(printf '%s' "$TF_OUTPUTS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('instance_name',{}).get('value',''))")
+            node_ready() {
+              [ "$(kubectl get node "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)" = "True" ]
+            }
+            JOINING=""
+            if [ -n "$WORKER_PREFIX" ]; then
+              for SLOT in $KNOWN_SLOTS; do
+                if ! node_ready "$WORKER_PREFIX-worker-$SLOT"; then JOINING="$JOINING $WORKER_PREFIX-worker-$SLOT"; fi
+              done
+            fi
+            if [ -n "$JOINING" ]; then
+              echo "Workers still joining:$JOINING - waiting for them before adding another."
+              for attempt in $(seq 1 60); do
+                STILL=""
+                for NODE in $JOINING; do
+                  if ! node_ready "$NODE"; then STILL="$STILL $NODE"; fi
+                done
+                if [ -z "$STILL" ]; then break; fi
+                echo "  still joining:$STILL ($attempt/60)"
+                sleep 10
+              done
+              # Ready comes before metrics-server has measured the node, and
+              # the oracle will not place onto a node it cannot measure.
+              for attempt in 1 2 3 4 5 6 7 8; do
+                OUT=$(ask_capacity 2>/dev/null || true)
+                if [ "$(printf '%s' "$OUT" | head -1)" = "yes" ]; then
+                  VERDICT=yes
+                  TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
+                  echo "$OUT"
+                  break
+                fi
+                sleep 15
+              done
+            fi
+          fi
+
           if [ "$VERDICT" = "no" ]; then
             echo "::warning::No node has room for this capsule. Adding a worker..."
 
@@ -432,12 +644,33 @@ jobs:
             # the cluster, so one stale NotReady node made every scale-up fail
             # after 180s - each attempt leaving behind a brand-new billed
             # instance, because nothing here rolls the apply back.
-            NEW_SLOT=$(printf '%s' "$NEW_SLOTS" | python3 -c "import json,sys; print(sorted(json.load(sys.stdin))[-1])")
+            # The slot that was just added, not the highest one: the lowest free
+            # slot is reused, so with [2] -> [1, 2] the highest is an existing
+            # node and the wait below would pass without the new one joining.
+            NEW_SLOT=$(CURRENT_SLOTS="$CURRENT_SLOTS" NEW_SLOTS="$NEW_SLOTS" python3 -c "import json,os; print(sorted(set(json.loads(os.environ['NEW_SLOTS'])) - set(json.loads(os.environ['CURRENT_SLOTS'])))[0])")
             NEW_NODE="${INSTANCE_NAME:-}"
             if [ -z "$NEW_NODE" ]; then NEW_NODE=$(terraform -chdir=deploy/terraform output -raw instance_name); fi
             NEW_NODE="${NEW_NODE}-worker-${NEW_SLOT}"
             echo "Waiting for $NEW_NODE to join..."
-            ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo k3s kubectl wait --for=condition=Ready node/${NEW_NODE} --timeout=240s"
+            # The server itself may have been created by this very apply, in
+            # which case it is still running cloud-init - so wait for it to be
+            # a cluster before asking it about a node.
+            flarops_wait_for_k3s "$EC2_IP"
+            # "kubectl wait" fails at once with NotFound for a node that has not
+            # registered yet - and terraform returns seconds after creating the
+            # instance, long before its cloud-init has installed the k3s agent.
+            # So first wait for the Node object to exist, then for it to be Ready.
+            NODE_SEEN=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$EC2_IP" "sudo k3s kubectl get node/${NEW_NODE}" > /dev/null 2>&1; then NODE_SEEN=yes; break; fi
+              echo "  $NEW_NODE not registered yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$NODE_SEEN" ]; then
+              echo "::error::$NEW_NODE never registered with the cluster within 10 minutes. The instance exists (and is billed) - check its cloud-init log (/var/log/flarops-bootstrap.log on the worker)."
+              exit 1
+            fi
+            flarops_ssh "$EC2_IP" "sudo k3s kubectl wait --for=condition=Ready node/${NEW_NODE} --timeout=240s"
 
             # The new node is Ready before metrics-server has measured it, and
             # the oracle refuses to place onto a node it cannot measure - so
@@ -590,11 +823,65 @@ jobs:
 
           export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
 
+          # --- flarops ssh helpers (see templates/ciSsh.js) ---
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+          # --- end flarops ssh helpers ---
+
+          flarops_wait_for_k3s "$EC2_IP"
+
           mkdir -p ~/.kube
-          ssh -o StrictHostKeyChecking=no ubuntu@$EC2_IP "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
+          flarops_ssh "$EC2_IP" "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
           chmod 600 ~/.kube/config
 
+          # The server writes its own kubeconfig pointing at 127.0.0.1; from here the
+          # API server is only reachable at the public address the certificate was
+          # issued for (--tls-san in user_data).
           sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+          # A kubeconfig that reached none of the above is an empty file that every
+          # later kubectl treats as "no context", which reads as a cluster with nothing
+          # in it - the exact shape that made a teardown report success while the
+          # capsule was still running.
+          test -s ~/.kube/config
 
       - name: Setup Werf
         uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d # branch v2 @ 2026-05-21
@@ -667,11 +954,26 @@ jobs:
             # counted as a line of output, so an empty node read as holding one
             # pod and was never reclaimed. A node that exists in Terraform but
             # not in Kubernetes then bills forever.
-            if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" --no-headers 2>/tmp/kubectl.err); then
+            if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" -o json 2>/tmp/kubectl.err); then
               echo "  could not query pods on $NODE_NAME ($(cat /tmp/kubectl.err)) - leaving it alone."
               continue
             fi
-            PODS=$(printf '%s' "$RAW" | grep -v '^$' | grep -cv '^kube-system ' || true)
+            # What counts as work on the node: not kube-system, not a pod that
+            # has finished or is already being deleted (the capsule dismissed a
+            # moment ago), and not a DaemonSet's pod. The last one is what kept
+            # every worker forever: Flarops' own node agent is a DaemonSet in
+            # the PRODUCTION namespace, so each worker always held one
+            # "active" pod and none was ever reclaimed. Drain ignores
+            # DaemonSet pods for the same reason - they exist because the node
+            # does, not the other way round.
+            PODS=$(printf '%s' "$RAW" | python3 -c "
+          import json, sys
+          busy = [p for p in json.load(sys.stdin)['items']
+                  if p['metadata']['namespace'] != 'kube-system'
+                  and not p['metadata'].get('deletionTimestamp')
+                  and p.get('status', {}).get('phase') not in ('Succeeded', 'Failed')
+                  and not any(o.get('kind') == 'DaemonSet' for o in p['metadata'].get('ownerReferences', []))]
+          print(len(busy))")
 
             if [ "$PODS" -ne 0 ]; then
               echo "  $PODS active pod(s) - keeping it."
@@ -1191,6 +1493,16 @@ spec:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.api.secretKeys | default list) (list "POSTGRES_PASSWORD")) "password" ((.Values.database | default dict).password | default "")) }}
     spec:
       automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      # The whole capsule sits on the node its placement chose, not only its
+      # database. Left to the scheduler, a capsule's stateless pods spread over
+      # every node with room, so closing one pull request freed no node at all:
+      # each still carried another capsule's api or worker, and the teardown
+      # that reclaims idle workers never found one idle. Production leaves this
+      # empty and is not pinned.
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+{{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:
         - name: {{ .Values.projectName }}-registry
@@ -1598,16 +1910,18 @@ spec:
       # Pinned because the volume is. k3s's default local-path StorageClass
       # writes to one node's disk and its PersistentVolume carries node
       # affinity, so a database pod that moves can never reach its data again.
-      # Only the stateful workloads carry this - everything else is left to the
-      # scheduler, so a capsule can use room spread across the fleet instead of
-      # demanding that one node hold all of it.
+      # Every other workload of the capsule is pinned to the same node too (so
+      # that closing the pull request leaves that node idle and reclaimable).
       nodeSelector:
 {{ toYaml .Values.dataNodeSelector | indent 8 }}
 {{- end }}
 {{- if .Values.dbCloneSource }}
       initContainers:
         - name: db-clone
-          image: curlimages/curl:latest
+          # Pinned to a version AND its digest, like every other image Flarops
+          # writes: ":latest" made what downloads the clone source - with the
+          # database's init directory mounted - whatever was pushed last.
+          image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
           command: ["curl"]
           args: ["--fail", "--silent", "--show-error", "--location", "--proto", "=https", "-o", "/docker-entrypoint-initdb.d/dump.sql", "{{ .Values.dbCloneSource }}"]
           volumeMounts:
@@ -1746,6 +2060,16 @@ spec:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat ((index .Values.additionalServices (index .Values.additionalServicesIndices "reporting" | int)).secretKeys | default list) (list "POSTGRES_PASSWORD")) "password" ((.Values.database | default dict).password | default "")) }}
     spec:
       automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      # The whole capsule sits on the node its placement chose, not only its
+      # database. Left to the scheduler, a capsule's stateless pods spread over
+      # every node with room, so closing one pull request freed no node at all:
+      # each still carried another capsule's api or worker, and the teardown
+      # that reclaims idle workers never found one idle. Production leaves this
+      # empty and is not pinned.
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+{{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:
         - name: {{ .Values.projectName }}-registry
@@ -1878,6 +2202,16 @@ spec:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat ((index .Values.additionalServices (index .Values.additionalServicesIndices "worker" | int)).secretKeys | default list) (list "POSTGRES_PASSWORD")) "password" ((.Values.database | default dict).password | default "")) }}
     spec:
       automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      # The whole capsule sits on the node its placement chose, not only its
+      # database. Left to the scheduler, a capsule's stateless pods spread over
+      # every node with room, so closing one pull request freed no node at all:
+      # each still carried another capsule's api or worker, and the teardown
+      # that reclaims idle workers never found one idle. Production leaves this
+      # empty and is not pinned.
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+{{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:
         - name: {{ .Values.projectName }}-registry
@@ -2055,10 +2389,10 @@ dashboard:
 # purpose - nothing secret belongs in a committed file.
 imagePullSecret: null
 # Set by the PR-capsule workflow to the node the dashboard's capacity oracle
-# picked. Only the STATEFUL workloads read it: their volumes come from k3s's
-# local-path provisioner and live on one node's disk, so a database pod that
-# moves can never reach its data again. Stateless workloads are deliberately
-# left to the scheduler, so a capsule can use room spread across the fleet.
+# picked, and read by EVERY workload of the capsule. The stateful ones must
+# stay there - their local-path volumes live on that node's disk - and the
+# rest stay with them, so that tearing a capsule down leaves its node idle and
+# the worker can be reclaimed. Empty in production, which is not pinned.
 dataNodeSelector: {}
 additionalServicesIndices:
   worker: 0
@@ -2224,13 +2558,97 @@ resource "aws_instance" "server" {
 
   user_data = sensitive(<<-EOF
     #!/bin/bash
+    # Everything this script prints goes to one file. Until now the only trace
+    # a failed bootstrap left behind was /var/log/cloud-init-output.log, which
+    # nothing ever fetched - so a node that failed to install k3s looked
+    # exactly like one still working on it, from every angle CI could see.
+    # The deploy workflow prints this log back into the job output when its
+    # wait gives up.
+    #
+    # Deliberately no "set -x": this log is published into a CI job, and
+    # xtrace would put the cluster join token in it.
+    exec > >(tee -a /var/log/flarops-bootstrap.log) 2>&1
+    set -Eeuo pipefail
+
+    mkdir -p /var/lib/flarops
+    # The sentinel CI polls for. Without it "k3s is not up yet" and "k3s will
+    # never be up" are the same observation from outside, so a bootstrap that
+    # died in its first ten seconds was still only reported a quarter of an
+    # hour later, after the full timeout had been sat out.
+    trap 'echo "flarops: bootstrap FAILED at line $LINENO"' ERR
+    # The sentinel is written from the EXIT trap, not the ERR one. An explicit
+    # "exit 1" - the installer download giving up after its last retry - is not
+    # a failed command, so ERR never fires for it, and the node would sit there
+    # broken with no sentinel while CI waited out the whole timeout.
+    trap 'flarops_rc=$?; if [ "$flarops_rc" != 0 ]; then touch /var/lib/flarops/bootstrap-failed; fi' EXIT
+
     mkdir -p /home/ubuntu/.ssh
     echo "${var.ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
     chown -R ubuntu:ubuntu /home/ubuntu/.ssh
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${var.k3s_version}" INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --token ${random_password.k3s_token.result} --tls-san ${aws_eip.eip.public_ip}" sh -
+    # Downloaded to a file and then run, rather than piped straight into sh.
+    # "curl -sfL https://get.k3s.io | ... sh -" swallowed every failure it had:
+    # on a network error or an HTTP 5xx, curl exits non-zero having written
+    # nothing, the sh on the right of the pipe reads an empty script and exits
+    # 0, and the pipeline's status is sh's. cloud-init then reported success on
+    # an instance with no k3s on it, and nothing anywhere recorded an error.
+    #
+    # Two sources, tried in order, and the pinned one comes first on purpose.
+    # raw.githubusercontent.com serves the installer exactly as it shipped with
+    # var.k3s_version, while get.k3s.io always serves master's copy, which can
+    # drift from the version it is being asked to install. It also removes a
+    # dependency rather than adding one: the installer downloads the k3s binary
+    # itself from github.com either way, so a node that cannot reach GitHub
+    # cannot be built at all - whereas get.k3s.io is a separate service that
+    # fails on its own. On 2026-09-29 it answered every request with Cloudflare
+    # error 1101, and every node built during that window got no k3s.
+    #
+    # The retries cover the transient case on top of that: DNS and the default
+    # route are seconds old when this runs, and there is no second chance -
+    # user_data executes on first boot only.
+    K3S_INSTALLER_URLS="https://raw.githubusercontent.com/k3s-io/k3s/${var.k3s_version}/install.sh https://get.k3s.io"
+
+    downloaded=""
+    for attempt in $(seq 1 5); do
+      for url in $K3S_INSTALLER_URLS; do
+        if curl -fsSL --retry 3 --retry-delay 5 --retry-connrefused --max-time 180 \
+             -o /tmp/k3s-install.sh "$url" && [ -s /tmp/k3s-install.sh ]; then
+          echo "flarops: got the k3s installer from $url"
+          downloaded=yes
+          break
+        fi
+        echo "flarops: $url did not serve the installer"
+      done
+      if [ -n "$downloaded" ]; then break; fi
+      echo "flarops: no source served the k3s installer (attempt $attempt/5)"
+      if [ "$attempt" = 5 ]; then exit 1; fi
+      sleep 15
+    done
+    test -s /tmp/k3s-install.sh
+
+    echo "flarops: installing k3s server ${var.k3s_version}"
+    # The join token travels in K3S_TOKEN rather than in "--token" inside
+    # INSTALL_K3S_EXEC so that it is never part of a command line: this log is
+    # printed back into the CI job output when a bootstrap fails, and an
+    # argument list would put a cluster-admin credential in it.
+    INSTALL_K3S_VERSION="${var.k3s_version}" \
+      K3S_TOKEN="${random_password.k3s_token.result}" \
+      INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --tls-san ${aws_eip.eip.public_ip}" \
+      sh /tmp/k3s-install.sh
+
+    # The installer exits once the systemd unit exists, so its own success says
+    # nothing about the cluster being up. CI treats /etc/rancher/k3s/k3s.yaml
+    # as "ready to receive a deploy", and this loop is what makes that true.
+    for attempt in $(seq 1 60); do
+      if [ -f /etc/rancher/k3s/k3s.yaml ]; then break; fi
+      sleep 5
+    done
+    test -f /etc/rancher/k3s/k3s.yaml
+
+    echo "flarops: bootstrap OK"
+    touch /var/lib/flarops/bootstrap-ok
   EOF
   )
 
@@ -2296,6 +2714,30 @@ resource "aws_instance" "worker" {
 
   user_data = sensitive(<<-EOF
     #!/bin/bash
+    # Everything this script prints goes to one file. Until now the only trace
+    # a failed bootstrap left behind was /var/log/cloud-init-output.log, which
+    # nothing ever fetched - so a node that failed to install k3s looked
+    # exactly like one still working on it, from every angle CI could see.
+    # The deploy workflow prints this log back into the job output when its
+    # wait gives up.
+    #
+    # Deliberately no "set -x": this log is published into a CI job, and
+    # xtrace would put the cluster join token in it.
+    exec > >(tee -a /var/log/flarops-bootstrap.log) 2>&1
+    set -Eeuo pipefail
+
+    mkdir -p /var/lib/flarops
+    # The sentinel CI polls for. Without it "k3s is not up yet" and "k3s will
+    # never be up" are the same observation from outside, so a bootstrap that
+    # died in its first ten seconds was still only reported a quarter of an
+    # hour later, after the full timeout had been sat out.
+    trap 'echo "flarops: bootstrap FAILED at line $LINENO"' ERR
+    # The sentinel is written from the EXIT trap, not the ERR one. An explicit
+    # "exit 1" - the installer download giving up after its last retry - is not
+    # a failed command, so ERR never fires for it, and the node would sit there
+    # broken with no sentinel while CI waited out the whole timeout.
+    trap 'flarops_rc=$?; if [ "$flarops_rc" != 0 ]; then touch /var/lib/flarops/bootstrap-failed; fi' EXIT
+
     HOSTNAME="${var.instance_name}-worker-${each.key}"
     hostnamectl set-hostname $HOSTNAME
 
@@ -2305,7 +2747,65 @@ resource "aws_instance" "worker" {
     chmod 700 /home/ubuntu/.ssh
     chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${var.k3s_version}" INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" K3S_URL=https://${aws_instance.server.private_ip}:6443 K3S_TOKEN=${random_password.k3s_token.result} sh -
+    # Downloaded to a file and then run, rather than piped straight into sh.
+    # "curl -sfL https://get.k3s.io | ... sh -" swallowed every failure it had:
+    # on a network error or an HTTP 5xx, curl exits non-zero having written
+    # nothing, the sh on the right of the pipe reads an empty script and exits
+    # 0, and the pipeline's status is sh's. cloud-init then reported success on
+    # an instance with no k3s on it, and nothing anywhere recorded an error.
+    #
+    # Two sources, tried in order, and the pinned one comes first on purpose.
+    # raw.githubusercontent.com serves the installer exactly as it shipped with
+    # var.k3s_version, while get.k3s.io always serves master's copy, which can
+    # drift from the version it is being asked to install. It also removes a
+    # dependency rather than adding one: the installer downloads the k3s binary
+    # itself from github.com either way, so a node that cannot reach GitHub
+    # cannot be built at all - whereas get.k3s.io is a separate service that
+    # fails on its own. On 2026-09-29 it answered every request with Cloudflare
+    # error 1101, and every node built during that window got no k3s.
+    #
+    # The retries cover the transient case on top of that: DNS and the default
+    # route are seconds old when this runs, and there is no second chance -
+    # user_data executes on first boot only.
+    K3S_INSTALLER_URLS="https://raw.githubusercontent.com/k3s-io/k3s/${var.k3s_version}/install.sh https://get.k3s.io"
+
+    downloaded=""
+    for attempt in $(seq 1 5); do
+      for url in $K3S_INSTALLER_URLS; do
+        if curl -fsSL --retry 3 --retry-delay 5 --retry-connrefused --max-time 180 \
+             -o /tmp/k3s-install.sh "$url" && [ -s /tmp/k3s-install.sh ]; then
+          echo "flarops: got the k3s installer from $url"
+          downloaded=yes
+          break
+        fi
+        echo "flarops: $url did not serve the installer"
+      done
+      if [ -n "$downloaded" ]; then break; fi
+      echo "flarops: no source served the k3s installer (attempt $attempt/5)"
+      if [ "$attempt" = 5 ]; then exit 1; fi
+      sleep 15
+    done
+    test -s /tmp/k3s-install.sh
+
+    echo "flarops: installing k3s agent ${var.k3s_version}"
+    INSTALL_K3S_VERSION="${var.k3s_version}" \
+      K3S_URL="https://${aws_instance.server.private_ip}:6443" \
+      K3S_TOKEN="${random_password.k3s_token.result}" \
+      INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" \
+      sh /tmp/k3s-install.sh
+
+    # A worker has no kubeconfig to wait for, and the agent retries the join on
+    # its own for as long as it takes - so the service being up is the most
+    # this script can honestly assert. Whether the node actually joined is
+    # checked from CI with "kubectl wait node", against the server.
+    for attempt in $(seq 1 60); do
+      if systemctl is-active --quiet k3s-agent; then break; fi
+      sleep 5
+    done
+    systemctl is-active --quiet k3s-agent
+
+    echo "flarops: bootstrap OK"
+    touch /var/lib/flarops/bootstrap-ok
   EOF
   )
 

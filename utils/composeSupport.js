@@ -128,7 +128,8 @@ function extractEnv(block) {
     if (!raw) continue;
     const m = raw.match(/^[ \t]*(?:-\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*[:=]\s*([\s\S]*)$/);
     if (!m) continue;
-    env[m[1]] = unquote(stripInlineComment(m[2]));
+    // Read as a YAML scalar: a quoted value keeps a " #" inside it.
+    env[m[1]] = parseComposeScalar(m[2]);
   }
   return env;
 }
@@ -163,31 +164,123 @@ function tokenizeShellWords(line) {
   return out;
 }
 
+// One YAML scalar as compose's own parser reads it. Stripping the outer
+// quotes was not enough: inside double quotes YAML has escapes, so the compose
+// line `- "grep -E '^\\d+$'"` means the argument `grep -E '^\d+$'` - with ONE
+// backslash - and keeping both made the container run something else.
+function parseComposeScalar(raw) {
+  const text = String(raw).trim();
+  if (text.startsWith('"')) {
+    let out = '';
+    for (let i = 1; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '"') return out;
+      if (ch === '\\' && i + 1 < text.length) {
+        const next = text[++i];
+        out += ({ n: '\n', t: '\t', r: '\r', '0': '\0', '"': '"', '\\': '\\', '/': '/', ' ': ' ' })[next] ?? ('\\' + next);
+        continue;
+      }
+      out += ch;
+    }
+    return out; // unterminated - keep what there is rather than drop it
+  }
+  if (text.startsWith("'")) {
+    let out = '';
+    for (let i = 1; i < text.length; i++) {
+      if (text[i] === "'") {
+        if (text[i + 1] === "'") { out += "'"; i++; continue; }
+        return out;
+      }
+      out += text[i];
+    }
+    return out;
+  }
+  return stripInlineComment(text);
+}
+
+// Splits a flow sequence body ("a", "b, c", d) at the commas that separate
+// items - not the ones inside a quoted item, which the old split(',') cut in
+// half.
+function splitFlowItems(body) {
+  const items = [];
+  let current = '';
+  let quote = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      current += ch;
+      if (quote === '"' && ch === '\\' && i + 1 < body.length) { current += body[++i]; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; current += ch; continue; }
+    if (ch === ',') { items.push(current); current = ''; continue; }
+    current += ch;
+  }
+  if (current.trim() !== '') items.push(current);
+  return items.map(s => s.trim()).filter(s => s !== '');
+}
+
+// A service's `command:` in every form compose accepts: a block list, a flow
+// list, or a single string. Returns the argument list, or null when there is
+// none. Used for app services and supporting services alike - init.js had a
+// parser of its own that read only the block form, so a worker declared as
+// `command: ["node", "worker.js"]` lost its command and ran its image's CMD,
+// which for a worker sharing the API's build context is a second API.
 function extractCommand(block) {
   const args = [];
   const section = readSection(block, 'command');
   for (const entry of section) {
     if (entry.inline) {
-      const inline = entry.inline;
+      const inline = stripInlineComment(entry.inline);
       if (inline.startsWith('[')) {
-        for (const part of inline.replace(/^\[|\]$/g, '').split(',')) {
-          const v = unquote(part.trim());
-          if (v) args.push(v);
-        }
+        const body = inline.replace(/^\[/, '').replace(/\]\s*$/, '');
+        for (const part of splitFlowItems(body)) args.push(parseComposeScalar(part));
       } else {
-        // Shell form. Splitting on whitespace alone broke every quoted
-        // argument - `--requirepass "my pass"` became three arguments, two of
-        // them wrong - so honour the quoting the same way a shell would.
-        for (const part of tokenizeShellWords(stripInlineComment(inline))) {
-          args.push(part);
-        }
+        // Shell form. YAML first (the whole string may itself be quoted),
+        // then the shell-style split compose applies to it - splitting on
+        // whitespace alone broke every quoted argument, so `--requirepass
+        // "my pass"` became three arguments, two of them wrong.
+        for (const part of tokenizeShellWords(parseComposeScalar(inline))) args.push(part);
       }
       continue;
     }
     const item = (entry.line || '').match(/^\s*-\s*([\s\S]+)$/);
-    if (item) args.push(unquote(stripInlineComment(item[1])));
+    if (item) args.push(parseComposeScalar(item[1]));
   }
   return args.length > 0 ? args : null;
+}
+
+// A service's `env_file:` entries in every form compose accepts - a single
+// path, a flow or block list of paths, or the long form with `path:` and
+// `required:`. Returns [{ path, required }] with paths as written (relative to
+// the compose file), or [] when there are none.
+function extractEnvFiles(block) {
+  const out = [];
+  let pending = null;
+  for (const entry of readSection(block, 'env_file')) {
+    if (entry.inline) {
+      const inline = stripInlineComment(entry.inline);
+      const items = inline.startsWith('[')
+        ? splitFlowItems(inline.replace(/^\[/, '').replace(/\]\s*$/, ''))
+        : [inline];
+      for (const item of items) out.push({ path: parseComposeScalar(item), required: true });
+      continue;
+    }
+    const line = entry.line || '';
+    const longPath = line.match(/^\s*(?:-\s+)?path:\s*(.+)$/);
+    const longRequired = line.match(/^\s*(?:-\s+)?required:\s*(.+)$/);
+    if (longPath) {
+      pending = { path: parseComposeScalar(longPath[1]), required: true };
+      out.push(pending);
+    } else if (longRequired && pending) {
+      pending.required = !/^(false|no|off)$/i.test(parseComposeScalar(longRequired[1]));
+    } else {
+      const item = line.match(/^\s*-\s*(.+)$/);
+      if (item) { pending = null; out.push({ path: parseComposeScalar(item[1]), required: true }); }
+    }
+  }
+  return out.filter(e => e.path);
 }
 
 // Two very different things share the "volumes:" key. A NAMED volume
@@ -231,7 +324,7 @@ function extractBuildArgs(block) {
     // Mapping form ("KEY: value") and sequence form ("- KEY=value").
     const m = raw.match(/^[ \t]*(?:-\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*([\s\S]*)$/);
     if (!m) continue;
-    args[m[1]] = unquote(stripInlineComment(m[2]));
+    args[m[1]] = parseComposeScalar(m[2]);
   }
   return Object.keys(args).length > 0 ? args : null;
 }
@@ -471,4 +564,4 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
   return { data: carried ? data : null, fileMounts, dirMounts, unresolved };
 }
 
-module.exports = { parseSupportService, extractBuildArgs, extractVolumes, looksLikeNodeAgent, materializeBindMounts, secretMaterialReason, toK8sName, tokenizeShellWords, WELL_KNOWN_IMAGE_PORTS };
+module.exports = { parseSupportService, extractBuildArgs, extractCommand, extractEnvFiles, parseComposeScalar, extractVolumes, looksLikeNodeAgent, materializeBindMounts, secretMaterialReason, toK8sName, tokenizeShellWords, WELL_KNOWN_IMAGE_PORTS };

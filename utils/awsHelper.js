@@ -331,6 +331,21 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
   // environment, to limit what an untrusted/hijacked child process could read.
   const env = { PATH: process.env.PATH, HOME: process.env.HOME, AWS_ACCESS_KEY_ID: credentials.accessKey, AWS_SECRET_ACCESS_KEY: credentials.secretKey };
 
+  // The credentials are checked once, on their own, before any bucket.
+  // HeadBucket has no response body, so a wrong key and a bucket name that is
+  // simply taken by ANOTHER account both come back as a bare "(403)
+  // Forbidden". Reading every 403 as bad credentials ended init on a name
+  // collision - with "make sure your credentials are correct", and before it
+  // ever asked for a different name. STS can tell the two apart.
+  try {
+    execFileSync(awsCmd, ['sts', 'get-caller-identity', '--region', region], { env, stdio: 'pipe' });
+  } catch (error) {
+    const stderr = error.stderr ? error.stderr.toString().trim() : '';
+    console.error("AWS UNAUTHORIZED Make sure your credentials are correct");
+    if (stderr) console.error(stderr);
+    process.exit(1);
+  }
+
   return new Promise(async (resolve) => {
     let currentBucket = sanitized;
 
@@ -339,7 +354,7 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
         execFileSync(awsCmd, ['s3api', 'head-bucket', '--bucket', currentBucket], { env, stdio: 'pipe' });
 
         // Exists and we have access
-        const answer = await askQuestion(`Bucket [${currentBucket}] is already exist, are you sure you want to use it? [y/N]: `);
+        const answer = await askQuestion(`Bucket [${currentBucket}] is already exist, are you sure you want to use it? (If this bucket belongs to another AWS account, its owner can read your Terraform state - including the k3s cluster token - and change your infrastructure. Check in the S3 console of YOUR account that the bucket is listed there before confirming.) [y/N]: `);
         if (answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes') {
           resolve({
             bucket: currentBucket,
@@ -352,9 +367,14 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
       } catch (error) {
         const stderr = error.stderr ? error.stderr.toString() : '';
 
-        if (stderr.includes('403') || stderr.includes('Forbidden') || stderr.includes('InvalidAccessKeyId') || stderr.includes('SignatureDoesNotMatch') || stderr.includes('AuthFailure')) {
+        if (stderr.includes('InvalidAccessKeyId') || stderr.includes('SignatureDoesNotMatch') || stderr.includes('AuthFailure') || stderr.includes('ExpiredToken')) {
           console.error("AWS UNAUTHORIZED Make sure your credentials are correct");
           process.exit(1);
+        } else if (stderr.includes('403') || stderr.includes('Forbidden')) {
+          // The credentials were proven above, so this is a bucket that exists
+          // and is not ours: names are global across every AWS account.
+          console.warn(`\x1b[33mBucket name "${currentBucket}" is already taken by another AWS account. S3 bucket names are global - choose a different one.\x1b[0m`);
+          currentBucket = sanitizeBucketName((await askQuestion('Enter new bucket name: ')).trim());
         } else if (stderr.includes('404') || stderr.includes('Not Found')) {
           // Doesn't exist, we can create it
           try {

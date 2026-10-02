@@ -40,6 +40,16 @@ spec:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.frontend.secretKeys | default list) (list ${frontendExtraKeyList}))) }}
     spec:
       automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      # The whole capsule sits on the node its placement chose, not only its
+      # database. Left to the scheduler, a capsule's stateless pods spread over
+      # every node with room, so closing one pull request freed no node at all:
+      # each still carried another capsule's api or worker, and the teardown
+      # that reclaims idle workers never found one idle. Production leaves this
+      # empty and is not pinned.
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+{{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:
         - name: {{ .Values.projectName }}-registry

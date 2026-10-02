@@ -3,12 +3,12 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync } = require('child_process');
 const { getDefaultAWSCredentials, ensureAwsCli, handleS3Bucket } = require('../../utils/awsHelper.js');
-const { SENSITIVE_REGEX, DB_PASSWORD_REGEX, IGNORED_DIRS } = require('../../utils/constants.js');
-const { parseSupportService, extractBuildArgs, materializeBindMounts } = require('../../utils/composeSupport.js');
+const { SENSITIVE_REGEX, DB_PASSWORD_REGEX, IGNORED_DIRS, LOOPBACK_HOST_REGEX } = require('../../utils/constants.js');
+const { parseSupportService, extractBuildArgs, extractCommand, extractEnvFiles, extractVolumes, materializeBindMounts } = require('../../utils/composeSupport.js');
 const { generateFlaropsYaml } = require('../../utils/flaropsYaml.js');
 const writeTerraform = require('../../templates/terraform.js');
 const collectOperatorAnswers = require('./prompts.js');
-const { defaultUserFor, passwordKeyFor, defaultImageFor } = require('../../utils/dbDefaults.js');
+const { defaultUserFor, passwordKeyFor, defaultImageFor, urlSchemeOf } = require('../../utils/dbDefaults.js');
 const { yamlEscapeDoubleQuoted, generateEnvString } = require('../../utils/yamlWrite.js');
 const { listComposeFiles, isVariantComposeFile, approveVariantComposeFile, composeBaseDir } = require('../../utils/composeFiles.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
@@ -131,6 +131,68 @@ function isSensitiveKey(key) {
 
 const crypto = require('crypto');
 
+// An example env file is committed ON PURPOSE, as documentation of what a
+// service needs. Its KEYS are real requirements - which is why these files are
+// scanned at all - but its VALUES are public by construction: they sit in the
+// repository's history and in every clone. Taking them as production secrets
+// meant a backend/.env.example with "DB_PASSWORD=postgres" and
+// "JWT_SECRET=changeme" deployed exactly that, and the CLI announced it as
+// "Found matching password".
+const EXAMPLE_ENV_FILE_REGEX = /^\.env\.(example|sample|template)$/;
+
+// Values that only ever stand in for a secret, wherever they are found. A
+// real .env is a developer's own file, but it is just as often a copy of the
+// example nobody filled in.
+const PLACEHOLDER_SECRET_REGEX = /^(?:changeme|change[-_ ]?(?:me|this|it)|todo|tbd|placeholder|secret|password|passwd|example|sample|dummy|x{3,}|\*+|\.{3}|<[^>]*>|your[-_ ].*|.*[-_ ]here)$|replace[-_]?me|change[-_]?me/i;
+
+// A database password has one more giveaway: the engine's own name or its
+// default superuser, which is what every local docker-compose setup uses.
+const WEAK_DB_PASSWORD_REGEX = /^(?:postgres|postgresql|root|admin|mysql|mariadb|mongo|mongodb|toor|12345678?|123456789|qwerty)$/i;
+
+// Why a value read from `file` must not become a production secret, or null
+// when it can be used. Decides only the VALUE - the key is still a secret, is
+// still wired into its container and is still demanded in GitHub Secrets.
+//
+// `committed` says the file is tracked by git. Whatever is committed is in the
+// history of every clone, so a credential in it is public in the same way an
+// example file's is - a docker-compose.yml with "JWT_SECRET: dev-secret", a
+// .env that was committed on purpose. Only literal values count: an
+// unresolved "${VAR}" reference carries no value to leak.
+function untrustedSecretValueReason(file, value, { isDbPassword = false, committed = false } = {}) {
+  if (EXAMPLE_ENV_FILE_REGEX.test(path.basename(file))) return 'example file - committed, so the value is public';
+  const v = String(value == null ? '' : value).trim();
+  if (!v) return null;
+  if (committed && !/\$\{?[A-Za-z_]/.test(v)) return 'committed to git, so the value is public';
+  if (PLACEHOLDER_SECRET_REGEX.test(v)) return 'placeholder value';
+  if (isDbPassword && WEAK_DB_PASSWORD_REGEX.test(v)) return "the database engine's default password";
+  return null;
+}
+
+// Secrets whose value was withheld for one of the reasons above, reported
+// together at the end of the run next to the list of secrets to create.
+const withheldSecretValues = [];
+
+// A compose command that starts a development server: a file watcher, a
+// hot-reloading dev server, a framework's own dev entrypoint.
+const DEV_COMMAND_REGEX = /(^|\s)(--reload|--watch|nodemon|ts-node-dev|runserver|ng serve|next dev)(\s|$)|(^|\s)(npm|yarn|pnpm|bun)( run)? (dev|start:dev|watch)(\s|$)|^vite(\s+(?!build\b|preview\b)|$)/;
+
+function looksLikeDevCommand(args) {
+  return Array.isArray(args) && DEV_COMMAND_REGEX.test(args.join(' '));
+}
+
+// Whether the image built from contextDir/dockerfile starts something by
+// itself (CMD or ENTRYPOINT). Without one, a compose command is the only thing
+// that makes the container run at all, dev server or not.
+function dockerfileDefinesCommand(contextDir, dockerfile) {
+  if (!contextDir) return false;
+  try {
+    const text = fs.readFileSync(path.join(contextDir, dockerfile || 'Dockerfile'), 'utf8');
+    return /^\s*(CMD|ENTRYPOINT)\b/im.test(text);
+  } catch (e) {
+    return false;
+  }
+}
+
 // Environment variable names come from the scanned repository, so they can
 // legally contain characters that mean something to a regex engine. Building
 // a pattern by concatenating one in either matched the wrong thing or threw a
@@ -162,13 +224,32 @@ function recordPlaceholderVars(value, key) {
   }
 }
 
-function sanitizeEnvValue(val, key) {
-  let cleaned = val;
-  const commentIdx = cleaned.indexOf('#');
-  if (commentIdx !== -1) {
-    cleaned = cleaned.substring(0, commentIdx).trim();
+// One value from a "KEY=value" line, read the way dotenv and compose's
+// env_file read it. A quoted value runs to its closing quote and "#" inside it
+// is an ordinary character; only an unquoted value can carry a comment, and
+// only one that starts with whitespace before the "#".
+//
+// The old reading cut every value at its first "#" - before the quotes were
+// even looked at - so API_TOKEN="abc#def" became "abc", and a generated
+// password containing "#" reached GitHub Secrets wrong without a word.
+function parseDotenvValue(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  const quote = text[0];
+  if (quote === '"' || quote === "'" || quote === '`') {
+    for (let i = 1; i < text.length; i++) {
+      if (quote === '"' && text[i] === '\\') { i++; continue; }
+      if (text[i] === quote) return text.slice(1, i);
+    }
+    // Unterminated: no closing quote to stop at, so it is read as unquoted.
   }
-  cleaned = cleaned.replace(/^["']|["']$/g, '').trim();
+  return text.replace(/(^|\s+)#.*$/, '').trim();
+}
+
+// `parsed`: the value was already read as a YAML scalar (extractEnv in
+// utils/composeSupport.js). Parsing it again as a .env value cut a quoted
+// "p #q" down to "p" on the second pass.
+function sanitizeEnvValue(val, key, { parsed = false } = {}) {
+  let cleaned = parsed ? String(val == null ? '' : val) : parseDotenvValue(val);
 
   // A "${OTHER_VAR}" reference embedded in a larger literal (e.g. a URL with
   // an inline "${DB_PASS}") cannot be resolved from inside this repo. It used
@@ -334,9 +415,15 @@ function applyEnvDecision(decision, targets) {
     // full line lets both slip through, producing a "KEY" that appears twice
     // in the same generated GitHub Actions env: block - which is invalid YAML
     // and fails the whole workflow.
-    const keyAlreadyPresent = new RegExp(`(^|\\n)${escapeRegex(key)}=`).test(sensitiveContext.content);
-    if (!keyAlreadyPresent) {
+    const keyLine = new RegExp(`(^|\\n)${escapeRegex(key)}=([^\\n]*)`);
+    const present = sensitiveContext.content.match(keyLine);
+    if (!present) {
       sensitiveContext.content += `${key}=${value}\n`;
+    } else if (present[2] === '' && value !== '') {
+      // The first declaration seen had its value withheld (an example file in
+      // another directory, a placeholder); a real value found later replaces
+      // the blank instead of being dropped as a duplicate.
+      sensitiveContext.content = sensitiveContext.content.replace(keyLine, (m, lead) => `${lead}${key}=${value}`);
     }
     return;
   }
@@ -348,12 +435,6 @@ function applyEnvDecision(decision, targets) {
   }
 }
 
-// Classify then apply, for the two scan loops that want both.
-function processEnvVariable(key, rawVal, targets) {
-  const decision = classifyEnvVariable(key, rawVal, targets.foundDbUrls);
-  if (decision) applyEnvDecision(decision, targets);
-  return decision;
-}
 
 
 module.exports = async function init() {
@@ -453,6 +534,33 @@ module.exports = async function init() {
     } catch (e) {
       return false;
     }
+  };
+
+  // Asked once per file: the env scan checks every value it reads.
+  const committedFiles = new Map();
+  const isCommitted = (filePath) => {
+    if (!filePath) return false;
+    if (!committedFiles.has(filePath)) committedFiles.set(filePath, isTrackedByGit(filePath));
+    return committedFiles.get(filePath);
+  };
+
+  // A secret's value as it may be used in production: the value itself, or ''
+  // when it cannot be a real secret (see untrustedSecretValueReason), recorded
+  // so the operator is told. The KEY is untouched either way - it stays a
+  // secret, stays wired and stays demanded in GitHub Secrets.
+  const usableSecretValue = (key, value, sourceFile) => {
+    const reason = sourceFile ? untrustedSecretValueReason(sourceFile, value, { committed: isCommitted(sourceFile) }) : null;
+    if (!reason || value === '' || value == null) return value;
+    withheldSecretValues.push(`${key} (${path.relative(currentDir, sourceFile)}: ${reason})`);
+    return '';
+  };
+
+  // Classify, then apply - the same for every file a variable can come from.
+  const takeEnvVariable = (key, val, sourceFile, targets) => {
+    const decision = classifyEnvVariable(key, val, targets.foundDbUrls);
+    if (decision && decision.disposition === 'secret') decision.value = usableSecretValue(key, decision.value, sourceFile);
+    if (decision) applyEnvDecision(decision, targets);
+    return decision;
   };
 
   if (fs.existsSync(privateKeyPath) && isTrackedByGit(privateKeyPath)) {
@@ -712,7 +820,11 @@ module.exports = async function init() {
         if (refactorResult.discoveredRoutes) {
           refactoredRoutes = refactorResult.discoveredRoutes;
         }
-        console.log(`\x1b[32mSuccessfully refactored ${refactorResult.filesChanged} files to use ${refactoredEnvKey}.\x1b[0m`);
+        // A result can come back with nothing rewritten - the project already
+        // reads its API URL from the environment - which is not news.
+        if (refactorResult.filesChanged > 0) {
+          console.log(`\x1b[32mSuccessfully refactored ${refactorResult.filesChanged} files to use ${refactoredEnvKey}.\x1b[0m`);
+        }
       }
     }
   }
@@ -756,9 +868,11 @@ module.exports = async function init() {
   // resolve against the file's OWN directory, which is not the repository root
   // when the file is kept in deploy/ or docker/.
   let composeDir = currentDir;
+  let composeFilePath = null;
   for (const cf of composeFiles) {
     try {
       composeContent = fs.readFileSync(path.join(currentDir, cf), 'utf8');
+      composeFilePath = path.join(currentDir, cf);
       composeDir = composeBaseDir(currentDir, cf);
       // A project whose compose file is not conventionally named would
       // otherwise have every service in it silently ignored.
@@ -825,7 +939,7 @@ module.exports = async function init() {
   }
   await discoverSharedCredentials();
 
-  // Short-circuits the generic env-handling path (processEnvVariable) for a
+  // Short-circuits the generic env-handling path (takeEnvVariable) for a
   // key whose value is a bare reference to an already-discovered shared
   // credential - wiring it straight to that credential's real, generated
   // value instead of leaving "${VAR}" as an unresolved placeholder (or, for
@@ -888,21 +1002,27 @@ module.exports = async function init() {
       isFrontend = true;
     }
 
-    const passwordRegex = /^(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)\s*=\s*(.*)$/gm;
+    const passwordRegex = /^(?:export\s+)?(DB_PASS|DB_PASSWORD|DATABASE_PASSWORD|DATABASE_PASS|DB_SECRET|DB_ROOT_PASSWORD|POSTGRES_PASSWORD|POSTGRESQL_PASSWORD|POSTGRES_PASS|PG_PASSWORD|PGPASSWORD|MYSQL_ROOT_PASSWORD|MYSQL_PASSWORD|MYSQL_PASS|MARIADB_ROOT_PASSWORD|MARIADB_PASSWORD|MONGO_INITDB_ROOT_PASSWORD|MONGO_PASSWORD|MONGO_PASS|MONGODB_PASSWORD|MONGO_ROOT_PASSWORD)\s*=\s*(.*)$/gm;
     let match;
     while ((match = passwordRegex.exec(content)) !== null) {
       const key = match[1];
-      const val = match[2].replace(/^["']|["']$/g, '').trim();
+      const val = parseDotenvValue(match[2]);
       if (val) {
-        foundDbPasswords.push({ file: path.relative(currentDir, file) || '.env', key, value: val });
+        // Recorded either way: the KEY still says which name the database
+        // password travels under. Only the value is held back when it is one
+        // nobody may use in production (see untrustedSecretValueReason).
+        foundDbPasswords.push({
+          file: path.relative(currentDir, file) || '.env', key, value: val,
+          untrusted: untrustedSecretValueReason(file, val, { isDbPassword: true, committed: isCommitted(file) }),
+        });
       }
     }
 
-    const urlRegex = /^(DATABASE_URL|DB_URL|MONGO_URI|MONGO_URL|POSTGRES_URL|MYSQL_URL)\s*=\s*(.*)$/gm;
+    const urlRegex = /^(?:export\s+)?(DATABASE_URL|DB_URL|MONGO_URI|MONGO_URL|POSTGRES_URL|MYSQL_URL)\s*=\s*(.*)$/gm;
     let urlMatch;
     while ((urlMatch = urlRegex.exec(content)) !== null) {
       const key = urlMatch[1];
-      const val = urlMatch[2].replace(/^["']|["']$/g, '').trim();
+      const val = parseDotenvValue(urlMatch[2]);
       if (val && !foundDbUrls[key]) {
         let query = '';
         try {
@@ -910,7 +1030,9 @@ module.exports = async function init() {
           const urlObj = new URL(tempVal);
           query = urlObj.search || '';
         } catch (e) { }
-        foundDbUrls[key] = { key, query };
+        // The scheme names the application's driver - kept for the URL the
+        // chart rebuilds (see dbUrlScheme in utils/dbDefaults.js).
+        foundDbUrls[key] = { key, query, scheme: urlSchemeOf(val) };
       }
     }
 
@@ -920,7 +1042,9 @@ module.exports = async function init() {
 
     const lines = content.split('\n');
     for (const line of lines) {
-      const lineMatch = line.match(/^([A-Z_][A-Z0-9_]*)\s*=(.*)$/);
+      // "export KEY=value" is the form a .env takes when it is also meant to be
+      // sourced by a shell; dotenv and compose both accept it.
+      const lineMatch = line.match(/^(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=(.*)$/);
       if (lineMatch) {
         const key = lineMatch[1];
         const val = lineMatch[2];
@@ -934,10 +1058,12 @@ module.exports = async function init() {
         const handledServices = typeof matchedAdditionalServices !== 'undefined' ? matchedAdditionalServices : [];
         if (!tryWireSharedCredential(key, val, isBackend, isFrontend, handledServices)) {
           let sensitiveContext = { content: sensitiveEnvContent };
-          processEnvVariable(key, val, {
-                isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv,
-                sensitiveContext, matchedAdditionalServices: handledServices,
-              });
+          // A value that cannot be a real production secret is left blank, so
+          // the checklist asks for one instead of handing over the example's.
+          takeEnvVariable(key, val, file, {
+            isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv,
+            sensitiveContext, matchedAdditionalServices: handledServices,
+          });
           sensitiveEnvContent = sensitiveContext.content;
         }
       }
@@ -988,6 +1114,8 @@ module.exports = async function init() {
   // actually references (see utils/composeSupport.js).
   const composeSupportCandidates = new Map();
 
+  const envFileWarnings = [];
+  const droppedDevCommands = [];
   if (composeContent) {
     // parseComposeServices anchors service blocks to the indentation the file
     // actually uses. The hand-rolled regex this replaces hardcoded two spaces,
@@ -1047,6 +1175,18 @@ module.exports = async function init() {
         (buildDirName && (s.name === buildDirName || s.originalName === buildDirName || s.name === sanitizeServiceName(buildDirName)))
       );
 
+      // A compose service that was generated as an additional service of its
+      // own IS that service, even when it builds from the backend's or the
+      // frontend's directory - a worker or a cron runner beside the API. The
+      // directory test above called it the backend, so its environment was
+      // merged into the API's, its command was taken for the API's, and its
+      // name was rewritten to "api" wherever it appeared - "node worker.js"
+      // became "node api.js".
+      if (additionalServices.some(s => s.composeName === composeKey)) {
+        isBackend = false;
+        isFrontend = false;
+      }
+
       if (isBackend) composeNameToK8s[services[i].name] = 'api';
       else if (isFrontend) composeNameToK8s[services[i].name] = 'frontend';
       else if (matchedAdditionalServices.length > 0) composeNameToK8s[services[i].name] = matchedAdditionalServices[0].name;
@@ -1085,6 +1225,19 @@ module.exports = async function init() {
       // with its Dockerfile's ARG defaults, i.e. a development bundle
       // pointing at localhost, and no generated manifest could fix that after
       // the fact.
+      // Named volumes ("uploads:/app/uploads") are this service's own
+      // persistence. Support services already carried them; a service this
+      // repository builds lost them, so whatever it stored lived in the
+      // container's filesystem and vanished on every restart. Bind mounts are
+      // not carried: on an app service they are almost always the source tree
+      // mounted for development.
+      if (matchedAdditionalServices.length > 0 && !isBackend && !isFrontend) {
+        const { persistent } = extractVolumes(block);
+        for (const s of matchedAdditionalServices) {
+          if (persistent.length > 0 && (!s.volumes || s.volumes.length === 0)) s.volumes = persistent.map(v => ({ ...v }));
+        }
+      }
+
       {
         const buildArgs = extractBuildArgs(block);
         if (buildArgs) {
@@ -1106,29 +1259,9 @@ module.exports = async function init() {
       // same as env values below) and carried into the Deployment as
       // `args:`.
       {
-        const commandLines = block.split('\n');
-        let inCommand = false;
-        let commandIndent = 0;
-        const commandArgs = [];
-        for (const line of commandLines) {
-          if (!inCommand) {
-            const m = line.match(/^([ \t]+)command:\s*$/);
-            if (m) {
-              inCommand = true;
-              commandIndent = m[1].length;
-            }
-            continue;
-          }
-          if (line.trim() === '') continue;
-          const indentMatch = line.match(/^([ \t]*)/);
-          const lineIndent = indentMatch ? indentMatch[1].length : 0;
-          if (lineIndent <= commandIndent) break; // exit command block
-          const itemMatch = line.match(/^\s*-\s*(.+)$/);
-          if (itemMatch) {
-            const cleaned = itemMatch[1].trim().replace(/\s+#.*$/, '').trim();
-            commandArgs.push(cleaned.replace(/^["']|["']$/g, ''));
-          }
-        }
+        // Every form compose accepts - a block list, a flow list or a single
+        // string - parsed the way compose itself reads it (see extractCommand).
+        const commandArgs = extractCommand(block) || [];
         if (commandArgs.length > 0) {
           // A CLI-configured app can carry a shared credential the same way
           // Redis does ("--requirepass ${VAR}") - rewrite it to k8s' own
@@ -1146,10 +1279,24 @@ module.exports = async function init() {
               s.forcedSecretKeys.add(secretKey);
             }
           }
-          if (isBackend && !apiCommand) apiCommand = commandArgs;
-          if (isFrontend && !frontendCommand) frontendCommand = commandArgs;
+          // A development server command - "uvicorn ... --reload", "npm run
+          // dev" - is what a compose file for a laptop says, and carried into
+          // the cluster as the container's args it REPLACES the image's own
+          // CMD. For an image whose CMD runs "alembic upgrade head" before
+          // starting the server, that meant migrations never ran and the
+          // database stayed empty. When the image has a CMD of its own, it
+          // wins; the command is reported, not silently kept or dropped.
+          const devOnly = looksLikeDevCommand(commandArgs);
+          const carry = (label, contextDir, dockerfile) => {
+            if (!devOnly) return true;
+            if (!dockerfileDefinesCommand(contextDir, dockerfile)) return true;
+            droppedDevCommands.push(`${label}: "${commandArgs.join(' ')}"`);
+            return false;
+          };
+          if (isBackend && !apiCommand && carry('api', backendInfo.backendPath, backendInfo.dockerfile)) apiCommand = commandArgs;
+          if (isFrontend && !frontendCommand && carry('frontend', frontendInfo.frontendPath, frontendInfo.dockerfile)) frontendCommand = commandArgs;
           for (const s of matchedAdditionalServices) {
-            if (!s.command) s.command = commandArgs;
+            if (!s.command && carry(s.name, s.path, s.dockerfile)) s.command = commandArgs;
           }
         }
       }
@@ -1157,6 +1304,9 @@ module.exports = async function init() {
       const lines = block.split('\n');
       let inEnv = false;
       let envIndent = 0;
+      // What this service's own environment: block sets - it wins over
+      // env_file, as it does in compose.
+      const declaredInEnvironment = new Set();
 
       for (const line of lines) {
         if (!inEnv) {
@@ -1183,6 +1333,7 @@ module.exports = async function init() {
           if (envLineMatch) {
             const key = envLineMatch[1];
             const val = envLineMatch[2];
+            declaredInEnvironment.add(key);
 
             // A full DB connection string (DATABASE_URL, MONGO_URI, ...) is
             // only ever recognized as such when it comes from an actual .env
@@ -1195,18 +1346,18 @@ module.exports = async function init() {
             // compose hostname (e.g. "db") untouched, which then fails to
             // resolve inside the cluster where the Service is named
             // "database". Registering it in foundDbUrls here makes
-            // processEnvVariable skip it below and routes it through the
+            // the generic path skip it below and routes it through the
             // dedicated dbUrlEnvBlock reconstruction in api/deployment.js
             // instead, which rebuilds the URL against the real Service name.
             if (dbUrlKeyRegex.test(key) && !foundDbUrls[key]) {
-              const cleanedVal = val.replace(/^["']|["']$/g, '').trim();
+              const cleanedVal = parseDotenvValue(val);
               let query = '';
               try {
                 const tempVal = cleanedVal.replace(/\$\{([^}]+)\}/g, 'BASH_VAR_$1');
                 const urlObj = new URL(tempVal);
                 query = urlObj.search || '';
               } catch (e) { }
-              foundDbUrls[key] = { key, query };
+              foundDbUrls[key] = { key, query, scheme: urlSchemeOf(cleanedVal) };
             }
 
             // Each additional service can declare its OWN DB connection
@@ -1221,7 +1372,7 @@ module.exports = async function init() {
             // Service actually hosts it (see the "shared database" wiring
             // loop later in this function).
             if (dbUrlKeyRegex.test(key) && typeof matchedAdditionalServices !== 'undefined' && matchedAdditionalServices.length > 0) {
-              const cleanedVal = val.replace(/^["']|["']$/g, '').trim();
+              const cleanedVal = parseDotenvValue(val);
               let ownDbName = null;
               try {
                 const tempVal = cleanedVal.replace(/\$\{([^}]+)\}/g, 'BASH_VAR_$1');
@@ -1230,7 +1381,7 @@ module.exports = async function init() {
               } catch (e) { }
               for (const s of matchedAdditionalServices) {
                 if (!s.dbUrlVars.some(v => v.key === key)) {
-                  s.dbUrlVars.push({ key, dbName: ownDbName });
+                  s.dbUrlVars.push({ key, dbName: ownDbName, scheme: urlSchemeOf(cleanedVal) });
                 }
               }
             }
@@ -1238,7 +1389,9 @@ module.exports = async function init() {
             const handledServices = typeof matchedAdditionalServices !== 'undefined' ? matchedAdditionalServices : [];
             if (!tryWireSharedCredential(key, val, isBackend, isFrontend, handledServices)) {
               let sensitiveContext = { content: sensitiveEnvContent };
-              processEnvVariable(key, val, {
+              // The compose file is committed, so a literal credential in it is
+              // public - see untrustedSecretValueReason.
+              takeEnvVariable(key, val, composeFilePath, {
                 isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv,
                 sensitiveContext, matchedAdditionalServices: handledServices,
               });
@@ -1267,7 +1420,64 @@ module.exports = async function init() {
           }
         }
       }
+
+      // env_file: - the variables compose loads from files for this service.
+      // They were never read, so a service configured that way reached the
+      // cluster without them and nothing said so. Read with the same rules as
+      // an environment: block (and the same rule for committed values), after
+      // it, so a key the block also sets keeps the block's value.
+      for (const envFileEntry of extractEnvFiles(block)) {
+        const envFilePath = path.resolve(composeDir, envFileEntry.path);
+        const shown = path.relative(currentDir, envFilePath) || envFileEntry.path;
+        let envFileStat = null;
+        try { envFileStat = fs.lstatSync(envFilePath); } catch (e) { /* missing */ }
+        if (!isPathInside(currentDir, envFilePath) || (envFileStat && envFileStat.isSymbolicLink())) {
+          envFileWarnings.push(`${composeKey}: ${shown} (outside this repository, or a symlink - not read)`);
+          continue;
+        }
+        if (!envFileStat || !envFileStat.isFile()) {
+          if (envFileEntry.required) envFileWarnings.push(`${composeKey}: ${shown} (does not exist)`);
+          continue;
+        }
+        const handledServices = matchedAdditionalServices;
+        for (const line of fs.readFileSync(envFilePath, 'utf8').split('\n')) {
+          const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/);
+          if (!m || declaredInEnvironment.has(m[1])) continue;
+          const [, key, val] = m;
+          if (dbPasswordRegex.test(key)) {
+            const value = parseDotenvValue(val);
+            if (value) {
+              foundDbPasswords.push({
+                file: shown, key, value,
+                untrusted: untrustedSecretValueReason(envFilePath, value, { isDbPassword: true, committed: isCommitted(envFilePath) }),
+              });
+            }
+            continue;
+          }
+          if (tryWireSharedCredential(key, val, isBackend, isFrontend, handledServices)) continue;
+          const sensitiveContext = { content: sensitiveEnvContent };
+          takeEnvVariable(key, val, envFilePath, {
+            isBackend, isFrontend, foundDbUrls, apiEnv, frontendEnv,
+            sensitiveContext, matchedAdditionalServices: handledServices,
+          });
+          sensitiveEnvContent = sensitiveContext.content;
+          // Declared for THIS service by its compose file, exactly like an
+          // environment: entry - so it is wired whether or not the source
+          // spells the name out.
+          if (isSensitiveKey(key)) {
+            if (isBackend) apiForcedSecretKeys.add(key);
+            if (isFrontend) frontendForcedSecretKeys.add(key);
+            for (const s of handledServices) s.forcedSecretKeys.add(key);
+          }
+        }
+      }
     }
+  }
+  if (droppedDevCommands.length > 0) {
+    console.warn(`\x1b[33mWARNING: These docker-compose commands start a development server, so they were NOT carried into the cluster - each image's own CMD runs instead: ${droppedDevCommands.join('; ')}. If production needs a command of its own, set it under the service's command in flarops.yaml and run "flarops sync".\x1b[0m`);
+  }
+  if (envFileWarnings.length > 0) {
+    console.warn(`\x1b[33mWARNING: These env_file entries in docker-compose could not be read, so their variables are missing from the deployment: ${envFileWarnings.join('; ')}. Add the variables to flarops.yaml (or the file to the repository) and run "flarops sync".\x1b[0m`);
   }
 
   // Rewriting compose hostnames has to happen AFTER the database wiring
@@ -1286,6 +1496,14 @@ module.exports = async function init() {
     }
   };
 
+  // A compose name where it is used as a HOSTNAME - "db:5432",
+  // "http://config/", "@cache" - and not as part of a longer word. "\b" let
+  // "." and "-" count as an edge, so "worker.js" and "my-worker" were
+  // rewritten too, and a worker's own "node worker.js" turned into
+  // "node api.js".
+  const composeHostnameRegex = (composeName) =>
+    new RegExp('(?<![A-Za-z0-9_.-])' + escapeRegex(composeName) + '(?![A-Za-z0-9_.-])', 'g');
+
   // Rewrite any compose-service hostname references captured above (e.g.
   // SPRING_CONFIG_IMPORT=configserver:http://goodreads-config:8888,
   // BACKEND_HOSTNAME=goodreads-svc1) to the actual k8s Service name Flarops
@@ -1301,7 +1519,7 @@ module.exports = async function init() {
       for (const composeName of composeNamesFound) {
         const k8sName = composeNameToK8s[composeName];
         if (composeName === k8sName) continue;
-        const re = new RegExp('\\b' + escapeRegex(composeName) + '\\b', 'g');
+        const re = composeHostnameRegex(composeName);
         const newVal = val.replace(re, k8sName);
         if (newVal !== val) {
           val = newVal;
@@ -1325,7 +1543,7 @@ module.exports = async function init() {
       for (const composeName of composeNamesFound) {
         const k8sName = composeNameToK8s[composeName];
         if (composeName === k8sName) continue;
-        const re = new RegExp('\\b' + escapeRegex(composeName) + '\\b', 'g');
+        const re = composeHostnameRegex(composeName);
         val = val.replace(re, k8sName);
       }
       return val;
@@ -1486,6 +1704,19 @@ module.exports = async function init() {
 
   const analyzedKey = (inferredKeys && inferredKeys.passwordKey) ? inferredKeys.passwordKey : (backendInfo.hasBackend ? await analyzeBackendForDbPasswordKey(backendInfo.backendPath) : null);
 
+  // A usable password beats one that is only an example or a default, wherever
+  // each was found; within each group, the scan order still decides.
+  foundDbPasswords = [...foundDbPasswords.filter(p => !p.untrusted), ...foundDbPasswords.filter(p => p.untrusted)];
+
+  // The value a found password contributes. One that cannot be a production
+  // secret still names the key, but the value is generated instead.
+  let withheldDbPassword = null;
+  const passwordValueOf = (entry) => {
+    if (!entry.untrusted) return entry.value;
+    withheldDbPassword = `${entry.key} in ${entry.file} (${entry.untrusted})`;
+    return crypto.randomBytes(16).toString('hex');
+  };
+
   if (analyzedKey) {
     finalDbPasswordKey = analyzedKey;
     finalDbPassword = require('crypto').randomBytes(16).toString('hex');
@@ -1493,19 +1724,19 @@ module.exports = async function init() {
 
     const envMatch = foundDbPasswords.find(p => p.key === finalDbPasswordKey);
     if (envMatch) {
-      finalDbPassword = envMatch.value;
-      console.log(`\x1b[34mINFO: Found matching password for ${finalDbPasswordKey} in ${envMatch.file}\x1b[0m`);
+      finalDbPassword = passwordValueOf(envMatch);
+      if (!envMatch.untrusted) console.log(`\x1b[34mINFO: Found matching password for ${finalDbPasswordKey} in ${envMatch.file}\x1b[0m`);
     } else if (foundDbPasswords.length > 0) {
       // The backend code reads a different key name than what's actually stored in
       // the project's own .env (e.g. code expects DB_PASSWORD, but .env has
       // POSTGRES_PASSWORD). Prefer the real, working password over inventing a
       // fresh random one that the existing database won't accept.
-      finalDbPassword = foundDbPasswords[0].value;
-      console.warn(`\x1b[33mWARNING: Backend code expects "${finalDbPasswordKey}", but ${foundDbPasswords[0].file} stores the database password under "${foundDbPasswords[0].key}". Using that value for ${finalDbPasswordKey} - please verify this is correct.\x1b[0m`);
+      finalDbPassword = passwordValueOf(foundDbPasswords[0]);
+      if (!foundDbPasswords[0].untrusted) console.warn(`\x1b[33mWARNING: Backend code expects "${finalDbPasswordKey}", but ${foundDbPasswords[0].file} stores the database password under "${foundDbPasswords[0].key}". Using that value for ${finalDbPasswordKey} - please verify this is correct.\x1b[0m`);
     }
   } else if (foundDbPasswords.length > 0) {
     finalDbPasswordKey = foundDbPasswords[0].key;
-    finalDbPassword = foundDbPasswords[0].value;
+    finalDbPassword = passwordValueOf(foundDbPasswords[0]);
     if (foundDbPasswords.length > 1) {
       console.log(`\x1b[33mWARNING: Found multiple database passwords in .env files. Using ${finalDbPasswordKey} from ${foundDbPasswords[0].file}\x1b[0m`);
     }
@@ -1545,7 +1776,7 @@ module.exports = async function init() {
       if (!bareVar || !sharedCredentialSecrets.has(bareVar)) continue;
       const shared = sharedCredentialSecrets.get(bareVar);
       if (shared.secretKey !== finalDbPasswordKey) {
-        console.log(`\x1b[34mINFO: the database password is the shared variable \${${'${bareVar}'}}, already wired as ${'${shared.secretKey}'} - using that key for the database too instead of a second secret named ${'${finalDbPasswordKey}'}.\x1b[0m`);
+        console.log(`\x1b[34mINFO: the database password is the shared variable \${${bareVar}}, already wired as ${shared.secretKey} - using that key for the database too instead of a second secret named ${finalDbPasswordKey}.\x1b[0m`);
         if (finalDbPasswordKey && finalDbPasswordKey !== shared.secretKey) {
           // In place: the list is owned by the wiring object now, and
           // replacing the binding would leave that owner holding the old one.
@@ -1556,8 +1787,14 @@ module.exports = async function init() {
         finalDbPasswordKey = shared.secretKey;
       }
       finalDbPassword = shared.value;
+      // The shared credential's own generated value is what is used now, so
+      // nothing found in an env file was set aside.
+      withheldDbPassword = null;
       break;
     }
+  }
+  if (withheldDbPassword) {
+    console.warn(`\x1b[33mWARNING: Not using the database password from ${withheldDbPassword} - it cannot be a production password. A random one was generated for ${finalDbPasswordKey} instead and written to deploy/.env.\x1b[0m`);
   }
 
   // The dashboard publishes the whole cluster's shape - nodes, pods,
@@ -2529,11 +2766,11 @@ AWS_REGION=${awsRegion}
             // deploy/.env has already been written by this point, so append
             // the way the per-service database passwords above do.
             if (!envIO.has(key)) {
-              envIO.append(`${key}=${sanitizeEnvValue(rawVal, key)}\n`);
+              envIO.append(`${key}=${usableSecretValue(key, sanitizeEnvValue(rawVal, key, { parsed: true }), composeFilePath)}\n`);
             }
             if (!envKeysToPass.includes(key)) envKeysToPass.push(key);
           } else {
-            parsed.env[key] = sanitizeEnvValue(rawVal, key);
+            parsed.env[key] = sanitizeEnvValue(rawVal, key, { parsed: true });
           }
         }
         if (parsed.extraSecretEnvMappings.length === 0) delete parsed.extraSecretEnvMappings;
@@ -2648,6 +2885,25 @@ AWS_REGION=${awsRegion}
   if (rewrittenRuntimeEnv.length > 0) {
     console.log(`\x1b[34mINFO: These environment variables pointed at a loopback address, which inside a pod means the pod itself - they were rewritten: ${rewrittenRuntimeEnv.join(', ')}.\x1b[0m`);
   }
+
+  // What is LEFT pointing at this machine after the rewrite above. Flarops
+  // does not guess at these: a value with no port matches no service, and a
+  // bare host or a "*.localhost" proxy route says nothing about what it should
+  // become - "DOMAIN: localhost" wants the project's domain, "db.localhost"
+  // was a route through a local proxy that does not exist in a cluster.
+  //
+  // Naming them is the whole point. "We found localhost somewhere" leaves the
+  // reader to search; a list of service.VARIABLE is something they can act on.
+  const unresolvedLoopback = [];
+  const collectLoopback = (envObj, label) => {
+    for (const [key, value] of Object.entries(envObj || {})) {
+      if (LOOPBACK_HOST_REGEX.test(String(value))) unresolvedLoopback.push(`${label}.${key}`);
+    }
+  };
+  collectLoopback(apiEnv, 'api');
+  collectLoopback(frontendEnv, 'frontend');
+  for (const s of additionalServices) collectLoopback(s.env, s.name);
+  for (const s of supportServices) collectLoopback(s.env, s.name);
 
   // A command argument can carry an unresolved reference just as an env value
   // can ("--requirepass ${REDIS_PASSWORD}"), and it would otherwise be set to
@@ -3085,6 +3341,13 @@ appVersion: "1.0.0"
     const needed = [...infrastructureKeys, ...envKeysToPass.filter(Boolean)]
       .filter((key, i, all) => all.indexOf(key) === i);
     const unmounted = unmountedSecretKeys(config);
+    // Only the ones still blank: a real value found in another directory
+    // replaces a withheld one, and then there is nothing to report.
+    const stillWithheld = withheldSecretValues.filter(entry => !valueOf(entry.split(' ')[0]));
+    if (stillWithheld.length > 0) {
+      console.log("");
+      console.warn(`\x1b[33mWARNING: These secrets were found, but their values were NOT carried into deploy/.env because they cannot be real production secrets: ${stillWithheld.join(', ')}. Each is still required - give it a real value when you create the GitHub secret.\x1b[0m`);
+    }
     if (needed.length > 0) {
       console.log("");
       console.log(`\x1b[36mCreate these ${needed.length} GitHub repository secrets before the first deploy\x1b[0m`);
@@ -3131,16 +3394,19 @@ appVersion: "1.0.0"
   // generation time rather than leaving it to be discovered in a browser.
   if (!frontendInfo.frontendPath && !(backendInfo.backendPath && config.apiServesFrontend)) {
     const rootedService = additionalServices.find(s =>
-      !s.suppressDirectIngress && Array.isArray(s.exposedRoutes) && s.exposedRoutes.includes('/'));
+      // Routes are objects by now (see normalizeRoutes) - comparing the list
+      // itself against "/" never matched, so this note was printed even for
+      // a project whose additional service does serve the root.
+      !s.suppressDirectIngress && normalizeRoutes(s.exposedRoutes).some(r => r.path === '/'));
     if (!rootedService) {
-      console.log(`\x1b[36mNOTE: No service in this project serves "/", so https://${domain}/ will return 404 from the ingress controller. Only the paths listed under each service in deploy/helm/values.yaml are routed. This is expected for a backend-only project - add a "/" entry to the intended service's exposedRoutes if something should answer there.\x1b[0m`);
+      console.log(`\x1b[36mNOTE: No service in this project serves "/", so ${domain ? `https://${domain}/` : 'the root path'} will return 404 from the ingress controller. Only the paths listed under each service in deploy/helm/values.yaml are routed. This is expected for a backend-only project - add a "/" entry to the intended service's exposedRoutes if something should answer there.\x1b[0m`);
       console.log("");
     }
   }
 
-  if (contextObj.hasLocalhostWarnings) {
-    console.log(`\x1b[36mATTENTION: We found "localhost" references in your environment variables.\x1b[0m`);
-    console.log(`\x1b[36mPlease open deploy/helm/values.yaml and change "localhost" to the appropriate service name (e.g. "api", "frontend", or "database") so containers can communicate properly in Kubernetes!\x1b[0m`);
+  if (unresolvedLoopback.length > 0) {
+    console.warn(`\x1b[33mWARNING: these variables still point at this machine, which inside a pod is the container itself - Flarops could not tell what they should become: ${unresolvedLoopback.join(', ')}.\x1b[0m`);
+    console.warn(`\x1b[33mSet them in flarops.yaml and run "flarops sync". Use a service's name for traffic inside the cluster ("database", "api"), and your project's domain for anything a browser reaches.\x1b[0m`);
     console.log("");
   }
 };

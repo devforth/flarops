@@ -159,6 +159,27 @@ broken:
   const cleanup = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
   fs.writeFileSync(path.join(dir, 'flarops.yaml'), cleanup.slice(0, cleanup.indexOf('\nbroken:\n')) + '\n');
 
+  // 3b'. Values that are pasted into file names and workflows unescaped. A
+  // service name climbing out of the chart wrote a file into
+  // .github/workflows, and a secret key with "\n" in it added lines of its own
+  // to deploy.yml - both must be refused before anything is written.
+  const hostile = [
+    ['a service name outside the chart', '"../../../.github/workflows/pwn":\n  image: "busybox:1"\n', /not a valid service name/],
+    ['a secret key that adds workflow lines', 'hostile:\n  image: "busybox:1"\n  secretEnvs:\n    X: "X }}\\n      INJECTED: ${{ github.token"\n', /not a valid GitHub secret name/],
+    ['a build context outside the repository', 'hostile:\n  dockerfile: Dockerfile\n  context: ../../elsewhere\n', /inside the repository/],
+    ['a port out of range', 'hostile:\n  image: "busybox:1"\n  ports:\n    - 99999\n', /port number/],
+  ];
+  const cleanFile = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+  const cleanWorkflow = read(dir, '.github/workflows/deploy.yml');
+  for (const [label, block, message] of hostile) {
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), cleanFile + '\n' + block);
+    r = runSync(dir);
+    check(`${label} is refused`, r.status === 1 && message.test(r.err || ''), r.err || r.out);
+  }
+  check('nothing reached .github/workflows on those refusals',
+    !exists(dir, '.github/workflows/pwn.yaml') && read(dir, '.github/workflows/deploy.yml') === cleanWorkflow);
+  fs.writeFileSync(path.join(dir, 'flarops.yaml'), cleanFile);
+
   // 3c. A task, not a service. Declared as an ordinary service with
   // replicas: 1 it would become a Deployment, exit, be restarted, and sit in
   // CrashLoopBackOff forever while redoing its work on every loop.

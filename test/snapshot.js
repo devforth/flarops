@@ -48,7 +48,9 @@ function scrub(text) {
     // ("PG_PASSWORD: POSTGRES_PASSWORD") and a Secret key reference are made
     // of. Scrubbing those hid a duplicate-key bug in generated output behind
     // two identical <SECRET> placeholders.
-    .replace(/([A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|KEY|HASH)[A-Z0-9_]*\s*[:=]\s*"?)([A-Za-z0-9+/=_-]{16,})("?)/g,
+    // [ \t], not \s: an EMPTY value ("JWT_SECRET=") let \s run on into the
+    // next line, so that line's key was scrubbed and its random value kept.
+    .replace(/([A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|KEY|HASH)[A-Z0-9_]*[ \t]*[:=][ \t]*"?)([A-Za-z0-9+/=_-]{16,})("?)/g,
       (all, lead, value, tail) => /^[A-Z][A-Z0-9_]*$/.test(value) ? all : `${lead}<SECRET>${tail}`)
     .replace(/(:\/\/[^:@\s"]+:)[A-Za-z0-9+/=_-]{16,}(@)/g, '$1<SECRET>$2');
 }

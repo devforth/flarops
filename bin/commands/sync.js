@@ -27,6 +27,7 @@ const { readState, writeState, STATE_FILE } = require('../../utils/state.js');
 const { makeServiceEntry } = require('../../utils/analyzer.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
 const { unmountedSecretKeys } = require('../../utils/secretWiring.js');
+const { validateDeclarations } = require('../../utils/flaropsValidate.js');
 const { renderChartTemplates } = require('../../templates/chart.js');
 const renderValues = require('../../templates/values.yaml.js');
 const renderWerf = require('../../templates/werf.yaml.js');
@@ -77,6 +78,9 @@ function declaredServices(text) {
     }
     out.set(name, { ...SERVICE_DEFAULTS, ...(body || {}) });
   }
+  // Before anything is applied: these values are pasted into file names,
+  // workflows and werf.yaml without escaping - see utils/flaropsValidate.js.
+  validateDeclarations(out);
   return out;
 }
 
@@ -549,10 +553,11 @@ module.exports = async function sync() {
   }
 
   // A secret the chart now mounts has to be something CI actually puts in the
-  // Secret, and CI only passes what the workflow names. Sync does not rewrite
-  // the workflows - they carry registry and cloud settings it was never told -
-  // so it says plainly what is missing rather than producing a chart that
-  // cannot start.
+  // Secret, and CI only passes what the workflow names. The workflows were
+  // re-rendered above, so this only fires when they could not be written
+  // (no .github/workflows directory) or were edited by hand since - and then
+  // it says plainly what is missing rather than leaving a chart that cannot
+  // start.
   const needed = new Set();
   for (const decl of declared.values()) {
     for (const key of Object.values(decl.secretEnvs || {})) needed.add(String(key));
@@ -561,7 +566,7 @@ module.exports = async function sync() {
   const workflow = path.join(currentDir, '.github', 'workflows', 'deploy.yml');
   if (fs.existsSync(workflow)) {
     const text = fs.readFileSync(workflow, 'utf8');
-    const missing = [...needed].filter(k => !new RegExp(`SECRET_ENV_${k}\\b`).test(text) && !new RegExp(`secrets\\.${k}\\b`).test(text));
+    const missing = [...needed].filter(k => !text.includes(`SECRET_ENV_${k}:`) && !text.includes(`secrets.${k} `));
     if (missing.length > 0) {
       console.warn(`\x1b[33mWARNING: these Secret keys are now referenced by the chart but not passed by .github/workflows/deploy.yml: ${missing.join(', ')}. Add a "SECRET_ENV_<KEY>: \${{ secrets.<KEY> }}" line for each under the deploy step's env:, and add the secret to the repository - without it those pods stay in CreateContainerConfigError.\x1b[0m`);
     }

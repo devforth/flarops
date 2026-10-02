@@ -1,0 +1,1 @@
+class WorkerSettings: functions = []

@@ -1,1 +1,3 @@
 pointed at a loopback address, which inside a pod means the pod itself
+still point at this machine, which inside a pod is the container itself
+api.METRICS_ENDPOINT, api.PUBLIC_DOMAIN, api.ALLOWED_ORIGINS, api.BIND_ADDRESS

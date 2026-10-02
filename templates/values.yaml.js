@@ -30,10 +30,9 @@ module.exports = function renderValues(config, context) {
 ${generateEnvString(s.env, context, '      ')}
     secretKeys:
 ${s.secretKeys.map(k => '      - ' + k).join('\n')}
-    ports:
-${s.ports.map(p => '      - ' + p).join('\n')}
+    ports:${s.ports.length === 0 ? ' []' : '\n' + s.ports.map(p => '      - ' + p).join('\n')}
     replicas: ${s.replicas || 1}
-    healthRoute: ${s.healthRoute ? '"' + s.healthRoute + '"' : 'null'}
+    healthRoute: ${s.healthRoute ? '"' + yamlEscapeDoubleQuoted(s.healthRoute) + '"' : 'null'}
     healthPort: ${s.healthPort || 'null'}
     exposedRoutes:
 ${renderRoutes(s.exposedRoutes, 6)}
@@ -41,7 +40,7 @@ ${renderRoutes(s.exposedRoutes, 6)}
     # (see detectServiceIsGateway) - set to true to also expose them directly,
     # bypassing the gateway.
     exposeDirectly: ${s.suppressDirectIngress ? 'false' : 'true'}
-${s.command ? `    command:\n${s.command.map(a => '      - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}${(s.db && !s.db.shared) ? `    db:
+${s.command ? `    command:\n${s.command.map(a => '      - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}${(s.db && !s.db.shared) ? `    db:
       type: "${yamlEscapeDoubleQuoted(s.db.type)}"
       image: "${yamlEscapeDoubleQuoted(s.db.image)}"
       port: ${s.db.port}
@@ -80,7 +79,7 @@ ${(s.volumes && s.volumes.length > 0) ? `    storage: "5Gi"\n` : ''}${s.command 
   }
 
   let valuesYaml = `projectName: ${config.projectName}
-domain: "${config.domain}"
+domain: "${yamlEscapeDoubleQuoted(config.domain)}"
 hasBackend: ${config.hasBackend}
 hasFrontend: ${config.hasFrontend}
 apiServesFrontend: ${!!config.apiServesFrontend}
@@ -88,7 +87,7 @@ images:
 ${config.hasBackend ? `  api: ${config.images.api}` : ''}
   db: ${config.images.db}
 ${config.hasFrontend ? `  frontend: ${config.images.frontend}` : ''}
-dbCloneSource: "${config.dbCloneSource}"
+dbCloneSource: "${yamlEscapeDoubleQuoted(config.dbCloneSource)}"
 dbType: ${config.dbType ? '"' + config.dbType + '"' : 'null'}
 dbPort: ${config.dbPort || 'null'}
 database:
@@ -101,13 +100,13 @@ database:
     # KEY: "VALUE"
 ${config.hasBackend ? `api:
   replicas: ${config.apiReplicas || 1}
-  healthRoute: ${config.apiHealthRoute ? '"' + config.apiHealthRoute + '"' : 'null'}
+  healthRoute: ${config.apiHealthRoute ? '"' + yamlEscapeDoubleQuoted(config.apiHealthRoute) + '"' : 'null'}
   healthPort: ${config.apiHealthPort || 'null'}
   secretKeys:
 ${config.apiSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
 ${generateEnvString(config.apiEnv || {}, context)}
-${config.apiCommand ? `  command:\n${config.apiCommand.map(a => '    - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}apiPorts:
+${config.apiCommand ? `  command:\n${config.apiCommand.map(a => '    - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}apiPorts:
 ${config.apiPorts.map(p => '  - ' + p).join('\n')}` : ''}
 ${config.hasFrontend ? `frontend:
   replicas: ${config.frontendReplicas || 1}
@@ -115,7 +114,7 @@ ${config.hasFrontend ? `frontend:
 ${config.frontendSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
 ${generateEnvString(config.frontendEnv || {}, context)}
-${config.frontendCommand ? `  command:\n${config.frontendCommand.map(a => '    - "' + String(a).replace(/"/g, '\\"') + '"').join('\n')}\n` : ''}frontendPorts:
+${config.frontendCommand ? `  command:\n${config.frontendCommand.map(a => '    - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}frontendPorts:
 ${config.frontendPorts.map(p => '  - ' + p).join('\n')}` : ''}
 ${additionalServicesYaml}${supportServicesYaml}
 apiRoutes:
@@ -142,10 +141,10 @@ dashboard:
 # purpose - nothing secret belongs in a committed file.
 imagePullSecret: null
 # Set by the PR-capsule workflow to the node the dashboard's capacity oracle
-# picked. Only the STATEFUL workloads read it: their volumes come from k3s's
-# local-path provisioner and live on one node's disk, so a database pod that
-# moves can never reach its data again. Stateless workloads are deliberately
-# left to the scheduler, so a capsule can use room spread across the fleet.
+# picked, and read by EVERY workload of the capsule. The stateful ones must
+# stay there - their local-path volumes live on that node's disk - and the
+# rest stay with them, so that tearing a capsule down leaves its node idle and
+# the worker can be reclaimed. Empty in production, which is not pinned.
 dataNodeSelector: {}
 `;
 

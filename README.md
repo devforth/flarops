@@ -62,7 +62,7 @@ Then commit what it changed (`flarops.yaml`, `deploy/`, `werf.yaml`, `.github/wo
 
 **Sync is a merge, not a regeneration.** `init` learned things by reading your code that you cannot reasonably be asked to write down again — the database URLs it builds for each container, a migration step it found, SQL that seeds the database on first start. Those live in `deploy/.flarops-state.json` (committed, and not meant to be edited). Your edits are laid over them, so changing one line does not erase the rest.
 
-Sync refuses rather than guessing. Unreadable YAML is reported with its line number and nothing is written. An empty `flarops.yaml` is treated as a truncated file, not as an instruction to delete your deployment.
+Sync refuses rather than guessing. Unreadable YAML is reported with its line number and nothing is written. An empty `flarops.yaml` is treated as a truncated file, not as an instruction to delete your deployment. Values that would end up somewhere they cannot be — a service name that is not a valid Kubernetes name, a secret name GitHub would not accept, a port outside 1–65535, a `context` outside the repository — are refused with the field named, before anything is written.
 
 ## `flarops.yaml` — the file you edit
 
@@ -249,6 +249,8 @@ This is the one part you do by hand, so it is worth seeing whole.
 
 A secret is missing from step 3 → the pod cannot start. A secret exists but no service declares it in `secretEnvs` → it sits in the cluster unused. Both are reported; neither is guessed at.
 
+Values from `.env.example`, `.env.sample` and `.env.template` are never used: those files are committed, so their values are public. Their keys still count — the secret is wired and listed — but its value is left empty, marked `<- no value found; you must supply one`. The same goes for an obvious placeholder in a real `.env` (`changeme`, `your-…-here`, `replace_me`). A database password taken from one of those, or set to the engine's default (`postgres`, `root`, `admin`), is replaced with a random one. `init` lists every value it set aside.
+
 Some values appear more than once with a note to give them the same value. That happens when your `docker-compose.yml` read one credential into several variables — they have to match, or the services will not authenticate to each other.
 
 ## First deployment
@@ -297,7 +299,7 @@ Answer `n` to any of them to leave your source untouched. Flarops still generate
 
 | Prompt | Notes |
 | --- | --- |
-| `Bucket [name] is already exist, are you sure you want to use it? [y/N]` | **Defaults to no.** An S3 bucket with the derived name already exists in your account. Answering yes stores this project's Terraform state in it. This is the one prompt where Enter declines, because agreeing by reflex could put your state in a bucket that belongs to something else. |
+| `Bucket [name] is already exist, are you sure you want to use it? (...) [y/N]` | **Defaults to no.** An S3 bucket with the derived name already exists and your credentials can reach it. Answering yes stores this project's Terraform state in it — including the k3s cluster token — so check it is listed in **your** account first. This is the one prompt where Enter declines, because agreeing by reflex could put your state in a bucket that belongs to something else. A name taken by another account that you cannot reach is not asked about: `init` says so and asks for a different name. |
 
 ### What `init` does without asking
 
