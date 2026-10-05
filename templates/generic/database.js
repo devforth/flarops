@@ -112,6 +112,12 @@ spec:
       containers:
         - name: db
           image: {{ $svcDb.image }}
+{{- if $svcDb.command }}
+          args:
+{{- range $arg := $svcDb.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

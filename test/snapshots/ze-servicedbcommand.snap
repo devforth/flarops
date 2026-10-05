@@ -5,9 +5,12 @@
   .keys/deploy_rsa
   .keys/deploy_rsa.pub
   FLAROPS.md
-  backend/Dockerfile
-  backend/index.js
-  backend/package.json
+  auth-service/Dockerfile
+  auth-service/app.js
+  auth-service/package.json
+  billing-service/Dockerfile
+  billing-service/app.js
+  billing-service/package.json
   deploy/.env
   deploy/.env.safety
   deploy/.flarops-state.json
@@ -30,13 +33,18 @@
   deploy/helm/Chart.yaml
   deploy/helm/templates/01-ingress.yaml
   deploy/helm/templates/_helpers.tpl
-  deploy/helm/templates/api.yaml
+  deploy/helm/templates/auth-service-db.yaml
+  deploy/helm/templates/auth-service.yaml
+  deploy/helm/templates/billing-service-db.yaml
+  deploy/helm/templates/billing-service.yaml
   deploy/helm/templates/dashboard.yaml
   deploy/helm/templates/registry-secret.yaml
   deploy/helm/templates/secret.yaml
   deploy/helm/values.yaml
   deploy/terraform/main.tf
   deploy/terraform/variables.tf
+  docker-compose.yml
+  expected-log.txt
   flarops.yaml
   werf-giterminism.yaml
   werf.yaml
@@ -54,12 +62,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: flarops-deploy-e-nocompose
+  group: flarops-deploy-ze-servicedbcommand
   cancel-in-progress: false
 
 env:
   AWS_REGION: us-west-2
-  PROJECT_NAME: e-nocompose
+  PROJECT_NAME: ze-servicedbcommand
   REGISTRY_USER: testuser
   BASE_DOMAIN: example.test
 
@@ -189,6 +197,8 @@ jobs:
       - name: Deploy application with Werf
         env:
           SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
+          SECRET_ENV_AUTH_SERVICE_POSTGRES_PASSWORD: ${{ secrets.AUTH_SERVICE_POSTGRES_PASSWORD }}
+          SECRET_ENV_BILLING_SERVICE_POSTGRES_PASSWORD: ${{ secrets.BILLING_SERVICE_POSTGRES_PASSWORD }}
           SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
           REGISTRY_SERVER: https://index.docker.io/v1/
         run: |
@@ -198,7 +208,7 @@ jobs:
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
-            --repo docker.io/${{ env.REGISTRY_USER }}/e-nocompose \
+            --repo docker.io/${{ env.REGISTRY_USER }}/ze-servicedbcommand \
             --env production \
             --values deploy/helm/flarops-ci-values.json
 
@@ -218,11 +228,11 @@ concurrency:
 
 env:
   AWS_REGION: us-west-2
-  PROJECT_NAME: e-nocompose
+  PROJECT_NAME: ze-servicedbcommand
   REGISTRY_USER: testuser
   BASE_DOMAIN: example.test
-  MAIN_NAMESPACE: e-nocompose-production
-  PR_NAMESPACE: e-nocompose-pr-${{ github.event.pull_request.number }}
+  MAIN_NAMESPACE: ze-servicedbcommand-production
+  PR_NAMESPACE: ze-servicedbcommand-pr-${{ github.event.pull_request.number }}
   PR_ENV_NAME: pr-${{ github.event.pull_request.number }}
   PR_DOMAIN: pr-${{ github.event.pull_request.number }}.example.test
 
@@ -526,6 +536,8 @@ jobs:
       - name: Deploy application with Werf
         env:
           SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
+          SECRET_ENV_AUTH_SERVICE_POSTGRES_PASSWORD: ${{ secrets.AUTH_SERVICE_POSTGRES_PASSWORD }}
+          SECRET_ENV_BILLING_SERVICE_POSTGRES_PASSWORD: ${{ secrets.BILLING_SERVICE_POSTGRES_PASSWORD }}
           SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
           REGISTRY_SERVER: https://index.docker.io/v1/
         run: |
@@ -535,7 +547,7 @@ jobs:
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
-            --repo docker.io/${{ env.REGISTRY_USER }}/e-nocompose \
+            --repo docker.io/${{ env.REGISTRY_USER }}/ze-servicedbcommand \
             --env ${{ env.PR_ENV_NAME }} \
             --set domain=${{ env.PR_DOMAIN }} \
             --set "dataNodeSelector.kubernetes\.io/hostname=$TARGET_NODE" \
@@ -648,7 +660,7 @@ jobs:
         continue-on-error: true
         run: |
           werf dismiss \
-            --repo docker.io/${{ env.REGISTRY_USER }}/e-nocompose \
+            --repo docker.io/${{ env.REGISTRY_USER }}/ze-servicedbcommand \
             --env ${{ env.PR_ENV_NAME }} \
             --with-namespace
 
@@ -764,14 +776,29 @@ git push origin main
 
 Once you push to the `main` branch (or trigger it manually), the GitHub Actions workflow (`deploy.yml`) will automatically start provisioning your infrastructure and deploying your application.
 
-# ===== backend/Dockerfile
+# ===== auth-service/Dockerfile
 FROM node:20
 
-# ===== backend/index.js
-const express=require("express");const app=express();app.get("/api/x",(q,r)=>r.json([]));app.listen(3000)
+# ===== auth-service/app.js
+const express = require("express");
+const app = express();
+app.get("/auth/login", (req, res) => res.json({}));
+app.listen(4001);
 
-# ===== backend/package.json
-{"name":"b","dependencies":{"express":"^4"}}
+# ===== auth-service/package.json
+{"name":"auth","dependencies":{"express":"^4","pg":"^8"}}
+
+# ===== billing-service/Dockerfile
+FROM node:20
+
+# ===== billing-service/app.js
+const express = require("express");
+const app = express();
+app.get("/billing/invoices", (req, res) => res.json([]));
+app.listen(4002);
+
+# ===== billing-service/package.json
+{"name":"billing","dependencies":{"express":"^4","pg":"^8"}}
 
 # ===== deploy/.env
 # ============================================================================
@@ -798,6 +825,10 @@ DASHBOARD_PASSWORD_HASH='pbkdf2-sha256$i=600000$<PBKDF2>'
 # One value on one very long line. Copy it whole, including both -----markers.
 SSH_PRIVATE_KEY="<PEM>"
 
+AUTH_SERVICE_POSTGRES_PASSWORD="<SECRET>"
+
+BILLING_SERVICE_POSTGRES_PASSWORD="<SECRET>"
+
 # ===== deploy/.env.safety
 DATABASE_USER=
 DATABASE_TYPE=
@@ -807,20 +838,21 @@ AWS_REGION=us-west-2
 
 # ===== deploy/.flarops-state.json
 {
-  "projectName": "e-nocompose",
+  "projectName": "ze-servicedbcommand",
   "domain": "example.test",
   "dockerRegistry": "",
   "dockerProject": null,
-  "dockerRepository": "e-nocompose",
+  "dockerRepository": "ze-servicedbcommand",
   "registryUser": "testuser",
   "envKeysToPass": [
-    "DASHBOARD_PASSWORD_HASH"
+    "DASHBOARD_PASSWORD_HASH",
+    "AUTH_SERVICE_POSTGRES_PASSWORD",
+    "BILLING_SERVICE_POSTGRES_PASSWORD"
   ],
-  "backendPath": "backend",
+  "backendPath": null,
   "frontendPath": null,
-  "hasBackend": true,
+  "hasBackend": false,
   "hasFrontend": false,
-  "apiServesFrontend": false,
   "apiMigrationStep": null,
   "apiWorkers": 1,
   "apiDockerfile": "Dockerfile",
@@ -830,7 +862,111 @@ AWS_REGION=us-west-2
   "apiBuildArgs": null,
   "frontendBuildArgs": null,
   "awsRegion": "us-west-2",
-  "additionalServices": [],
+  "additionalServices": [
+    {
+      "name": "auth-service",
+      "relativePath": "auth-service",
+      "originalName": "auth-service",
+      "composeName": "auth-service",
+      "ports": [
+        4001
+      ],
+      "healthRoute": null,
+      "healthPort": null,
+      "usedEnvVars": [],
+      "dockerfile": "Dockerfile",
+      "exposedRoutes": [
+        {
+          "path": "/auth",
+          "stripPrefix": false
+        }
+      ],
+      "isMavenReactorModule": false,
+      "replicas": 1,
+      "oneShot": false,
+      "env": {},
+      "secretKeys": [
+        "AUTH_SERVICE_POSTGRES_PASSWORD"
+      ],
+      "forcedSecretKeys": [],
+      "extraSecretEnvMappings": [],
+      "suppressDirectIngress": false,
+      "db": {
+        "type": "postgres",
+        "image": "postgres:15",
+        "port": 5432,
+        "user": "postgres",
+        "name": "authdb",
+        "passwordKey": "AUTH_SERVICE_POSTGRES_PASSWORD",
+        "composeServiceName": "auth-db",
+        "command": [
+          "postgres",
+          "-c",
+          "wal_level=logical"
+        ]
+      },
+      "dbPasswordKey": null,
+      "dbUrlVars": [
+        {
+          "key": "DATABASE_URL",
+          "dbName": "authdb",
+          "scheme": "postgres"
+        }
+      ],
+      "springDatasourcePasswordSecretKey": null,
+      "buildArgs": null,
+      "command": null
+    },
+    {
+      "name": "billing-service",
+      "relativePath": "billing-service",
+      "originalName": "billing-service",
+      "composeName": "billing-service",
+      "ports": [
+        4002
+      ],
+      "healthRoute": null,
+      "healthPort": null,
+      "usedEnvVars": [],
+      "dockerfile": "Dockerfile",
+      "exposedRoutes": [
+        {
+          "path": "/billing",
+          "stripPrefix": false
+        }
+      ],
+      "isMavenReactorModule": false,
+      "replicas": 1,
+      "oneShot": false,
+      "env": {},
+      "secretKeys": [
+        "BILLING_SERVICE_POSTGRES_PASSWORD"
+      ],
+      "forcedSecretKeys": [],
+      "extraSecretEnvMappings": [],
+      "suppressDirectIngress": false,
+      "db": {
+        "type": "postgres",
+        "image": "postgres:15",
+        "port": 5432,
+        "user": "postgres",
+        "name": "billingdb",
+        "passwordKey": "BILLING_SERVICE_POSTGRES_PASSWORD",
+        "composeServiceName": "billing-db"
+      },
+      "dbPasswordKey": null,
+      "dbUrlVars": [
+        {
+          "key": "DATABASE_URL",
+          "dbName": "billingdb",
+          "scheme": "postgres"
+        }
+      ],
+      "springDatasourcePasswordSecretKey": null,
+      "buildArgs": null,
+      "command": null
+    }
+  ],
   "supportServices": [],
   "apiEnv": {},
   "frontendEnv": {},
@@ -864,7 +1000,13 @@ AWS_REGION=us-west-2
   "dbCommand": null,
   "dbPasswordKey": "DATABASE_PASSWORD",
   "hasDbPassword": false,
-  "dbUrlVars": [],
+  "dbUrlVars": [
+    {
+      "key": "DATABASE_URL",
+      "query": "",
+      "scheme": "postgres"
+    }
+  ],
   "apiRoutes": [
     {
       "path": "/api",
@@ -878,8 +1020,8 @@ AWS_REGION=us-west-2
 
 # ===== deploy/helm/Chart.yaml
 apiVersion: v2
-name: e-nocompose
-description: A Helm chart for e-nocompose generated by Flarops
+name: ze-servicedbcommand
+description: A Helm chart for ze-servicedbcommand generated by Flarops
 type: application
 version: 0.1.0
 appVersion: "1.0.0"
@@ -1010,46 +1152,148 @@ spec:
 {{- if kindIs "invalid" . -}}1{{- else -}}{{ . }}{{- end -}}
 {{- end -}}
 
-# ===== deploy/helm/templates/api.yaml
+# ===== deploy/helm/templates/auth-service-db.yaml
+{{- $svcDb := (index .Values.additionalServices (index .Values.additionalServicesIndices "auth-service" | int)).db }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: api
+  name: auth-service-db
   labels:
     app: {{ .Values.projectName }}
-    component: api
+    component: auth-service-db
 spec:
   selector:
     app: {{ .Values.projectName }}
-    component: api
+    component: auth-service-db
   ports:
-{{- range $port := .Values.apiPorts }}
-    - name: port-{{ $port }}
-      protocol: TCP
-      port: {{ $port }}
+    - protocol: TCP
+      port: {{ $svcDb.port }}
+      targetPort: {{ $svcDb.port }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: auth-service-db
+  labels:
+    app: {{ .Values.projectName }}
+    component: auth-service-db
+spec:
+  serviceName: auth-service-db
+  replicas: {{ include "flarops.replicas" $svcDb.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: auth-service-db
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: auth-service-db
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "password" ((.Values.database | default dict).password | default "")) }}
+    spec:
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+{{- if .Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml .Values.dataNodeSelector | indent 8 }}
+{{- end }}
+      containers:
+        - name: db
+          image: {{ $svcDb.image }}
+{{- if $svcDb.command }}
+          args:
+{{- range $arg := $svcDb.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: POSTGRES_USER
+              value: {{ $svcDb.user | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: AUTH_SERVICE_POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: {{ $svcDb.name | quote }}
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: {{ $svcDb.storage | default "10Gi" }}
+
+# ===== deploy/helm/templates/auth-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: auth-service
+  ports:
+{{- $serviceObj := index .Values.additionalServices (index .Values.additionalServicesIndices "auth-service" | int) }}
+{{- range $port := $serviceObj.ports }}
+    - port: {{ $port }}
       targetPort: {{ $port }}
+      protocol: TCP
+      name: http-{{ $port }}
 {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: api
+  name: auth-service
   labels:
     app: {{ .Values.projectName }}
-    component: api
+    component: auth-service
 spec:
-  replicas: {{ include "flarops.replicas" .Values.api.replicas }}
+  replicas: {{ include "flarops.replicas" (index .Values.additionalServices (index .Values.additionalServicesIndices "auth-service" | int)).replicas }}
   selector:
     matchLabels:
       app: {{ .Values.projectName }}
-      component: api
+      component: auth-service
   template:
     metadata:
       labels:
         app: {{ .Values.projectName }}
-        component: api
+        component: auth-service
       annotations:
-        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.api.secretKeys | default list) (list "DATABASE_PASSWORD")) "password" ((.Values.database | default dict).password | default "")) }}
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat ((index .Values.additionalServices (index .Values.additionalServicesIndices "auth-service" | int)).secretKeys | default list) (list )) "password" ((.Values.database | default dict).password | default "")) }}
     spec:
       automountServiceAccountToken: false
 {{- if $.Values.dataNodeSelector }}
@@ -1060,27 +1304,32 @@ spec:
       imagePullSecrets:
         - name: {{ .Values.projectName }}-registry
 {{- end }}
-
+{{- $serviceObj := index .Values.additionalServices (index .Values.additionalServicesIndices "auth-service" | int) }}
       containers:
-        - name: api
-          image: {{ if .Values.werf }}{{ .Values.werf.image.api }}{{ else }}{{ .Values.images.api | default "api:latest" }}{{ end }}
+        - name: auth-service
+          image: {{ if .Values.werf }}{{ index .Values.werf.image "auth-service" }}{{ else }}{{ (index (index .Values.additionalServices (index .Values.additionalServicesIndices "auth-service" | int)) "image") | default "auth-service:latest" }}{{ end }}
+{{- if $serviceObj.command }}
+          args:
+{{- range $arg := $serviceObj.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["NET_RAW"]
             seccompProfile:
               type: RuntimeDefault
-
-{{- if or .Values.api.env .Values.api.secretKeys false false false }}
+{{- if or $serviceObj.env $serviceObj.secretKeys false false false }}
           env:
-{{- if .Values.api.env }}
-{{- range $key, $value := .Values.api.env }}
+{{- if $serviceObj.env }}
+{{- range $key, $value := $serviceObj.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
 {{- end }}
 {{- end }}
-{{- if .Values.api.secretKeys }}
-{{- range $key := .Values.api.secretKeys }}
+{{- if $serviceObj.secretKeys }}
+{{- range $key := $serviceObj.secretKeys }}
             - name: {{ $key }}
               valueFrom:
                 secretKeyRef:
@@ -1088,27 +1337,250 @@ spec:
                   key: {{ $key }}
 {{- end }}
 {{- end }}
-
+            - name: AUTH_SERVICE_POSTGRES_PASSWORD_URLENCODED
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: AUTH_SERVICE_POSTGRES_PASSWORD_URLENCODED
+            - name: DATABASE_URL
+              value: "postgres://postgres:$(AUTH_SERVICE_POSTGRES_PASSWORD_URLENCODED)@auth-service-db:5432/authdb"
 {{- end }}
-{{- if .Values.api.healthRoute }}
+{{- if $serviceObj.healthRoute }}
           startupProbe:
             httpGet:
-              path: {{ .Values.api.healthRoute }}
-              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+              path: {{ $serviceObj.healthRoute }}
+              port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 30
           livenessProbe:
             httpGet:
-              path: {{ .Values.api.healthRoute }}
-              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+              path: {{ $serviceObj.healthRoute }}
+              port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: {{ .Values.api.healthRoute }}
-              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+              path: {{ $serviceObj.healthRoute }}
+              port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+{{- end }}
+
+# ===== deploy/helm/templates/billing-service-db.yaml
+{{- $svcDb := (index .Values.additionalServices (index .Values.additionalServicesIndices "billing-service" | int)).db }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-service-db
+  labels:
+    app: {{ .Values.projectName }}
+    component: billing-service-db
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: billing-service-db
+  ports:
+    - protocol: TCP
+      port: {{ $svcDb.port }}
+      targetPort: {{ $svcDb.port }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: billing-service-db
+  labels:
+    app: {{ .Values.projectName }}
+    component: billing-service-db
+spec:
+  serviceName: billing-service-db
+  replicas: {{ include "flarops.replicas" $svcDb.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: billing-service-db
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: billing-service-db
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "password" ((.Values.database | default dict).password | default "")) }}
+    spec:
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+{{- if .Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml .Values.dataNodeSelector | indent 8 }}
+{{- end }}
+      containers:
+        - name: db
+          image: {{ $svcDb.image }}
+{{- if $svcDb.command }}
+          args:
+{{- range $arg := $svcDb.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: POSTGRES_USER
+              value: {{ $svcDb.user | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: BILLING_SERVICE_POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: {{ $svcDb.name | quote }}
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: {{ $svcDb.storage | default "10Gi" }}
+
+# ===== deploy/helm/templates/billing-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-service
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: billing-service
+  ports:
+{{- $serviceObj := index .Values.additionalServices (index .Values.additionalServicesIndices "billing-service" | int) }}
+{{- range $port := $serviceObj.ports }}
+    - port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: TCP
+      name: http-{{ $port }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-service
+  labels:
+    app: {{ .Values.projectName }}
+    component: billing-service
+spec:
+  replicas: {{ include "flarops.replicas" (index .Values.additionalServices (index .Values.additionalServicesIndices "billing-service" | int)).replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: billing-service
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: billing-service
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat ((index .Values.additionalServices (index .Values.additionalServicesIndices "billing-service" | int)).secretKeys | default list) (list )) "password" ((.Values.database | default dict).password | default "")) }}
+    spec:
+      automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+{{- end }}
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+{{- $serviceObj := index .Values.additionalServices (index .Values.additionalServicesIndices "billing-service" | int) }}
+      containers:
+        - name: billing-service
+          image: {{ if .Values.werf }}{{ index .Values.werf.image "billing-service" }}{{ else }}{{ (index (index .Values.additionalServices (index .Values.additionalServicesIndices "billing-service" | int)) "image") | default "billing-service:latest" }}{{ end }}
+{{- if $serviceObj.command }}
+          args:
+{{- range $arg := $serviceObj.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+{{- if or $serviceObj.env $serviceObj.secretKeys false false false }}
+          env:
+{{- if $serviceObj.env }}
+{{- range $key, $value := $serviceObj.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+{{- if $serviceObj.secretKeys }}
+{{- range $key := $serviceObj.secretKeys }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: {{ $key }}
+{{- end }}
+{{- end }}
+            - name: BILLING_SERVICE_POSTGRES_PASSWORD_URLENCODED
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: BILLING_SERVICE_POSTGRES_PASSWORD_URLENCODED
+            - name: DATABASE_URL
+              value: "postgres://postgres:$(BILLING_SERVICE_POSTGRES_PASSWORD_URLENCODED)@billing-service-db:5432/billingdb"
+{{- end }}
+{{- if $serviceObj.healthRoute }}
+          startupProbe:
+            httpGet:
+              path: {{ $serviceObj.healthRoute }}
+              port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: {{ $serviceObj.healthRoute }}
+              port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: {{ $serviceObj.healthRoute }}
+              port: {{ $serviceObj.healthPort | default (index $serviceObj.ports 0) | default 80 }}
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
@@ -1374,15 +1846,24 @@ stringData:
   {{ $key }}: {{ $value | quote }}
 {{- end }}
 {{- end }}
+{{- with (index (.Values.env | default dict) "DATABASE_PASSWORD") }}
+  DATABASE_PASSWORD_URLENCODED: {{ include "flarops.urlencode" . | quote }}
+{{- end }}
+{{- with (index (.Values.env | default dict) "AUTH_SERVICE_POSTGRES_PASSWORD") }}
+  AUTH_SERVICE_POSTGRES_PASSWORD_URLENCODED: {{ include "flarops.urlencode" . | quote }}
+{{- end }}
+{{- with (index (.Values.env | default dict) "BILLING_SERVICE_POSTGRES_PASSWORD") }}
+  BILLING_SERVICE_POSTGRES_PASSWORD_URLENCODED: {{ include "flarops.urlencode" . | quote }}
+{{- end }}
 
 # ===== deploy/helm/values.yaml
-projectName: e-nocompose
+projectName: ze-servicedbcommand
 domain: "example.test"
-hasBackend: true
+hasBackend: false
 hasFrontend: false
 apiServesFrontend: false
 images:
-  api: api:latest
+
   db: postgres:18-alpine
 
 dbCloneSource: ""
@@ -1396,17 +1877,61 @@ database:
   storage: "10Gi"
   env:
     # KEY: "VALUE"
-api:
-  replicas: 1
-  healthRoute: null
-  healthPort: null
-  secretKeys:
 
-  env:
-    # KEY: "VALUE"
-apiPorts:
-  - 3000
 
+additionalServices:
+  - name: auth-service
+    image: auth-service:latest
+    env:
+      # KEY: "VALUE"
+    secretKeys:
+      - AUTH_SERVICE_POSTGRES_PASSWORD
+    ports:
+      - 4001
+    replicas: 1
+    healthRoute: null
+    healthPort: null
+    exposedRoutes:
+      - path: "/auth"
+    # false when this project's own API gateway already covers these routes -
+    # set to true to also expose them directly, bypassing the gateway.
+    exposeDirectly: true
+    db:
+      type: "postgres"
+      image: "postgres:15"
+      port: 5432
+      user: "postgres"
+      name: "authdb"
+      replicas: 1
+      storage: "10Gi"
+      command:
+        - "postgres"
+        - "-c"
+        - "wal_level=logical"
+  - name: billing-service
+    image: billing-service:latest
+    env:
+      # KEY: "VALUE"
+    secretKeys:
+      - BILLING_SERVICE_POSTGRES_PASSWORD
+    ports:
+      - 4002
+    replicas: 1
+    healthRoute: null
+    healthPort: null
+    exposedRoutes:
+      - path: "/billing"
+    # false when this project's own API gateway already covers these routes -
+    # set to true to also expose them directly, bypassing the gateway.
+    exposeDirectly: true
+    db:
+      type: "postgres"
+      image: "postgres:15"
+      port: 5432
+      user: "postgres"
+      name: "billingdb"
+      replicas: 1
+      storage: "10Gi"
 
 apiRoutes:
   - path: "/api"
@@ -1426,11 +1951,14 @@ imagePullSecret: null
 # Set by the PR-capsule workflow to the node a capsule is placed on. Leave
 # empty here.
 dataNodeSelector: {}
+additionalServicesIndices:
+  auth-service: 0
+  billing-service: 1
 
 # ===== deploy/terraform/main.tf
 terraform {
   backend "s3" {
-    bucket = "e-nocompose-remote-state"
+    bucket = "ze-servicedbcommand-remote-state"
     key    = "terraform.tfstate"
     region = "us-west-2"
     encrypt      = true
@@ -1768,7 +2296,7 @@ variable "aws_region" {
 variable "instance_name" {
   description = "Name tag for the EC2 instance"
   type        = string
-  default     = "e-nocompose-instance"
+  default     = "ze-servicedbcommand-instance"
 }
 
 # Worker nodes, by slot number. The PR-capsule workflow adds and removes them;
@@ -1812,22 +2340,85 @@ variable "domain" {
   default     = "example.test"
 }
 
+# ===== docker-compose.yml
+services:
+  auth-db:
+    image: postgres:15
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_PASSWORD: authpw
+      POSTGRES_DB: authdb
+  billing-db:
+    image: postgres:15
+    command: postgres -c max_connections=${BILLING_MAX_CONNECTIONS}
+    environment:
+      POSTGRES_PASSWORD: billpw
+      POSTGRES_DB: billingdb
+  auth-service:
+    build: ./auth-service
+    ports: ["4001:4001"]
+    environment:
+      DATABASE_URL: postgres://postgres:authpw@auth-db:5432/authdb
+    depends_on: [auth-db]
+  billing-service:
+    build: ./billing-service
+    ports: ["4002:4002"]
+    environment:
+      DATABASE_URL: postgres://postgres:billpw@billing-db:5432/billingdb
+    depends_on: [billing-db]
+
+# ===== expected-log.txt
+WARNING: These database commands in docker-compose use variables that compose fills from .env, so they were not carried: billing-service.db: "postgres -c max_connections=${BILLING_MAX_CONNECTIONS}"
+
 # ===== flarops.yaml
 # repository settings
 repositorySettings:
   registry: docker.io               # registry host; docker.io is Docker Hub
   project: null                     # namespace inside the registry (a Harbor project, an organisation);
                                     # null for none - on Docker Hub, your own user
-  repository: e-nocompose           # repository the images are pushed to
+  repository: ze-servicedbcommand   # repository the images are pushed to
 
-api:
+auth-service:
   dockerfile: Dockerfile
-  context: backend
+  context: auth-service
   replicas: 1
   ports:
-    - 3000
+    - 4001
+  secretEnvs:
+    AUTH_SERVICE_POSTGRES_PASSWORD: AUTH_SERVICE_POSTGRES_PASSWORD
   exposedRoutes:
-    - /api
+    - /auth
+  db:
+    type: postgres
+    image: "postgres:15"
+    port: 5432
+    user: postgres
+    name: authdb
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+    secretEnvs:
+      POSTGRES_PASSWORD: AUTH_SERVICE_POSTGRES_PASSWORD
+
+billing-service:
+  dockerfile: Dockerfile
+  context: billing-service
+  replicas: 1
+  ports:
+    - 4002
+  secretEnvs:
+    BILLING_SERVICE_POSTGRES_PASSWORD: BILLING_SERVICE_POSTGRES_PASSWORD
+  exposedRoutes:
+    - /billing
+  db:
+    type: postgres
+    image: "postgres:15"
+    port: 5432
+    user: postgres
+    name: billingdb
+    secretEnvs:
+      POSTGRES_PASSWORD: BILLING_SERVICE_POSTGRES_PASSWORD
 
 # ============================================================================
 # This file is the source of truth for what gets deployed. Edit it, then run
@@ -1934,14 +2525,18 @@ helm:
     - deploy/helm/flarops-ci-values.json
 
 # ===== werf.yaml
-project: e-nocompose
+project: ze-servicedbcommand
 configVersion: 1
 deploy:
   helmChartDir: deploy/helm
 ---
-image: api
+image: auth-service
 dockerfile: Dockerfile
-context: backend
+context: auth-service
+---
+image: billing-service
+dockerfile: Dockerfile
+context: billing-service
 ---
 image: dashboard
 dockerfile: Dockerfile

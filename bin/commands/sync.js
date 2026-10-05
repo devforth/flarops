@@ -168,6 +168,7 @@ function applyDatabase(config, decl, set) {
   if (decl.port) set(config, 'dbPort', Number(decl.port), 'database.port');
   if (decl.user) set(config, 'dbUser', String(decl.user), 'database.user');
   if (decl.name) set(config, 'dbName', String(decl.name), 'database.name');
+  set(config, 'dbCommand', decl.command ? asList(decl.command).map(String) : null, 'database.command');
   // Every env name a database image reads its password under points at one Secret key, which is
   // all the chart needs. A second distinct key cannot be mounted; unmountedSecretKeys reports it.
   const distinctKeys = [...new Set(Object.values(decl.secretEnvs || {}).map(String))];
@@ -219,6 +220,8 @@ function applyService(service, decl, set, label) {
     const db = { ...(service.db || {}), ...decl.db };
     const dbKeys = Object.values(decl.db.secretEnvs || {});
     if (dbKeys.length > 0) db.passwordKey = String(dbKeys[0]);
+    if (decl.db.command) db.command = asList(decl.db.command).map(String);
+    else delete db.command;
     delete db.secretEnvs;
     set(service, 'db', db, `${label}.db`);
   }
@@ -232,6 +235,7 @@ function normalizeState(config) {
   config.apiReplicas = config.apiReplicas || SERVICE_DEFAULTS.replicas;
   config.frontendReplicas = config.frontendReplicas || SERVICE_DEFAULTS.replicas;
   config.dbReplicas = config.dbReplicas || SERVICE_DEFAULTS.replicas;
+  if (config.dbCommand === undefined) config.dbCommand = null;
   for (const service of [...(config.additionalServices || []), ...(config.supportServices || [])]) {
     service.replicas = service.replicas || SERVICE_DEFAULTS.replicas;
   }

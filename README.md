@@ -266,6 +266,22 @@ reporting:
 
 It gets its own StatefulSet and its own storage.
 
+### Database server settings
+
+A database takes server settings the same way a service takes its command — `command:` replaces the image's CMD and keeps its entrypoint, exactly as in docker-compose. It works on the top-level `database:` block and on a service's `db:` block:
+
+```yaml
+database:
+  image: "postgres:18"
+  type: postgres
+  command:
+    - postgres
+    - -c
+    - wal_level=logical
+```
+
+`init` carries a database's `command:` over from docker-compose. A command that uses `${VAR}` is not carried — compose fills those in from `.env`, a pod cannot — and `init` says so; write it with the values themselves.
+
 ## Secrets, end to end
 
 This is the one part you do by hand, so it is worth seeing whole.

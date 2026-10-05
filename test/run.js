@@ -254,7 +254,7 @@ except yaml.YAMLError as e:
 blocks = dict(declared)
 for name, b in declared.items():
     if isinstance(b, dict) and isinstance(b.get('db'), dict):
-        blocks[name + '-db'] = {'secretEnvs': b['db'].get('secretEnvs') or {}}
+        blocks[name + '-db'] = {'secretEnvs': b['db'].get('secretEnvs') or {}, 'command': b['db'].get('command')}
 
 bad = []
 for doc in yaml.safe_load_all(open(sys.argv[2])):
@@ -264,6 +264,11 @@ for doc in yaml.safe_load_all(open(sys.argv[2])):
     # declares, so it is deliberately absent from flarops.yaml.
     if name == 'flarops-dashboard': continue
     spec = (doc.get('spec') or {}).get('template', {}).get('spec') or {}
+    # command: is what the container runs; the chart renders it as args.
+    if isinstance(blocks.get(name), dict) and spec.get('containers'):
+        want = [str(a) for a in (blocks[name].get('command') or [])]
+        have = [str(a) for a in (spec['containers'][0].get('args') or [])]
+        if want != have: bad.append(name + ': flarops.yaml command ' + json.dumps(want) + ', chart args ' + json.dumps(have))
     refs = {}
     for c in (spec.get('containers') or []):
         for e in (c.get('env') or []):

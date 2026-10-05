@@ -1533,6 +1533,25 @@ AWS_REGION=${awsRegion}
     }
   }
 
+  // A database's compose `command:` carries its server settings (postgres -c wal_level=logical).
+  // Compose fills ${VAR} from .env, which a pod's args cannot; such a command is left to flarops.yaml.
+  const dbCommandWarnings = [];
+  const composeDbCommand = async (composeServiceName, label) => {
+    if (!composeServiceName) return null;
+    try {
+      const composeServices = await parseComposeServices(currentDir);
+      const block = composeServices[composeServiceName] && composeServices[composeServiceName].block;
+      const args = block ? extractCommand(block) : null;
+      if (!args) return null;
+      if (args.some(a => /\$\{?[A-Za-z_]/.test(a))) {
+        dbCommandWarnings.push(`${label}: "${args.join(' ')}"`);
+        return null;
+      }
+      return args;
+    } catch (e) { return null; }
+  };
+  const dbCommand = dbInfo.hasDb ? await composeDbCommand(dbInfo.composeServiceName, 'database') : null;
+
   // Bootstrap SQL mounted into /docker-entrypoint-initdb.d is often the only schema definition.
   let dbInitFiles = null;
   const dbInitWarnings = [];
@@ -1704,6 +1723,8 @@ AWS_REGION=${awsRegion}
       passwordKey,
       composeServiceName: serviceDb.composeServiceName || null
     };
+    const ownDbCommand = await composeDbCommand(serviceDb.composeServiceName, `${s.name}.db`);
+    if (ownDbCommand) s.db.command = ownDbCommand;
 
     // Spring Data MongoDB: SPRING_DATA_MONGODB_URI, built against the service's own database.
     const isSpringMongo = await detectSpringDataMongoConfig(s.path);
@@ -2087,6 +2108,9 @@ AWS_REGION=${awsRegion}
   if (dbInitFiles) {
     console.log(`\x1b[34mINFO: Carried the database's docker-compose bootstrap scripts into the chart as a ConfigMap: ${Object.keys(dbInitFiles).join(', ')}. They run on the database's FIRST boot only - an existing volume is never re-initialised, so an already-deployed database needs its PVC removed (or the scripts applied by hand) before they take effect.\x1b[0m`);
   }
+  if (dbCommandWarnings.length > 0) {
+    console.warn(`\x1b[33mWARNING: These database commands in docker-compose use variables that compose fills from .env, so they were not carried: ${dbCommandWarnings.join('; ')}. Write the command with the values themselves under "command:" in flarops.yaml and run "flarops sync".\x1b[0m`);
+  }
   if (dbInitWarnings.length > 0) {
     console.warn(`\x1b[33mWARNING: The database mounts these files into /docker-entrypoint-initdb.d in docker-compose, but they could NOT be carried into the cluster: ${dbInitWarnings.join('; ')}. Without them the database will come up with no schema. Apply them yourself, or provide them as a ConfigMap/Secret volume.\x1b[0m`);
   }
@@ -2179,6 +2203,7 @@ AWS_REGION=${awsRegion}
     dbHasLocalDockerfile: dbInfo.hasDb ? dbInfo.hasLocalDockerfile : false,
     dbLocalDockerfile: dbInfo.hasDb ? dbInfo.localDbDockerfile : null,
     dbContext: dbInfo.hasDb ? dbInfo.dbContext : null,
+    dbCommand,
     dbPasswordKey: finalDbPasswordKey,
     hasDbPassword,
     dbUrlVars: Object.values(foundDbUrls),

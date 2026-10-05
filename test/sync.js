@@ -159,6 +159,30 @@ broken:
     check('restoring the defaults goes back to Docker Hub', r.status === 0 && read(dir, '.github/workflows/deploy.yml').includes('--repo docker.io/${{ env.REGISTRY_USER }}/'), r.err || r.out);
   }
 
+  // 3a''. Database server settings: command: becomes the database container's args.
+  {
+    const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+    const withCommand = original.replace(/^(database:\n(?:  .*\n)*?  type: .*\n)/m,
+      '$1  command:\n    - postgres\n    - -c\n    - wal_level=logical\n');
+    check('the database block has a type line to extend', withCommand !== original);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), withCommand);
+    r = runSync(dir);
+    check('sync applies a database command', r.status === 0 && /database\.command/.test(r.out), r.err || r.out);
+    check('values.yaml carries it for the database',
+      /^database:\n(?:  .*\n)*?  command:\n    - "postgres"\n    - "-c"\n    - "wal_level=logical"$/m.test(read(dir, 'deploy/helm/values.yaml')),
+      read(dir, 'deploy/helm/values.yaml').match(/^database:\n(?:  .*\n)*/m));
+    if (helmRenders) {
+      const err = helmRenders(dir);
+      check('the chart renders the database command as args', !err, err);
+    }
+    r = runSync(dir);
+    check('an unchanged database command reports nothing', /nothing to do/.test(r.out), r.out);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('removing the database command takes it out of values.yaml',
+      r.status === 0 && !/^database:\n(?:  .*\n)*?  command:/m.test(read(dir, 'deploy/helm/values.yaml')), r.err || r.out);
+  }
+
   // 3b'. Values pasted unescaped into file names and workflows must be refused.
   const hostile = [
     ['a service name outside the chart', '"../../../.github/workflows/pwn":\n  image: "busybox:1"\n', /not a valid service name/],

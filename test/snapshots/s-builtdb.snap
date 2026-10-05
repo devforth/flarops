@@ -909,6 +909,7 @@ AWS_REGION=us-west-2
   "dbHasLocalDockerfile": true,
   "dbLocalDockerfile": "Dockerfile",
   "dbContext": "inventory/postgres",
+  "dbCommand": null,
   "dbPasswordKey": "DATABASE_PASSWORD",
   "hasDbPassword": true,
   "dbUrlVars": [],
@@ -1452,6 +1453,12 @@ spec:
       containers:
         - name: db
           image: {{ if and .Values.werf .Values.werf.image.db }}{{ .Values.werf.image.db }}{{ else }}{{ .Values.images.db | default "db:latest" }}{{ end }}
+{{- if (.Values.database | default dict).command }}
+          args:
+{{- range $arg := .Values.database.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -2099,6 +2106,10 @@ database:
 #     port: 5432
 #     user: "postgres"
 #     name: "mydb"
+#     command:                              # server settings, as in compose;
+#       - "postgres"                        #  the same field works on the
+#       - "-c"                              #  top-level database: block
+#       - "wal_level=logical"
 #
 # ============================================================================
 

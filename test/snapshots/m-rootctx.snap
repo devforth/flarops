@@ -913,6 +913,7 @@ AWS_REGION=us-west-2
   "dbHasLocalDockerfile": false,
   "dbLocalDockerfile": null,
   "dbContext": null,
+  "dbCommand": null,
   "dbPasswordKey": "DATABASE_PASSWORD",
   "hasDbPassword": false,
   "dbUrlVars": [],
@@ -1112,6 +1113,12 @@ spec:
       containers:
         - name: db
           image: {{ $svcDb.image }}
+{{- if $svcDb.command }}
+          args:
+{{- range $arg := $svcDb.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -2112,6 +2119,10 @@ api-1:
 #     port: 5432
 #     user: "postgres"
 #     name: "mydb"
+#     command:                              # server settings, as in compose;
+#       - "postgres"                        #  the same field works on the
+#       - "-c"                              #  top-level database: block
+#       - "wal_level=logical"
 #
 # ============================================================================
 

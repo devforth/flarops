@@ -175,6 +175,12 @@ spec:
       containers:
         - name: db
           image: {{ if and .Values.werf .Values.werf.image.db }}{{ .Values.werf.image.db }}{{ else }}{{ .Values.images.db | default "db:latest" }}{{ end }}
+{{- if (.Values.database | default dict).command }}
+          args:
+{{- range $arg := .Values.database.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

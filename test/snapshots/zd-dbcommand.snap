@@ -32,12 +32,17 @@
   deploy/helm/templates/_helpers.tpl
   deploy/helm/templates/api.yaml
   deploy/helm/templates/dashboard.yaml
+  deploy/helm/templates/database.yaml
+  deploy/helm/templates/frontend.yaml
   deploy/helm/templates/registry-secret.yaml
   deploy/helm/templates/secret.yaml
   deploy/helm/values.yaml
   deploy/terraform/main.tf
   deploy/terraform/variables.tf
+  docker-compose.yml
   flarops.yaml
+  frontend/Dockerfile
+  frontend/package.json
   werf-giterminism.yaml
   werf.yaml
 
@@ -54,12 +59,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: flarops-deploy-e-nocompose
+  group: flarops-deploy-zd-dbcommand
   cancel-in-progress: false
 
 env:
   AWS_REGION: us-west-2
-  PROJECT_NAME: e-nocompose
+  PROJECT_NAME: zd-dbcommand
   REGISTRY_USER: testuser
   BASE_DOMAIN: example.test
 
@@ -188,7 +193,9 @@ jobs:
 
       - name: Deploy application with Werf
         env:
+          SECRET_ENV_POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
+          SECRET_DB_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
           REGISTRY_SERVER: https://index.docker.io/v1/
         run: |
@@ -198,7 +205,7 @@ jobs:
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
-            --repo docker.io/${{ env.REGISTRY_USER }}/e-nocompose \
+            --repo docker.io/${{ env.REGISTRY_USER }}/zd-dbcommand \
             --env production \
             --values deploy/helm/flarops-ci-values.json
 
@@ -218,13 +225,15 @@ concurrency:
 
 env:
   AWS_REGION: us-west-2
-  PROJECT_NAME: e-nocompose
+  PROJECT_NAME: zd-dbcommand
   REGISTRY_USER: testuser
   BASE_DOMAIN: example.test
-  MAIN_NAMESPACE: e-nocompose-production
-  PR_NAMESPACE: e-nocompose-pr-${{ github.event.pull_request.number }}
+  MAIN_NAMESPACE: zd-dbcommand-production
+  PR_NAMESPACE: zd-dbcommand-pr-${{ github.event.pull_request.number }}
   PR_ENV_NAME: pr-${{ github.event.pull_request.number }}
   PR_DOMAIN: pr-${{ github.event.pull_request.number }}.example.test
+  DB_USER: "appuser"
+  DB_NAME: "appdb"
 
 
 jobs:
@@ -383,8 +392,8 @@ jobs:
           REQUIRED_MI=$(kubectl top pods -n "${{ env.MAIN_NAMESPACE }}" --no-headers 2>/dev/null \
             | awk '$1 !~ /^flarops-(dashboard|node-agent)/ { v = $3; if (v ~ /Gi$/) { sub(/Gi$/, "", v); v = v * 1024 } else if (v ~ /Ki$/) { sub(/Ki$/, "", v); v = v / 1024 } else { sub(/Mi$/, "", v) } s += v } END { printf "%d", s }' || true)
           if [ -z "$REQUIRED_MI" ] || [ "$REQUIRED_MI" -lt 64 ]; then
-            echo "No usable measurement of ${{ env.MAIN_NAMESPACE }} yet - planning with the generated estimate of 256 MiB."
-            REQUIRED_MI=256
+            echo "No usable measurement of ${{ env.MAIN_NAMESPACE }} yet - planning with the generated estimate of 640 MiB."
+            REQUIRED_MI=640
           else
             echo "Planning this capsule at $REQUIRED_MI MiB - what the same stack uses in ${{ env.MAIN_NAMESPACE }} right now."
           fi
@@ -525,7 +534,9 @@ jobs:
           password: ${{ secrets.REGISTRY_PASSWORD }}
       - name: Deploy application with Werf
         env:
+          SECRET_ENV_POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
+          SECRET_DB_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
           REGISTRY_SERVER: https://index.docker.io/v1/
         run: |
@@ -535,11 +546,36 @@ jobs:
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
-            --repo docker.io/${{ env.REGISTRY_USER }}/e-nocompose \
+            --repo docker.io/${{ env.REGISTRY_USER }}/zd-dbcommand \
             --env ${{ env.PR_ENV_NAME }} \
             --set domain=${{ env.PR_DOMAIN }} \
             --set "dataNodeSelector.kubernetes\.io/hostname=$TARGET_NODE" \
             --values deploy/helm/flarops-ci-values.json
+
+      - name: Database Clone & Restore
+        run: |
+          set -euo pipefail
+
+          echo "Cloning database from ${{ env.MAIN_NAMESPACE }} to ${{ env.PR_NAMESPACE }}..."
+
+          echo "Waiting for PR database to be ready..."
+          kubectl rollout status statefulset/database -n ${{ env.PR_NAMESPACE }} --timeout=180s
+
+          echo "Checking if PR database was already cloned..."
+          if ! kubectl get configmap flarops-db-cloned -n ${{ env.PR_NAMESPACE }} > /dev/null 2>&1; then
+            echo "Database has not been cloned yet, streaming dump straight into the PR database..."
+            kubectl exec -n ${{ env.MAIN_NAMESPACE }} database-0 -- sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' \
+            | kubectl exec -i -n ${{ env.PR_NAMESPACE }} database-0 -- sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+
+            echo "Marking database as cloned..."
+            kubectl create configmap flarops-db-cloned -n ${{ env.PR_NAMESPACE }}
+
+            echo "Restarting API pod to pick up restored data..."
+            kubectl rollout restart deployment api -n ${{ env.PR_NAMESPACE }} || true
+            kubectl rollout status deployment/api -n ${{ env.PR_NAMESPACE }} --timeout=120s || true
+          else
+            echo "Database was already cloned, skipping clone to preserve data."
+          fi
 
   cleanup-capsule:
     name: Teardown PR Capsule
@@ -648,7 +684,7 @@ jobs:
         continue-on-error: true
         run: |
           werf dismiss \
-            --repo docker.io/${{ env.REGISTRY_USER }}/e-nocompose \
+            --repo docker.io/${{ env.REGISTRY_USER }}/zd-dbcommand \
             --env ${{ env.PR_ENV_NAME }} \
             --with-namespace
 
@@ -768,10 +804,10 @@ Once you push to the `main` branch (or trigger it manually), the GitHub Actions 
 FROM node:20
 
 # ===== backend/index.js
-const express=require("express");const app=express();app.get("/api/x",(q,r)=>r.json([]));app.listen(3000)
+const express=require("express");const app=express();app.get("/api/users",(q,r)=>r.json([]));app.listen(process.env.PORT||4000)
 
 # ===== backend/package.json
-{"name":"b","dependencies":{"express":"^4"}}
+{"name":"b","dependencies":{"express":"^4","pg":"^8"}}
 
 # ===== deploy/.env
 # ============================================================================
@@ -790,6 +826,7 @@ const express=require("express");const app=express();app.get("/api/x",(q,r)=>r.j
 AWS_ACCESS_KEY_ID="AKIATEST"
 AWS_SECRET_ACCESS_KEY="secrettest"
 REGISTRY_PASSWORD="testpass"
+POSTGRES_PASSWORD="<SECRET>"
 
 # --- Generated by Flarops for the deployment dashboard ----------------------
 DASHBOARD_PASSWORD_HASH='pbkdf2-sha256$i=600000$<PBKDF2>'
@@ -800,26 +837,27 @@ SSH_PRIVATE_KEY="<PEM>"
 
 # ===== deploy/.env.safety
 DATABASE_USER=
-DATABASE_TYPE=
+DATABASE_TYPE=postgres
 DOCKER_REGISTRY=
 DOMAIN=example.test
 AWS_REGION=us-west-2
 
 # ===== deploy/.flarops-state.json
 {
-  "projectName": "e-nocompose",
+  "projectName": "zd-dbcommand",
   "domain": "example.test",
   "dockerRegistry": "",
   "dockerProject": null,
-  "dockerRepository": "e-nocompose",
+  "dockerRepository": "zd-dbcommand",
   "registryUser": "testuser",
   "envKeysToPass": [
+    "POSTGRES_PASSWORD",
     "DASHBOARD_PASSWORD_HASH"
   ],
   "backendPath": "backend",
-  "frontendPath": null,
+  "frontendPath": "frontend",
   "hasBackend": true,
-  "hasFrontend": false,
+  "hasFrontend": true,
   "apiServesFrontend": false,
   "apiMigrationStep": null,
   "apiWorkers": 1,
@@ -832,9 +870,15 @@ AWS_REGION=us-west-2
   "awsRegion": "us-west-2",
   "additionalServices": [],
   "supportServices": [],
-  "apiEnv": {},
+  "apiEnv": {
+    "PORT": "4000",
+    "DB_HOST": "database",
+    "DB_PORT": "5432"
+  },
   "frontendEnv": {},
-  "apiUsedEnvVars": [],
+  "apiUsedEnvVars": [
+    "PORT"
+  ],
   "frontendUsedEnvVars": [],
   "apiSecretKeys": [],
   "frontendSecretKeys": [],
@@ -842,28 +886,32 @@ AWS_REGION=us-west-2
   "frontendExtraSecretEnvMappings": [],
   "images": {
     "api": "api:latest",
-    "db": "postgres:18-alpine",
+    "db": "postgres:18",
     "frontend": "frontend:latest"
   },
   "dbCloneSource": "",
   "dbInitFiles": null,
-  "hasDb": false,
+  "hasDb": true,
   "apiPorts": [
-    3000
+    4000
   ],
   "frontendPorts": [
     80
   ],
-  "dbType": null,
-  "dbPort": null,
-  "dbUser": "postgres",
+  "dbType": "postgres",
+  "dbPort": 5432,
+  "dbUser": "appuser",
   "dbName": "appdb",
   "dbHasLocalDockerfile": false,
-  "dbLocalDockerfile": null,
-  "dbContext": null,
-  "dbCommand": null,
-  "dbPasswordKey": "DATABASE_PASSWORD",
-  "hasDbPassword": false,
+  "dbCommand": [
+    "postgres",
+    "-c",
+    "wal_level=logical",
+    "-c",
+    "max_replication_slots=10"
+  ],
+  "dbPasswordKey": "POSTGRES_PASSWORD",
+  "hasDbPassword": true,
   "dbUrlVars": [],
   "apiRoutes": [
     {
@@ -878,8 +926,8 @@ AWS_REGION=us-west-2
 
 # ===== deploy/helm/Chart.yaml
 apiVersion: v2
-name: e-nocompose
-description: A Helm chart for e-nocompose generated by Flarops
+name: zd-dbcommand
+description: A Helm chart for zd-dbcommand generated by Flarops
 type: application
 version: 0.1.0
 appVersion: "1.0.0"
@@ -1049,7 +1097,7 @@ spec:
         app: {{ .Values.projectName }}
         component: api
       annotations:
-        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.api.secretKeys | default list) (list "DATABASE_PASSWORD")) "password" ((.Values.database | default dict).password | default "")) }}
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.api.secretKeys | default list) (list "POSTGRES_PASSWORD")) "password" ((.Values.database | default dict).password | default "")) }}
     spec:
       automountServiceAccountToken: false
 {{- if $.Values.dataNodeSelector }}
@@ -1071,7 +1119,7 @@ spec:
             seccompProfile:
               type: RuntimeDefault
 
-{{- if or .Values.api.env .Values.api.secretKeys false false false }}
+{{- if or .Values.api.env .Values.api.secretKeys true false false }}
           env:
 {{- if .Values.api.env }}
 {{- range $key, $value := .Values.api.env }}
@@ -1089,6 +1137,11 @@ spec:
 {{- end }}
 {{- end }}
 
+            - name: {{ "POSTGRES_PASSWORD" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: {{ "POSTGRES_PASSWORD" }}
 {{- end }}
 {{- if .Values.api.healthRoute }}
           startupProbe:
@@ -1345,6 +1398,230 @@ spec:
               number: 80
 {{- end }}
 
+# ===== deploy/helm/templates/database.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  labels:
+    app: {{ .Values.projectName }}
+    component: database
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: database
+  ports:
+    - protocol: TCP
+      port: {{ .Values.dbPort | default 5432 }}
+      targetPort: {{ .Values.dbPort | default 5432 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+  labels:
+    app: {{ .Values.projectName }}
+    component: database
+spec:
+  serviceName: database
+  replicas: {{ include "flarops.replicas" .Values.database.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: database
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: database
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "password" ((.Values.database | default dict).password | default "")) }}
+    spec:
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+{{- if .Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml .Values.dataNodeSelector | indent 8 }}
+{{- end }}
+{{- if .Values.dbCloneSource }}
+      initContainers:
+        - name: db-clone
+          image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
+          command: ["curl"]
+          args: ["--fail", "--silent", "--show-error", "--location", "--proto", "=https", "-o", "/docker-entrypoint-initdb.d/dump.sql", "{{ .Values.dbCloneSource }}"]
+          volumeMounts:
+            - name: db-init
+              mountPath: /docker-entrypoint-initdb.d
+{{- end }}
+      containers:
+        - name: db
+          image: {{ if and .Values.werf .Values.werf.image.db }}{{ .Values.werf.image.db }}{{ else }}{{ .Values.images.db | default "db:latest" }}{{ end }}
+{{- if (.Values.database | default dict).command }}
+          args:
+{{- range $arg := .Values.database.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.database.user | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: {{ .Values.database.name | quote }}
+{{- if .Values.database.env }}
+{{- range $key, $value := .Values.database.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+{{- if .Values.dbCloneSource }}
+            - name: db-init
+              mountPath: /docker-entrypoint-initdb.d
+{{- end }}
+{{- if .Values.dbCloneSource }}
+      volumes:
+        - name: db-init
+          emptyDir: {}
+{{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: {{ .Values.database.storage | default "10Gi" }}
+
+# ===== deploy/helm/templates/frontend.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels:
+    app: {{ .Values.projectName }}
+    component: frontend
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: frontend
+  ports:
+{{- range $i, $port := .Values.frontendPorts }}
+    - name: port-{{ $port }}
+      protocol: TCP
+      port: {{ $port }}
+      targetPort: {{ $port }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    app: {{ .Values.projectName }}
+    component: frontend
+spec:
+  replicas: {{ include "flarops.replicas" .Values.frontend.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: frontend
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: frontend
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.frontend.secretKeys | default list) (list ))) }}
+    spec:
+      automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+{{- end }}
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+      containers:
+        - name: frontend
+          image: {{ if .Values.werf }}{{ .Values.werf.image.frontend }}{{ else }}{{ .Values.images.frontend | default "frontend:latest" }}{{ end }}
+{{- if .Values.frontend.command }}
+          args:
+{{- range $arg := .Values.frontend.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+{{- if or .Values.frontend.env .Values.frontend.secretKeys false }}
+          env:
+{{- if .Values.frontend.env }}
+{{- range $key, $value := .Values.frontend.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+{{- if .Values.frontend.secretKeys }}
+{{- range $key := .Values.frontend.secretKeys }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: {{ $key }}
+{{- end }}
+{{- end }}
+{{- end }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: {{ index .Values.frontendPorts 0 | default 80 }}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /
+              port: {{ index .Values.frontendPorts 0 | default 80 }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
 # ===== deploy/helm/templates/registry-secret.yaml
 {{- if and .Values.imagePullSecret (kindIs "map" .Values.imagePullSecret) }}
 {{- $reg := .Values.imagePullSecret }}
@@ -1376,24 +1653,30 @@ stringData:
 {{- end }}
 
 # ===== deploy/helm/values.yaml
-projectName: e-nocompose
+projectName: zd-dbcommand
 domain: "example.test"
 hasBackend: true
-hasFrontend: false
+hasFrontend: true
 apiServesFrontend: false
 images:
   api: api:latest
-  db: postgres:18-alpine
-
+  db: postgres:18
+  frontend: frontend:latest
 dbCloneSource: ""
-dbType: null
-dbPort: null
+dbType: "postgres"
+dbPort: 5432
 database:
-  user: "postgres"
+  user: "appuser"
   password: null
   name: "appdb"
   replicas: 1
   storage: "10Gi"
+  command:
+    - "postgres"
+    - "-c"
+    - "wal_level=logical"
+    - "-c"
+    - "max_replication_slots=10"
   env:
     # KEY: "VALUE"
 api:
@@ -1403,10 +1686,19 @@ api:
   secretKeys:
 
   env:
-    # KEY: "VALUE"
+    PORT: "4000"
+    DB_HOST: "database"
+    DB_PORT: "5432"
 apiPorts:
-  - 3000
+  - 4000
+frontend:
+  replicas: 1
+  secretKeys:
 
+  env:
+    # KEY: "VALUE"
+frontendPorts:
+  - 80
 
 apiRoutes:
   - path: "/api"
@@ -1430,7 +1722,7 @@ dataNodeSelector: {}
 # ===== deploy/terraform/main.tf
 terraform {
   backend "s3" {
-    bucket = "e-nocompose-remote-state"
+    bucket = "zd-dbcommand-remote-state"
     key    = "terraform.tfstate"
     region = "us-west-2"
     encrypt      = true
@@ -1768,7 +2060,7 @@ variable "aws_region" {
 variable "instance_name" {
   description = "Name tag for the EC2 instance"
   type        = string
-  default     = "e-nocompose-instance"
+  default     = "zd-dbcommand-instance"
 }
 
 # Worker nodes, by slot number. The PR-capsule workflow adds and removes them;
@@ -1812,22 +2104,76 @@ variable "domain" {
   default     = "example.test"
 }
 
+# ===== docker-compose.yml
+services:
+  db:
+    image: postgres:18
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+    environment:
+      POSTGRES_PASSWORD: pw
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+  api:
+    build: ./backend
+    ports: ["4000:4000"]
+    environment:
+      PORT: 4000
+      DB_HOST: db
+    depends_on: [db]
+  frontend:
+    build: ./frontend
+    ports: ["80:80"]
+
 # ===== flarops.yaml
 # repository settings
 repositorySettings:
   registry: docker.io               # registry host; docker.io is Docker Hub
   project: null                     # namespace inside the registry (a Harbor project, an organisation);
                                     # null for none - on Docker Hub, your own user
-  repository: e-nocompose           # repository the images are pushed to
+  repository: zd-dbcommand          # repository the images are pushed to
 
 api:
   dockerfile: Dockerfile
   context: backend
   replicas: 1
   ports:
-    - 3000
+    - 4000
+  env:
+    PORT: "4000"
+    DB_HOST: database
+    DB_PORT: "5432"
+  secretEnvs:
+    POSTGRES_PASSWORD: POSTGRES_PASSWORD
   exposedRoutes:
     - /api
+
+frontend:
+  dockerfile: Dockerfile
+  context: frontend
+  replicas: 1
+  ports:
+    - 80
+
+database:
+  image: "postgres:18"
+  replicas: 1
+  port: 5432
+  user: appuser
+  name: appdb
+  type: postgres
+  command:
+    - postgres
+    - -c
+    - wal_level=logical
+    - -c
+    - max_replication_slots=10
+  secretEnvs:
+    POSTGRES_PASSWORD: POSTGRES_PASSWORD
 
 # ============================================================================
 # This file is the source of truth for what gets deployed. Edit it, then run
@@ -1922,6 +2268,12 @@ api:
 #
 # ============================================================================
 
+# ===== frontend/Dockerfile
+FROM nginx
+
+# ===== frontend/package.json
+{"name":"f","dependencies":{"react":"^18"}}
+
 # ===== werf-giterminism.yaml
 giterminismConfigVersion: 1
 config:
@@ -1934,7 +2286,7 @@ helm:
     - deploy/helm/flarops-ci-values.json
 
 # ===== werf.yaml
-project: e-nocompose
+project: zd-dbcommand
 configVersion: 1
 deploy:
   helmChartDir: deploy/helm
@@ -1942,6 +2294,10 @@ deploy:
 image: api
 dockerfile: Dockerfile
 context: backend
+---
+image: frontend
+dockerfile: Dockerfile
+context: frontend
 ---
 image: dashboard
 dockerfile: Dockerfile

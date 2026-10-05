@@ -157,6 +157,8 @@ function serviceBlock(name, opts) {
     lines.push(`    port: ${opts.db.port}`);
     lines.push(`    user: ${yamlScalar(opts.db.user)}`);
     lines.push(`    name: ${yamlScalar(opts.db.name)}`);
+    const dbCmdStr = renderCommand(opts.db.command, 6);
+    if (dbCmdStr) lines.push('    command:', dbCmdStr);
     if (opts.db.passwordKey) {
       const names = databaseSecretEnvNames(opts.db.type, opts.db.user);
       if (names.length > 0) {
@@ -270,6 +272,10 @@ const TEMPLATE_COMMENT = `
 #     port: 5432
 #     user: "postgres"
 #     name: "mydb"
+#     command:                              # server settings, as in compose;
+#       - "postgres"                        #  the same field works on the
+#       - "-c"                              #  top-level database: block
+#       - "wal_level=logical"
 #
 # ============================================================================`.trimStart();
 
@@ -342,6 +348,8 @@ function generateFlaropsYaml(config, {
     if (config.dbUser) dbLines.push(`  user: ${yamlScalar(config.dbUser)}`);
     if (config.dbName) dbLines.push(`  name: ${yamlScalar(config.dbName)}`);
     if (config.dbType) dbLines.push(`  type: ${yamlScalar(config.dbType)}`);
+    const dbCmdStr = renderCommand(config.dbCommand, 4);
+    if (dbCmdStr) dbLines.push('  command:', dbCmdStr);
     const dbSecretNames = config.dbPasswordKey
       ? databaseSecretEnvNames(config.dbType, config.dbUser)
       : [];
