@@ -1,5 +1,6 @@
 const ciSsh = require('./ciSsh');
 const { registrySettings, imageRepository, isDockerHub } = require('../utils/registry.js');
+const werfCleanupStep = require('./werfCleanup.js');
 
 module.exports = function deployYmlTemplate(config) {
   const registry = registrySettings(config);
@@ -133,10 +134,6 @@ ${secretEnvBlock}${dbPasswordEnvLine}          SECRET_REGISTRY_PASSWORD: \${{ se
             --repo ${repoString} \\
             --env production \\
             --values deploy/helm/flarops-ci-values.json${onDockerHub ? '' : `
-
-      - name: Cleanup old images
-        run: |
-          werf cleanup \\
-            --repo ${repoString}`}
+${werfCleanupStep(repoString)}`}
 `;
 }

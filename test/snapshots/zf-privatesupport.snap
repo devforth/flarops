@@ -5,6 +5,7 @@
   .keys/deploy_rsa
   .keys/deploy_rsa.pub
   FLAROPS.md
+  answers.json
   backend/Dockerfile
   backend/index.js
   backend/package.json
@@ -66,7 +67,7 @@ env:
   PROJECT_NAME: zf-privatesupport
   REGISTRY_USER: testuser
   BASE_DOMAIN: example.test
-
+  DOCKER_REGISTRY: harbor.example.com
 
 jobs:
   infrastructure:
@@ -182,7 +183,7 @@ jobs:
       - name: Login to Docker Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
-          registry: docker.io
+          registry: harbor.example.com
           username: ${{ env.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
@@ -194,7 +195,7 @@ jobs:
         env:
           SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
           SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-          REGISTRY_SERVER: https://index.docker.io/v1/
+          REGISTRY_SERVER: harbor.example.com
         run: |
           umask 077
           export TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
@@ -202,9 +203,21 @@ jobs:
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
-            --repo docker.io/${{ env.REGISTRY_USER }}/zf-privatesupport \
+            --repo harbor.example.com/team/zf-privatesupport \
             --env production \
             --values deploy/helm/flarops-ci-values.json
+
+      - name: Cleanup old images
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          GIT_AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          echo "::add-mask::$GIT_AUTH_HEADER"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="$GIT_AUTH_HEADER"
+          werf cleanup \
+            --repo harbor.example.com/team/zf-privatesupport
 
 # ===== .github/workflows/pr-capsule.yml
 name: Flarops PR Capsule
@@ -229,6 +242,7 @@ env:
   PR_NAMESPACE: zf-privatesupport-pr-${{ github.event.pull_request.number }}
   PR_ENV_NAME: pr-${{ github.event.pull_request.number }}
   PR_DOMAIN: pr-${{ github.event.pull_request.number }}.example.test
+  DOCKER_REGISTRY: harbor.example.com
 
 
 jobs:
@@ -524,14 +538,14 @@ jobs:
       - name: Login to Docker Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
-          registry: docker.io
+          registry: harbor.example.com
           username: ${{ env.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
       - name: Deploy application with Werf
         env:
           SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
           SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-          REGISTRY_SERVER: https://index.docker.io/v1/
+          REGISTRY_SERVER: harbor.example.com
         run: |
           umask 077
           export TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
@@ -539,11 +553,23 @@ jobs:
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
-            --repo docker.io/${{ env.REGISTRY_USER }}/zf-privatesupport \
+            --repo harbor.example.com/team/zf-privatesupport \
             --env ${{ env.PR_ENV_NAME }} \
             --set domain=${{ env.PR_DOMAIN }} \
             --set "dataNodeSelector.kubernetes\.io/hostname=$TARGET_NODE" \
             --values deploy/helm/flarops-ci-values.json
+
+      - name: Cleanup old images
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          GIT_AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          echo "::add-mask::$GIT_AUTH_HEADER"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="$GIT_AUTH_HEADER"
+          werf cleanup \
+            --repo harbor.example.com/team/zf-privatesupport
 
   cleanup-capsule:
     name: Teardown PR Capsule
@@ -645,14 +671,14 @@ jobs:
       - name: Login to Docker Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
-          registry: docker.io
+          registry: harbor.example.com
           username: ${{ env.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
       - name: Dismiss application with Werf
         continue-on-error: true
         run: |
           werf dismiss \
-            --repo docker.io/${{ env.REGISTRY_USER }}/zf-privatesupport \
+            --repo harbor.example.com/team/zf-privatesupport \
             --env ${{ env.PR_ENV_NAME }} \
             --with-namespace
 
@@ -768,6 +794,9 @@ git push origin main
 
 Once you push to the `main` branch (or trigger it manually), the GitHub Actions workflow (`deploy.yml`) will automatically start provisioning your infrastructure and deploying your application.
 
+# ===== answers.json
+{ "docker registry": "harbor.example.com/team" }
+
 # ===== backend/Dockerfile
 FROM node:20
 
@@ -808,7 +837,7 @@ SSH_PRIVATE_KEY="<PEM>"
 # ===== deploy/.env.safety
 DATABASE_USER=
 DATABASE_TYPE=
-DOCKER_REGISTRY=
+DOCKER_REGISTRY=harbor.example.com
 DOMAIN=example.test
 AWS_REGION=us-west-2
 
@@ -816,8 +845,8 @@ AWS_REGION=us-west-2
 {
   "projectName": "zf-privatesupport",
   "domain": "example.test",
-  "dockerRegistry": "",
-  "dockerProject": null,
+  "dockerRegistry": "harbor.example.com",
+  "dockerProject": "team",
   "dockerRepository": "zf-privatesupport",
   "registryUser": "testuser",
   "envKeysToPass": [
@@ -2183,8 +2212,8 @@ services:
 # ===== flarops.yaml
 # repository settings
 repositorySettings:
-  registry: docker.io               # registry host; docker.io is Docker Hub
-  project: null                     # namespace inside the registry (a Harbor project, an organisation);
+  registry: harbor.example.com      # registry host; docker.io is Docker Hub
+  project: team                     # namespace inside the registry (a Harbor project, an organisation);
                                     # null for none - on Docker Hub, your own user
   repository: zf-privatesupport     # repository the images are pushed to
 

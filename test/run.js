@@ -159,6 +159,27 @@ print('\\n'.join(bad))
   } catch (e) { return (e.stderr || Buffer.from('')).toString(); }
 }
 
+// werf cleanup fetches origin; checkout keeps no credentials, so the cleanup step must bring its own.
+function cleanupWithoutGitAuth(dir, rel) {
+  const script = `
+import sys, yaml
+wf = yaml.safe_load(open(sys.argv[1]))
+bad = []
+for job_name, job in (wf.get('jobs') or {}).items():
+    for step in job.get('steps') or []:
+        uses = str(step.get('uses', ''))
+        if uses.startswith('actions/checkout') and (step.get('with') or {}).get('persist-credentials') is not False:
+            bad.append(job_name + ': checkout keeps credentials in .git/config')
+        run = str(step.get('run', ''))
+        if 'werf cleanup' in run and not ('GIT_CONFIG_KEY_0=http.https://github.com/.extraheader' in run and 'github.token' in str(step.get('env', ''))):
+            bad.append(job_name + ': werf cleanup without git credentials')
+print('\\n'.join(bad))
+`;
+  try {
+    return execFileSync('python3', ['-c', script, path.join(dir, rel)], { stdio: 'pipe' }).toString().trim() || null;
+  } catch (e) { return (e.stderr || Buffer.from('')).toString(); }
+}
+
 // Duplicate env names: helm renders them, the API server rejects them.
 function duplicateEnvNames(dir) {
   const script = `
@@ -452,6 +473,11 @@ async function urlBreakingPasswordSurvives() {
       for (const rel of ['.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml']) {
         const bad = shellParses(result.dir, rel);
         check(`${rel} run blocks pass bash -n`, !bad, bad);
+        const noAuth = cleanupWithoutGitAuth(result.dir, rel);
+        check(`${rel} gives werf cleanup git credentials and checkout none`, !noAuth, noAuth);
+        const onHub = /--repo docker\.io\//.test(fs.readFileSync(path.join(result.dir, rel), 'utf8'));
+        check(`${rel} cleans up old images ${onHub ? 'nowhere on Docker Hub' : 'in a private registry'}`,
+          /werf cleanup/.test(fs.readFileSync(path.join(result.dir, rel), 'utf8')) === !onHub);
       }
     }
 

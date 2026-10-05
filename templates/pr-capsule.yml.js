@@ -1,5 +1,6 @@
 const ciSsh = require('./ciSsh');
 const { registrySettings, imageRepository, isDockerHub } = require('../utils/registry.js');
+const werfCleanupStep = require('./werfCleanup.js');
 
 module.exports = function prCapsuleYmlTemplate(config) {
   const registry = registrySettings(config);
@@ -355,11 +356,7 @@ ${secretEnvBlock}${dbPasswordEnvLine}          SECRET_REGISTRY_PASSWORD: \${{ se
             --set domain=\${{ env.PR_DOMAIN }} \\
             --set "dataNodeSelector.kubernetes\\.io/hostname=$TARGET_NODE" \\
             --values deploy/helm/flarops-ci-values.json${onDockerHub ? '' : `
-
-      - name: Cleanup old images
-        run: |
-          werf cleanup \\
-            --repo ${repoString}`}
+${werfCleanupStep(repoString)}`}
 ${dbCloningLogic}
   cleanup-capsule:
     name: Teardown PR Capsule
