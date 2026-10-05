@@ -6,5 +6,5 @@ dashboard/*.db
 dashboard/*.db-wal
 dashboard/*.db-shm
 SECURITY_AUDIT_REPORT*
-CODE_REVIEW.md
+CODE_REVIEW*
 .claude/*

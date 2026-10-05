@@ -130,6 +130,35 @@ broken:
   const cleanup = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
   fs.writeFileSync(path.join(dir, 'flarops.yaml'), cleanup.slice(0, cleanup.indexOf('\nbroken:\n')) + '\n');
 
+  // 3a'. Repository settings: where the images are pushed.
+  {
+    const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+    check('flarops.yaml starts with the repository settings', /^# repository settings\nrepositorySettings:\n/.test(original), original.slice(0, 200));
+    const harbor = original
+      .replace(/^  registry: .*$/m, '  registry: harbor.example.com')
+      .replace(/^  project: .*$/m, '  project: team')
+      .replace(/^  repository: .*$/m, '  repository: shop-web');
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), harbor);
+    r = runSync(dir);
+    check('sync applies new repository settings', r.status === 0 && /repositorySettings\.project: none -> team/.test(r.out), r.err || r.out);
+    for (const wf of ['.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml']) {
+      const text = read(dir, wf);
+      check(`${wf} pushes to <registry>/<project>/<repository>`, text.includes('--repo harbor.example.com/team/shop-web'), text.match(/--repo .*/) && text.match(/--repo .*/)[0]);
+      check(`${wf} logs in to the registry host`, /registry: harbor\.example\.com\n/.test(text));
+    }
+    r = runSync(dir);
+    check('unchanged repository settings report nothing', /nothing to do/.test(r.out), r.out);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), harbor.replace(/^  registry: .*$/m, '  registry: harbor.example.com/team'));
+    r = runSync(dir);
+    check('a registry with a path is refused', r.status === 1 && /repositorySettings\.registry/.test(r.err || ''), r.err);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), harbor.replace(/^  project: .*$/m, '  project: Team Space'));
+    r = runSync(dir);
+    check('an invalid project is refused', r.status === 1 && /repositorySettings\.project/.test(r.err || ''), r.err);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('restoring the defaults goes back to Docker Hub', r.status === 0 && read(dir, '.github/workflows/deploy.yml').includes('--repo docker.io/${{ env.REGISTRY_USER }}/'), r.err || r.out);
+  }
+
   // 3b'. Values pasted unescaped into file names and workflows must be refused.
   const hostile = [
     ['a service name outside the chart', '"../../../.github/workflows/pwn":\n  image: "busybox:1"\n', /not a valid service name/],

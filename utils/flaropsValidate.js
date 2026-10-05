@@ -4,6 +4,7 @@
 const path = require('path');
 const { YamlError } = require('./yamlLite.js');
 const { ENGINES } = require('./dbDefaults.js');
+const { REGISTRY_HOST, IMAGE_PATH } = require('./registry.js');
 
 // Kubernetes object names (RFC 1123 label) - also safe as a file name.
 const SERVICE_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
@@ -151,4 +152,25 @@ function validateDeclarations(declared) {
   }
 }
 
-module.exports = { validateDeclarations };
+const REPOSITORY_FIELDS = ['registry', 'project', 'repository'];
+
+// The repositorySettings block: registry host, optional project, repository name.
+function validateRepositorySettings(block) {
+  if (block === null || typeof block !== 'object' || Array.isArray(block)) {
+    fail('repositorySettings', 'must be a block with registry, project and repository');
+  }
+  for (const key of Object.keys(block)) {
+    if (!REPOSITORY_FIELDS.includes(key)) fail(`repositorySettings.${key}`, 'is not a setting - use registry, project or repository');
+  }
+  if (block.registry !== undefined && !REGISTRY_HOST.test(String(block.registry))) {
+    fail('repositorySettings.registry', `must be a registry host such as docker.io or harbor.example.com (no path), not ${JSON.stringify(block.registry)}`);
+  }
+  if (block.project !== undefined && block.project !== null && !IMAGE_PATH.test(String(block.project))) {
+    fail('repositorySettings.project', `must be lowercase letters, digits, ".", "_", "-" (and "/" between parts), or null - not ${JSON.stringify(block.project)}`);
+  }
+  if (block.repository !== undefined && (block.repository === null || !IMAGE_PATH.test(String(block.repository)))) {
+    fail('repositorySettings.repository', `must be lowercase letters, digits, ".", "_", "-" (and "/" between parts), not ${JSON.stringify(block.repository)}`);
+  }
+}
+
+module.exports = { validateDeclarations, validateRepositorySettings };

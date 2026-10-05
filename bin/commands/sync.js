@@ -9,7 +9,8 @@ const { readState, writeState, STATE_FILE } = require('../../utils/state.js');
 const { makeServiceEntry } = require('../../utils/analyzer.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
 const { unmountedSecretKeys } = require('../../utils/secretWiring.js');
-const { validateDeclarations } = require('../../utils/flaropsValidate.js');
+const { validateDeclarations, validateRepositorySettings } = require('../../utils/flaropsValidate.js');
+const { isDockerHub } = require('../../utils/registry.js');
 const { renderChartTemplates } = require('../../templates/chart.js');
 const renderValues = require('../../templates/values.yaml.js');
 const renderWerf = require('../../templates/werf.yaml.js');
@@ -41,10 +42,14 @@ const ALWAYS_PRESENT = new Set([
   '_helpers.tpl', '01-ingress.yaml', 'secret.yaml', 'registry-secret.yaml', 'dashboard.yaml',
 ]);
 
+// Not a service: the image repository settings at the top of flarops.yaml.
+const REPOSITORY_SETTINGS = 'repositorySettings';
+
 function declaredServices(text) {
   const doc = parse(text);
   const out = new Map();
   for (const [name, body] of Object.entries(doc)) {
+    if (name === REPOSITORY_SETTINGS) continue;
     if (body !== null && typeof body !== 'object') {
       throw new YamlError(`"${name}" must be a service block, not a single value`);
     }
@@ -55,6 +60,14 @@ function declaredServices(text) {
   }
   validateDeclarations(out);
   return out;
+}
+
+// The repositorySettings block, or null when the file has none (written before it existed).
+function declaredRepositorySettings(text) {
+  const block = parse(text)[REPOSITORY_SETTINGS];
+  if (block === undefined) return null;
+  validateRepositorySettings(block);
+  return block;
 }
 
 // secretEnvs is "env name: Secret key"; the chart splits same-name keys from renamed ones.
@@ -213,6 +226,9 @@ function applyService(service, decl, set, label) {
 
 // Older state has no replica counts; absent means the default, or every sync would report changes.
 function normalizeState(config) {
+  // State written before repositorySettings existed: the defaults init would have recorded.
+  config.dockerRepository = config.dockerRepository || config.projectName;
+  if (config.dockerProject === undefined) config.dockerProject = null;
   config.apiReplicas = config.apiReplicas || SERVICE_DEFAULTS.replicas;
   config.frontendReplicas = config.frontendReplicas || SERVICE_DEFAULTS.replicas;
   config.dbReplicas = config.dbReplicas || SERVICE_DEFAULTS.replicas;
@@ -247,11 +263,28 @@ function secretKeysFor(declared, config) {
   return [...kept, ...keys.filter(k => !kept.includes(k))];
 }
 
-function applyDeclarations(state, declared) {
+function applyDeclarations(state, declared, repository = null) {
   const changes = [];
   const set = makeRecorder(changes);
   const config = state;
   normalizeState(config);
+
+  if (repository) {
+    if (repository.registry !== undefined) {
+      const host = String(repository.registry).toLowerCase();
+      const value = isDockerHub(host) ? '' : host;
+      if ((config.dockerRegistry || '') !== value) {
+        changes.push({ label: 'repositorySettings.registry', from: config.dockerRegistry || 'docker.io', to: value || 'docker.io' });
+        config.dockerRegistry = value;
+      }
+    }
+    if (repository.project !== undefined) {
+      set(config, 'dockerProject', repository.project === null ? null : String(repository.project), 'repositorySettings.project');
+    }
+    if (repository.repository !== undefined) {
+      set(config, 'dockerRepository', String(repository.repository), 'repositorySettings.repository');
+    }
+  }
 
   const seenAdditional = new Set();
   const seenSupport = new Set();
@@ -350,8 +383,11 @@ module.exports = async function sync() {
   }
 
   let declared;
+  let repository = null;
   try {
-    declared = declaredServices(fs.readFileSync(flaropsYamlFile, 'utf8'));
+    const text = fs.readFileSync(flaropsYamlFile, 'utf8');
+    declared = declaredServices(text);
+    repository = declaredRepositorySettings(text);
   } catch (e) {
     if (e instanceof YamlError) {
       console.error(`\x1b[31mERROR: flarops.yaml could not be read - ${e.message}\x1b[0m`);
@@ -367,7 +403,7 @@ module.exports = async function sync() {
 
   let config, changes;
   try {
-    ({ config, changes } = applyDeclarations(state, declared));
+    ({ config, changes } = applyDeclarations(state, declared, repository));
   } catch (e) {
     if (e instanceof YamlError) {
       console.error(`\x1b[31mERROR: flarops.yaml cannot be applied - ${e.message}\x1b[0m`);

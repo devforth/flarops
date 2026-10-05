@@ -89,7 +89,19 @@ Sync refuses rather than guessing. Unreadable YAML is reported with its line num
 
 ## `flarops.yaml` — the file you edit
 
-Every top-level key is a service. Here is a complete, ordinary example:
+It opens with where the images are pushed:
+
+```yaml
+# repository settings
+repositorySettings:
+  registry: docker.io        # registry host
+  project: null              # namespace inside the registry
+  repository: shop           # repository the images are pushed to
+```
+
+The images end up at `<registry>/<project>/<repository>` — `harbor.example.com/team/shop` for a Harbor project, `ghcr.io/acme/shop` for a GitHub organisation. Leave `project` as `null` when the registry has no such level; on Docker Hub, `null` means your own user (`docker.io/<user>/shop`). `init` fills this in from the registry you gave it (`harbor.example.com/team` is split into registry and project) and names the repository after the project directory. Changing any of it and running `sync` updates both workflows; log-in still goes to the registry host with the same credentials.
+
+Every other top-level key is a service. Here is a complete, ordinary example:
 
 ```yaml
 api:
@@ -292,7 +304,7 @@ None of these change anything on their own — they are written into the generat
 
 | Prompt | Notes |
 | --- | --- |
-| `Enter docker registry` | Leave empty for Docker Hub. |
+| `Enter docker registry` | Leave empty for Docker Hub. A project inside the registry can be included: `harbor.example.com/team`. Both can be changed later under `repositorySettings`. |
 | `Enter username for <registry>` | |
 | `Enter password for <registry>` | Hidden. Used immediately for `docker login`, then stored in `deploy/.env`. |
 | `Enter project domain` | Required, asked again until it is a valid domain name. The dashboard and the pull-request environments are addressed under it. |

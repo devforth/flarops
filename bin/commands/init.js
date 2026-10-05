@@ -424,7 +424,7 @@ module.exports = async function init() {
     ensureAwsCli, handleS3Bucket, getDefaultAWSCredentials,
   });
   const {
-    projectName, dockerRegistry, registryUser, registryPassword,
+    projectName, dockerRegistry, dockerProject, dockerRepository, registryUser, registryPassword,
     domain, cloudflareApiToken, cloudflareZoneId,
     awsCredentials, awsRegion, remoteStateBucket,
   } = answers;
@@ -2130,6 +2130,8 @@ AWS_REGION=${awsRegion}
     projectName,
     domain,
     dockerRegistry,
+    dockerProject,
+    dockerRepository,
     registryUser,
     envKeysToPass,
     backendPath: relativeBackendPath,

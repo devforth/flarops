@@ -1,6 +1,7 @@
 // Everything `flarops init` asks the operator, in one place (stubbed by test/harness.js).
 
 const path = require('path');
+const { splitRegistry } = require('../../utils/registry.js');
 // Enter accepts. The one [y/N] prompt (reusing an existing state bucket) lives in utils/awsHelper.js.
 // At least two labels, each 1-63 letters, digits or hyphens, not starting or ending with a hyphen.
 function isDomain(value) {
@@ -16,8 +17,10 @@ module.exports = async function collectOperatorAnswers({
   currentDir, askQuestion, askPassword, execFileSync,
   ensureAwsCli, handleS3Bucket, getDefaultAWSCredentials,
 }) {
-  const registryAnswer = await askQuestion('Enter docker registry (leave empty for Docker Hub): ');
-  const dockerRegistry = registryAnswer.trim();
+  // "harbor.example.com/team" splits into the registry host and the project inside it; both can be
+  // changed later under repositorySettings in flarops.yaml.
+  const registryAnswer = await askQuestion('Enter docker registry, optionally with a project (e.g. harbor.example.com/team; leave empty for Docker Hub): ');
+  const { host: dockerRegistry, project: dockerProject } = splitRegistry(registryAnswer);
 
   let registryUser = '';
   let registryPassword = '';
@@ -93,7 +96,7 @@ module.exports = async function collectOperatorAnswers({
   let s3BucketWarning = bucketResult.warning;
 
   return {
-    projectName, dockerRegistry, registryUser, registryPassword,
+    projectName, dockerRegistry, dockerProject, dockerRepository: projectName, registryUser, registryPassword,
     domain, cloudflareApiToken, cloudflareZoneId,
     awsCredentials, awsRegion, remoteStateBucket, s3BucketWarning,
   };

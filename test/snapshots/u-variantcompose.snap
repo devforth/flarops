@@ -208,7 +208,7 @@ jobs:
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
-            --repo docker.io/${{ env.REGISTRY_USER }}/${{ env.PROJECT_NAME }} \
+            --repo docker.io/${{ env.REGISTRY_USER }}/u-variantcompose \
             --env production \
             --values deploy/helm/flarops-ci-values.json
 
@@ -549,7 +549,7 @@ jobs:
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
-            --repo docker.io/${{ env.REGISTRY_USER }}/${{ env.PROJECT_NAME }} \
+            --repo docker.io/${{ env.REGISTRY_USER }}/u-variantcompose \
             --env ${{ env.PR_ENV_NAME }} \
             --set domain=${{ env.PR_DOMAIN }} \
             --set "dataNodeSelector.kubernetes\.io/hostname=$TARGET_NODE" \
@@ -687,7 +687,7 @@ jobs:
         continue-on-error: true
         run: |
           werf dismiss \
-            --repo docker.io/${{ env.REGISTRY_USER }}/${{ env.PROJECT_NAME }} \
+            --repo docker.io/${{ env.REGISTRY_USER }}/u-variantcompose \
             --env ${{ env.PR_ENV_NAME }} \
             --with-namespace
 
@@ -850,6 +850,8 @@ AWS_REGION=us-west-2
   "projectName": "u-variantcompose",
   "domain": "example.test",
   "dockerRegistry": "",
+  "dockerProject": null,
+  "dockerRepository": "u-variantcompose",
   "registryUser": "testuser",
   "envKeysToPass": [
     "POSTGRES_PASSWORD",
@@ -2284,6 +2286,13 @@ reading docker-compose-dev.yaml as this project's docker-compose file
 build from a context OUTSIDE this repository and were skipped: legacy
 
 # ===== flarops.yaml
+# repository settings
+repositorySettings:
+  registry: docker.io               # registry host; docker.io is Docker Hub
+  project: null                     # namespace inside the registry (a Harbor project, an organisation);
+                                    # null for none - on Docker Hub, your own user
+  repository: u-variantcompose      # repository the images are pushed to
+
 api:
   dockerfile: Dockerfile
   context: api

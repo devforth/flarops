@@ -1,6 +1,7 @@
 // Generates flarops.yaml, the file the user edits; `flarops sync` applies it.
 
 const { passwordKeyFor } = require('./dbDefaults');
+const { registrySettings } = require('./registry');
 const { normalizeRoutes } = require('./routes');
 
 function yamlScalar(value) {
@@ -272,6 +273,21 @@ const TEMPLATE_COMMENT = `
 #
 # ============================================================================`.trimStart();
 
+// Where the images are pushed. Not a service: the key has an uppercase letter, which no service
+// name can have.
+function repositorySettingsBlock(config) {
+  const { host, project, repository } = registrySettings(config);
+  const line = (text, note) => `${text.padEnd(36)}# ${note}`;
+  return [
+    '# repository settings',
+    'repositorySettings:',
+    line(`  registry: ${yamlScalar(host)}`, 'registry host; docker.io is Docker Hub'),
+    line(`  project: ${project ? yamlScalar(project) : 'null'}`, 'namespace inside the registry (a Harbor project, an organisation);'),
+    line('', 'null for none - on Docker Hub, your own user'),
+    line(`  repository: ${yamlScalar(repository)}`, 'repository the images are pushed to'),
+  ].join('\n');
+}
+
 function generateFlaropsYaml(config, {
   apiEnv, frontendEnv, apiSecretKeys, frontendSecretKeys,
   apiExtraSecretEnvMappings, frontendExtraSecretEnvMappings,
@@ -374,7 +390,7 @@ function generateFlaropsYaml(config, {
     }));
   }
 
-  return blocks.join('\n\n') + '\n\n' + TEMPLATE_COMMENT + '\n';
+  return repositorySettingsBlock(config) + '\n\n' + blocks.join('\n\n') + '\n\n' + TEMPLATE_COMMENT + '\n';
 }
 
 module.exports = { generateFlaropsYaml };

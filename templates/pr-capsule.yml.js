@@ -1,17 +1,12 @@
 const ciSsh = require('./ciSsh');
+const { registrySettings, imageRepository, isDockerHub } = require('../utils/registry.js');
 
 module.exports = function prCapsuleYmlTemplate(config) {
-  const repoString = config.dockerRegistry
-    ? `\${{ env.DOCKER_REGISTRY }}/\${{ env.PROJECT_NAME }}`
-    : `docker.io/\${{ env.REGISTRY_USER }}/\${{ env.PROJECT_NAME }}`;
-
-  const registryEnv = config.dockerRegistry
-    ? 'DOCKER_REGISTRY: ' + config.dockerRegistry
-    : '';
-
-  const loginRegistryHost = config.dockerRegistry
-    ? config.dockerRegistry.split('/')[0]
-    : 'docker.io';
+  const registry = registrySettings(config);
+  const repoString = imageRepository(config);
+  const onDockerHub = isDockerHub(registry.host);
+  const registryEnv = onDockerHub ? '' : 'DOCKER_REGISTRY: ' + registry.host;
+  const loginRegistryHost = registry.host;
 
   const loginStep = `
       - name: Login to Docker Registry
@@ -25,7 +20,7 @@ module.exports = function prCapsuleYmlTemplate(config) {
     ? config.envKeysToPass.map(k => `          SECRET_ENV_${k}: \${{ secrets.${k} }}`).join('\n') + '\n'
     : '';
 
-  const registryServerForPull = config.dockerRegistry ? config.dockerRegistry.split('/')[0] : 'https://index.docker.io/v1/';
+  const registryServerForPull = onDockerHub ? 'https://index.docker.io/v1/' : registry.host;
 
   const buildValuesScript = `python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"`;
 
@@ -359,7 +354,7 @@ ${secretEnvBlock}${dbPasswordEnvLine}          SECRET_REGISTRY_PASSWORD: \${{ se
             --env \${{ env.PR_ENV_NAME }} \\
             --set domain=\${{ env.PR_DOMAIN }} \\
             --set "dataNodeSelector.kubernetes\\.io/hostname=$TARGET_NODE" \\
-            --values deploy/helm/flarops-ci-values.json${loginRegistryHost === 'docker.io' ? '' : `
+            --values deploy/helm/flarops-ci-values.json${onDockerHub ? '' : `
 
       - name: Cleanup old images
         run: |
