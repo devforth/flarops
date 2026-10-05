@@ -42,9 +42,10 @@ module.exports = (service) => {
     }
     for (const urlVar of service.dbUrlVars) {
       const dbName = urlVar.dbName || db.name;
+      const dbPath = dbName ? urlComponent(dbName) : '{{ include "flarops.urlencode" .Values.database.name }}';
       ownDbUrlBlock += `
             - name: ${urlVar.key}
-              value: "${dbUrlScheme(db.type, urlVar.scheme)}://${urlComponent(db.user)}:$(${db.passwordKey}_URLENCODED)@${dbHost}:${db.port}/${urlComponent(dbName)}${authSuffix}"`;
+              value: "${dbUrlScheme(db.type, urlVar.scheme)}://${urlComponent(db.user)}:$(${db.passwordKey}_URLENCODED)@${dbHost}:${db.port}/${dbPath}${authSuffix}"`;
     }
   }
 
@@ -103,7 +104,7 @@ spec:
               drop: ["NET_RAW"]
             seccompProfile:
               type: RuntimeDefault
-{{- if or $serviceObj.env $serviceObj.secretKeys ${service.dbPasswordKey ? 'true' : 'false'} ${service.springDatasourcePasswordSecretKey ? 'true' : 'false'} ${(Array.isArray(service.extraSecretEnvMappings) && service.extraSecretEnvMappings.length > 0) ? 'true' : 'false'} }}
+{{- if or $serviceObj.env $serviceObj.secretKeys ${service.dbPasswordKey ? 'true' : 'false'} ${service.springDatasourcePasswordSecretKey ? 'true' : 'false'} ${(Array.isArray(service.extraSecretEnvMappings) && service.extraSecretEnvMappings.length > 0) ? 'true' : 'false'} ${ownDbUrlBlock ? 'true' : 'false'} }}
           env:
 {{- if $serviceObj.env }}
 {{- range $key, $value := $serviceObj.env }}

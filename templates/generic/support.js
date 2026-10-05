@@ -1,10 +1,12 @@
 // A supporting service from docker-compose (cache, broker, identity provider): Deployment + Service.
 const { renderVolumes } = require('./volumes.js');
 const { secretRefs, urlEncodedRef, alreadyEmitted } = require('./env.js');
+const { imageHost, isDockerHub } = require('../../utils/registry.js');
 
 module.exports = (service) => {
   const idx = `(index .Values.supportServices (index .Values.supportServicesIndices "${service.name}" | int))`;
   const hasVolumes = Array.isArray(service.volumes) && service.volumes.length > 0;
+  const pullsFromPrivateRegistry = !isDockerHub(imageHost(service.image));
 
   const extraSecretEnvBlock = secretRefs(service.extraSecretEnvMappings);
   const hasExtraSecretEnv = extraSecretEnvBlock.length > 0;
@@ -137,7 +139,11 @@ ${hasVolumes ? `  strategy:
       nodeSelector:
 {{ toYaml $.Values.dataNodeSelector | indent 8 }}
 {{- end }}
-{{- $svc := ${idx} }}
+${pullsFromPrivateRegistry ? `{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+` : ''}{{- $svc := ${idx} }}
       containers:
         - name: ${service.name}
           image: {{ $svc.image | quote }}

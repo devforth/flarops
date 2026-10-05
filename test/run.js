@@ -137,6 +137,28 @@ function helmRenders(dir) {
   }
 }
 
+// A pod whose image is not on Docker Hub pulls from a registry that needs the project's credentials.
+function podsWithoutPullSecret(dir) {
+  const script = `
+import sys, yaml
+def host(image):
+    first = image.split('/')[0]
+    return first.lower() if '/' in image and ('.' in first or ':' in first or first == 'localhost') else 'docker.io'
+bad = []
+for doc in yaml.safe_load_all(open(sys.argv[1])):
+    if not doc: continue
+    spec = (doc.get('spec') or {}).get('template', {}).get('spec') or {}
+    containers = (spec.get('containers') or []) + (spec.get('initContainers') or [])
+    private = [c['image'] for c in containers if host(str(c.get('image', ''))) not in ('docker.io', 'index.docker.io', 'registry-1.docker.io')]
+    if private and not spec.get('imagePullSecrets'):
+        bad.append(doc['kind'] + '/' + doc['metadata']['name'] + ': ' + ', '.join(private))
+print('\\n'.join(bad))
+`;
+  try {
+    return execFileSync('python3', ['-c', script, path.join(dir, '.rendered.yaml')], { stdio: 'pipe' }).toString().trim() || null;
+  } catch (e) { return (e.stderr || Buffer.from('')).toString(); }
+}
+
 // Duplicate env names: helm renders them, the API server rejects them.
 function duplicateEnvNames(dir) {
   const script = `
@@ -169,6 +191,7 @@ function writeTestValues(dir) {
     werf: { env: 'production', image: images },
     env,
     database: { password: 'test-value' },
+    imagePullSecret: { server: 'example.test', username: 'ci', password: 'test-value' },
   }));
 }
 
@@ -256,6 +279,9 @@ for name, b in declared.items():
     if isinstance(b, dict) and isinstance(b.get('db'), dict):
         blocks[name + '-db'] = {'secretEnvs': b['db'].get('secretEnvs') or {}, 'command': b['db'].get('command')}
 
+import re
+built_url = re.compile(r'\\$\\([A-Za-z0-9_]+_URLENCODED\\)@')
+
 bad = []
 for doc in yaml.safe_load_all(open(sys.argv[2])):
     if not doc: continue
@@ -269,6 +295,10 @@ for doc in yaml.safe_load_all(open(sys.argv[2])):
         want = [str(a) for a in (blocks[name].get('command') or [])]
         have = [str(a) for a in (spec['containers'][0].get('args') or [])]
         if want != have: bad.append(name + ': flarops.yaml command ' + json.dumps(want) + ', chart args ' + json.dumps(have))
+        # databaseUrls: the env names whose value the chart builds as a database URL.
+        want = sorted(str(n) for n in (blocks[name].get('databaseUrls') or []))
+        have = sorted(e['name'] for e in (spec['containers'][0].get('env') or []) if built_url.search(str(e.get('value', ''))))
+        if want != have: bad.append(name + ': flarops.yaml databaseUrls ' + json.dumps(want) + ', chart builds ' + json.dumps(have))
     refs = {}
     for c in (spec.get('containers') or []):
         for e in (c.get('env') or []):
@@ -288,7 +318,8 @@ for doc in yaml.safe_load_all(open(sys.argv[2])):
         # derives FROM still has to be declared, which is what this checks.
         if env.endswith('_URLENCODED') and env == key:
             base = env[:-len('_URLENCODED')]
-            if base not in got: bad.append(name + ': derives ' + env + ' from ' + base + ', which is not declared')
+            # databaseUrls declares it: the twin carries the database's own password.
+            if base not in got and not block.get('databaseUrls'): bad.append(name + ': derives ' + env + ' from ' + base + ', which is not declared')
             continue
         if env not in got: bad.append(name + ': chart mounts ' + env + ' <- ' + key + ', not declared')
         elif got[env] != key: bad.append(name + ': ' + env + ' <- chart "' + key + '", flarops.yaml "' + str(got[env]) + '"')
@@ -445,6 +476,8 @@ async function urlBreakingPasswordSurvives() {
       if (err === null && HAS_PY) {
         const dups = duplicateEnvNames(result.dir);
         check('no container lists an env name twice', !dups, dups);
+        const unpulled = podsWithoutPullSecret(result.dir);
+        check('every pod pulling from outside Docker Hub has the registry credentials', !unpulled, unpulled);
         const drift = flaropsYamlMatchesChart(result.dir);
         check('flarops.yaml matches the deployed chart', !drift, drift);
       }

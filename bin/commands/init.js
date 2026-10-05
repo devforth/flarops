@@ -2207,6 +2207,7 @@ AWS_REGION=${awsRegion}
     dbPasswordKey: finalDbPasswordKey,
     hasDbPassword,
     dbUrlVars: Object.values(foundDbUrls),
+    databaseUrlsDeclared: true,
     apiRoutes,
     apiHealthRoute: backendInfo.healthRoute || null,
     apiHealthPort: backendInfo.healthPort || null,

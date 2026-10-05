@@ -1007,6 +1007,7 @@ AWS_REGION=us-west-2
       "scheme": "postgres"
     }
   ],
+  "databaseUrlsDeclared": true,
   "apiRoutes": [
     {
       "path": "/api",
@@ -1320,7 +1321,7 @@ spec:
               drop: ["NET_RAW"]
             seccompProfile:
               type: RuntimeDefault
-{{- if or $serviceObj.env $serviceObj.secretKeys false false false }}
+{{- if or $serviceObj.env $serviceObj.secretKeys false false false true }}
           env:
 {{- if $serviceObj.env }}
 {{- range $key, $value := $serviceObj.env }}
@@ -1537,7 +1538,7 @@ spec:
               drop: ["NET_RAW"]
             seccompProfile:
               type: RuntimeDefault
-{{- if or $serviceObj.env $serviceObj.secretKeys false false false }}
+{{- if or $serviceObj.env $serviceObj.secretKeys false false false true }}
           env:
 {{- if $serviceObj.env }}
 {{- range $key, $value := $serviceObj.env }}
@@ -1671,6 +1672,10 @@ spec:
         app: flarops-node-agent
     spec:
       automountServiceAccountToken: false
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
       tolerations:
         - operator: Exists
       containers:
@@ -1733,6 +1738,10 @@ spec:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (list "DASHBOARD_PASSWORD_HASH")) }}
     spec:
       serviceAccountName: flarops-dashboard
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -2384,6 +2393,8 @@ auth-service:
   replicas: 1
   ports:
     - 4001
+  databaseUrls:
+    - DATABASE_URL
   secretEnvs:
     AUTH_SERVICE_POSTGRES_PASSWORD: AUTH_SERVICE_POSTGRES_PASSWORD
   exposedRoutes:
@@ -2407,6 +2418,8 @@ billing-service:
   replicas: 1
   ports:
     - 4002
+  databaseUrls:
+    - DATABASE_URL
   secretEnvs:
     BILLING_SERVICE_POSTGRES_PASSWORD: BILLING_SERVICE_POSTGRES_PASSWORD
   exposedRoutes:
@@ -2481,6 +2494,13 @@ billing-service:
 #   env:                                    # plain-text environment variables
 #     DATABASE_HOST: "database"
 #     APP_ENV: "production"
+#
+#   databaseUrls:                           # env vars that get the database's
+#     - DATABASE_URL                        #  connection URL, built by the chart
+#                                           #  from its user, password and name -
+#                                           #  this service's own db: if it has
+#                                           #  one, otherwise the top-level
+#                                           #  database. No GitHub Secret needed.
 #
 #   secretEnvs:                             # env vars sourced from GitHub Secrets
 #     SECRET_KEY: SECRET_KEY                # env name: GitHub Secret name

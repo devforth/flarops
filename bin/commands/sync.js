@@ -11,6 +11,7 @@ const { normalizeRoutes } = require('../../utils/routes.js');
 const { unmountedSecretKeys } = require('../../utils/secretWiring.js');
 const { validateDeclarations, validateRepositorySettings } = require('../../utils/flaropsValidate.js');
 const { isDockerHub } = require('../../utils/registry.js');
+const { defaultUserFor } = require('../../utils/dbDefaults.js');
 const { renderChartTemplates } = require('../../templates/chart.js');
 const renderValues = require('../../templates/values.yaml.js');
 const renderWerf = require('../../templates/werf.yaml.js');
@@ -119,6 +120,17 @@ function asList(value) {
   return Array.isArray(value) ? value : [value];
 }
 
+// databaseUrls: env names that get the URL of the service's database - its own db: if it has one,
+// otherwise the top-level database. What init learned about each name (scheme, database, query)
+// is kept. Absent means none, except in state from before the field existed: there the URLs
+// init built stay until flarops.yaml names them.
+function declaredUrlVars(config, decl, previous) {
+  if (decl.databaseUrls === undefined || decl.databaseUrls === null) {
+    return config.databaseUrlsDeclared ? [] : (previous || []);
+  }
+  return asList(decl.databaseUrls).map(String).map(key => (previous || []).find(v => v.key === key) || { key });
+}
+
 function makeRecorder(changes) {
   // "absent" and "empty" are the same to every consumer; do not report them as a change.
   const normalize = (v) => {
@@ -154,6 +166,7 @@ function applyPrimary(config, name, decl, set) {
     set(config, prefix === 'api' ? 'backendPath' : 'frontendPath', String(decl.context), `${name}.context`);
   }
   if (prefix === 'api') {
+    set(config, 'dbUrlVars', declaredUrlVars(config, decl, config.dbUrlVars), 'api.databaseUrls');
     set(config, 'apiHealthRoute', decl.healthRoute, 'api.healthRoute');
     set(config, 'apiHealthPort', decl.healthPort, 'api.healthPort');
     set(config, 'apiRoutes', normalizeRoutes(asList(decl.exposedRoutes)), 'api.exposedRoutes');
@@ -225,6 +238,32 @@ function applyService(service, decl, set, label) {
     delete db.secretEnvs;
     set(service, 'db', db, `${label}.db`);
   }
+}
+
+// A service without a database of its own reaches the top-level one; its URLs need that database.
+function applyDatabaseUrls(config, service, decl, set, label) {
+  const urlVars = declaredUrlVars(config, decl, service.dbUrlVars);
+  const ownDb = service.db && !service.db.shared;
+  if (urlVars.length > 0 && !ownDb && !config.hasDb) {
+    throw new YamlError(`"${label}.databaseUrls" needs a database: declare a top-level database: block, or a db: block for ${label}`);
+  }
+  set(service, 'dbUrlVars', urlVars, `${label}.databaseUrls`);
+  if (ownDb) return;
+  if (urlVars.length === 0) {
+    if (service.db) set(service, 'db', null, `${label}.databaseUrls`);
+    return;
+  }
+  // Read from the top-level database on every sync, so a change there reaches the URL too.
+  const shared = {
+    ...(service.db || { name: null }),
+    type: config.dbType,
+    image: config.images && config.images.db,
+    port: config.dbPort,
+    user: config.dbUser || defaultUserFor(config.dbType),
+    passwordKey: config.dbPasswordKey,
+    shared: true,
+  };
+  set(service, 'db', shared, `${label}.databaseUrls (top-level database)`);
 }
 
 // Older state has no replica counts; absent means the default, or every sync would report changes.
@@ -308,6 +347,7 @@ function applyDeclarations(state, declared, repository = null) {
       changes.push({ label: `${name}: created from the shared template`, from: null, to: name });
     }
     applyService(service, decl, set, name);
+    if (isBuilt) applyDatabaseUrls(config, service, decl, set, name);
   }
 
   // A service removed from flarops.yaml is removed from the deployment.

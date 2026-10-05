@@ -105,6 +105,21 @@ function checkVolumes(where, volumes) {
   });
 }
 
+// Each name gets a URL the chart builds; the same name from env or secretEnvs would be a second source.
+function checkDatabaseUrls(name, decl) {
+  if (decl.databaseUrls === undefined || decl.databaseUrls === null) return;
+  const where = `${name}.databaseUrls`;
+  if (name === 'frontend' || !(name === 'api' || decl.dockerfile)) {
+    fail(where, 'is only for api and services built here - give this one its URL under secretEnvs');
+  }
+  const names = asList(decl.databaseUrls);
+  for (const envName of names) {
+    if (!ENV_NAME.test(String(envName))) fail(where, `must list environment variable names, not ${JSON.stringify(envName)}`);
+    if (decl.env && Object.prototype.hasOwnProperty.call(decl.env, envName)) fail(where, `names ${envName}, which env also sets - keep one`);
+    if (decl.secretEnvs && Object.prototype.hasOwnProperty.call(decl.secretEnvs, envName)) fail(where, `names ${envName}, which secretEnvs also sets - keep one`);
+  }
+}
+
 function checkCommon(name, decl) {
   checkReplicas(`${name}.replicas`, decl.replicas);
   checkPorts(`${name}.ports`, decl.ports);
@@ -121,6 +136,7 @@ function checkCommon(name, decl) {
   checkBuildArgs(`${name}.buildArgs`, decl.buildArgs);
   checkBuildArgs(`${name}.args`, decl.args);
   checkVolumes(`${name}.volumes`, decl.volumes);
+  checkDatabaseUrls(name, decl);
 }
 
 function checkDatabase(where, db) {

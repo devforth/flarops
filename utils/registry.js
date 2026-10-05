@@ -8,6 +8,12 @@ function isDockerHub(host) {
   return DOCKER_HUB_HOSTS.has(String(host || '').toLowerCase());
 }
 
+function imageHost(image) {
+  const first = String(image || '').split('/')[0];
+  const isHost = String(image || '').includes('/') && (first.includes('.') || first.includes(':') || first === 'localhost');
+  return isHost ? first.toLowerCase() : 'docker.io';
+}
+
 function splitRegistry(value) {
   const raw = String(value || '').trim().toLowerCase().replace(/\/+$/, '');
   const [host, ...rest] = raw ? raw.split('/') : [''];
@@ -29,4 +35,4 @@ function imageRepository(config) {
   return [host, namespace, repository].filter(Boolean).join('/');
 }
 
-module.exports = { registrySettings, imageRepository, splitRegistry, isDockerHub, REGISTRY_HOST, IMAGE_PATH };
+module.exports = { registrySettings, imageRepository, splitRegistry, isDockerHub, imageHost, REGISTRY_HOST, IMAGE_PATH };

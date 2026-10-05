@@ -187,6 +187,15 @@ The name on the **left** is the environment variable your code reads. The name o
 
 > WARNING: CI passes these Secret keys but no workload reads them: JWT_SECRET.
 
+**`databaseUrls`** — environment variables that get a connection URL to the database, built by the chart. Don't make the URL a secret yourself: the chart builds it from the database's user, name and password, so it changes when they do.
+
+```yaml
+  databaseUrls:
+    - DATABASE_URL     # postgresql://<user>:<password>@database:5432/<name>
+```
+
+The URL points at the service's own `db:` if it has one, otherwise at the top-level `database:`. It works on `api` and on services built here. A name listed here cannot also be in `env` or `secretEnvs`. `init` writes the field wherever it builds a URL. In a project generated before the field existed, sync keeps the URLs `init` built until flarops.yaml names them; write `databaseUrls: []` to stop one.
+
 **`exposedRoutes`** — the URL prefixes the outside world reaches this service through.
 
 ```yaml

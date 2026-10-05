@@ -183,6 +183,69 @@ broken:
       r.status === 0 && !/^database:\n(?:  .*\n)*?  command:/m.test(read(dir, 'deploy/helm/values.yaml')), r.err || r.out);
   }
 
+  // 3a'''. databaseUrls: URLs the chart builds from the database, for any service built here.
+  {
+    const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+    const reporter = `
+reporter:
+  dockerfile: "reporter/Dockerfile"
+  context: "reporter"
+  replicas: 1
+  ports:
+    - 8080
+  databaseUrls:
+    - DATABASE_URL
+`;
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original + reporter);
+    r = runSync(dir);
+    check('sync accepts databaseUrls on a declared service', r.status === 0 && /reporter\.databaseUrls/.test(r.out), r.err || r.out);
+    const template = read(dir, 'deploy/helm/templates/reporter.yaml');
+    check('the chart builds its URL against the top-level database',
+      /- name: DATABASE_URL\n\s+value: "postgres(ql)?:\/\/[^:]+:\$\(POSTGRES_PASSWORD_URLENCODED\)@database:5432\/[^"]+"/.test(template),
+      (template.match(/- name: DATABASE_URL[\s\S]{0,160}/) || [template.slice(0, 300)])[0]);
+    check('no GitHub Secret is asked for the URL', !read(dir, '.github/workflows/deploy.yml').includes('SECRET_ENV_DATABASE_URL'));
+    if (helmRenders) {
+      const err = helmRenders(dir);
+      check('the chart renders with databaseUrls and matches flarops.yaml', !err, err);
+    }
+    r = runSync(dir);
+    check('unchanged databaseUrls report nothing', /nothing to do/.test(r.out), r.out);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original + reporter + '  secretEnvs:\n    DATABASE_URL: DATABASE_URL\n');
+    r = runSync(dir);
+    check('a name in both databaseUrls and secretEnvs is refused', r.status === 1 && /reporter\.databaseUrls/.test(r.err || ''), r.err || r.out);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original.replace(/^frontend:\n/m, 'frontend:\n  databaseUrls:\n    - DATABASE_URL\n') + reporter);
+    r = runSync(dir);
+    check('databaseUrls on the frontend is refused', r.status === 1 && /frontend\.databaseUrls/.test(r.err || ''), r.err || r.out);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original + reporter.replace(/  databaseUrls:\n    - DATABASE_URL\n/, ''));
+    r = runSync(dir);
+    check('removing databaseUrls stops the URL', r.status === 0 && !/name: DATABASE_URL/.test(read(dir, 'deploy/helm/templates/reporter.yaml')), r.err || r.out);
+
+    // State from before the field: what init built stays until flarops.yaml names it.
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original.replace(/^api:\n/m, 'api:\n  databaseUrls:\n    - DATABASE_URL\n'));
+    r = runSync(dir);
+    check('databaseUrls on api builds its URL', r.status === 0 && /- name: DATABASE_URL/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.err || r.out);
+    const statePath = path.join(dir, 'deploy/.flarops-state.json');
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    delete state.databaseUrlsDeclared;
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n');
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('older state keeps the URLs init built when flarops.yaml does not name them',
+      /nothing to do/.test(r.out) && /- name: DATABASE_URL/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.err || r.out);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original.replace(/^api:\n/m, 'api:\n  databaseUrls: []\n'));
+    r = runSync(dir);
+    check('databaseUrls: [] removes them there', r.status === 0 && !/- name: DATABASE_URL/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.err || r.out);
+    state.databaseUrlsDeclared = true;
+    state.dbUrlVars = [];
+    fs.writeFileSync(statePath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statePath, 'utf8')), databaseUrlsDeclared: true }, null, 2) + '\n');
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('back to the original flarops.yaml', r.status === 0, r.err || r.out);
+  }
+
   // 3b'. Values pasted unescaped into file names and workflows must be refused.
   const hostile = [
     ['a service name outside the chart', '"../../../.github/workflows/pwn":\n  image: "busybox:1"\n', /not a valid service name/],

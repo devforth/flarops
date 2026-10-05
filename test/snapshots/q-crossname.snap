@@ -1001,6 +1001,7 @@ AWS_REGION=us-west-2
   "dbPasswordKey": "POSTGRES_PASSWORD",
   "hasDbPassword": true,
   "dbUrlVars": [],
+  "databaseUrlsDeclared": true,
   "apiRoutes": [
     {
       "path": "/api",
@@ -1335,6 +1336,10 @@ spec:
         app: flarops-node-agent
     spec:
       automountServiceAccountToken: false
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
       tolerations:
         - operator: Exists
       containers:
@@ -1397,6 +1402,10 @@ spec:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (list "DASHBOARD_PASSWORD_HASH")) }}
     spec:
       serviceAccountName: flarops-dashboard
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -1688,7 +1697,7 @@ spec:
               drop: ["NET_RAW"]
             seccompProfile:
               type: RuntimeDefault
-{{- if or $serviceObj.env $serviceObj.secretKeys true false false }}
+{{- if or $serviceObj.env $serviceObj.secretKeys true false false false }}
           env:
 {{- if $serviceObj.env }}
 {{- range $key, $value := $serviceObj.env }}
@@ -1809,7 +1818,7 @@ spec:
               drop: ["NET_RAW"]
             seccompProfile:
               type: RuntimeDefault
-{{- if or $serviceObj.env $serviceObj.secretKeys false false true }}
+{{- if or $serviceObj.env $serviceObj.secretKeys false false true false }}
           env:
 {{- if $serviceObj.env }}
 {{- range $key, $value := $serviceObj.env }}
@@ -2479,6 +2488,13 @@ reporting:
 #   env:                                    # plain-text environment variables
 #     DATABASE_HOST: "database"
 #     APP_ENV: "production"
+#
+#   databaseUrls:                           # env vars that get the database's
+#     - DATABASE_URL                        #  connection URL, built by the chart
+#                                           #  from its user, password and name -
+#                                           #  this service's own db: if it has
+#                                           #  one, otherwise the top-level
+#                                           #  database. No GitHub Secret needed.
 #
 #   secretEnvs:                             # env vars sourced from GitHub Secrets
 #     SECRET_KEY: SECRET_KEY                # env name: GitHub Secret name

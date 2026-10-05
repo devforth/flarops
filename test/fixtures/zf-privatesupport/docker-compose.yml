@@ -1,0 +1,16 @@
+services:
+  connect:
+    image: quay.io/debezium/connect:3.6
+    ports: ["8083:8083"]
+  internal-cache:
+    image: harbor.example.com/team/cache:1.4
+  cache:
+    image: redis:7
+  api:
+    build: ./backend
+    ports: ["3000:3000"]
+    environment:
+      CONNECT_URL: http://connect:8083
+      INTERNAL_CACHE_HOST: internal-cache
+      REDIS_HOST: cache
+    depends_on: [connect, internal-cache, cache]

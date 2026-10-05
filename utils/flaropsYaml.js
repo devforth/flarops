@@ -119,6 +119,11 @@ function serviceBlock(name, opts) {
   if (opts.springDatasourcePasswordSecretKey) {
     allMappings.push({ envName: 'SPRING_DATASOURCE_PASSWORD', secretKey: opts.springDatasourcePasswordSecretKey });
   }
+  if (Array.isArray(opts.databaseUrls) && opts.databaseUrls.length > 0) {
+    lines.push('  databaseUrls:');
+    for (const envName of opts.databaseUrls) lines.push(`    - ${yamlScalar(envName)}`);
+  }
+
   const secretStr = renderSecretEnvBlock(opts.secretKeys, allMappings, 4);
   if (secretStr) {
     lines.push('  secretEnvs:');
@@ -248,6 +253,13 @@ const TEMPLATE_COMMENT = `
 #     DATABASE_HOST: "database"
 #     APP_ENV: "production"
 #
+#   databaseUrls:                           # env vars that get the database's
+#     - DATABASE_URL                        #  connection URL, built by the chart
+#                                           #  from its user, password and name -
+#                                           #  this service's own db: if it has
+#                                           #  one, otherwise the top-level
+#                                           #  database. No GitHub Secret needed.
+#
 #   secretEnvs:                             # env vars sourced from GitHub Secrets
 #     SECRET_KEY: SECRET_KEY                # env name: GitHub Secret name
 #     DB_PASSWORD: SHARED_DB_PASSWORD       # env name can differ from secret name
@@ -310,6 +322,7 @@ function generateFlaropsYaml(config, {
       buildArgs: apiBuildArgs,
       command: apiCommand,
       env: apiEnv,
+      databaseUrls: config.hasDb ? (config.dbUrlVars || []).map(v => v.key) : [],
       secretKeys: apiSecretKeys,
       extraSecretEnvMappings: apiExtraSecretEnvMappings,
       healthRoute: config.apiHealthRoute,
@@ -371,6 +384,7 @@ function generateFlaropsYaml(config, {
       buildArgs: s.buildArgs,
       command: s.command,
       env: s.env,
+      databaseUrls: s.db ? (s.dbUrlVars || []).map(v => v.key) : [],
       secretKeys: s.secretKeys,
       extraSecretEnvMappings: s.extraSecretEnvMappings,
       healthRoute: s.healthRoute,

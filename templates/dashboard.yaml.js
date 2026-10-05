@@ -87,6 +87,10 @@ spec:
         app: flarops-node-agent
     spec:
       automountServiceAccountToken: false
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
       tolerations:
         - operator: Exists
       containers:
@@ -149,6 +153,10 @@ spec:
         checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (list "DASHBOARD_PASSWORD_HASH")) }}
     spec:
       serviceAccountName: flarops-dashboard
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
