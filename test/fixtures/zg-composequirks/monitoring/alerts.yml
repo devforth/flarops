@@ -1,0 +1,7 @@
+groups:
+  - name: up
+    rules:
+      - alert: Down
+        expr: up == 0
+        annotations:
+          summary: "{{ $labels.instance }} is down"

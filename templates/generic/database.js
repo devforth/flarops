@@ -1,3 +1,4 @@
+const { defaultPortFor } = require('../../utils/dbDefaults.js');
 function getPostgresMajorVersion(image) {
   const tag = (image || '').split(':')[1] || '';
   const match = tag.match(/^(\d+)/);
@@ -77,7 +78,7 @@ spec:
   ports:
     - protocol: TCP
       port: {{ $svcDb.port }}
-      targetPort: {{ $svcDb.port }}
+      targetPort: ${defaultPortFor(db.type)}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -108,6 +109,11 @@ spec:
 {{- if .Values.dataNodeSelector }}
       nodeSelector:
 {{ toYaml .Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
 {{- end }}
       containers:
         - name: db

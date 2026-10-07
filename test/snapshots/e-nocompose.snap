@@ -85,6 +85,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.15.8
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -94,12 +96,98 @@ jobs:
         working-directory: deploy/terraform
         run: terraform workspace select -or-create main
 
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
       - name: Terraform Apply
         working-directory: deploy/terraform
         env:
           TF_VAR_domain: ${{ env.BASE_DOMAIN }}
         run: |
-          set -o pipefail
+          set -euo pipefail
+
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+
+
+          FLAROPS_LOCK_OWNER="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          flarops_kubectl() { flarops_ssh "$1" "sudo k3s kubectl -n default $2"; }
+
+          flarops_slots_lock() {
+            for attempt in $(seq 1 120); do
+              EXPIRES=$(( $(date +%s) + 1200 ))
+              if flarops_kubectl "$1" "create configmap flarops-slots-lock --from-literal=owner=$FLAROPS_LOCK_OWNER --from-literal=expires=$EXPIRES" > /dev/null 2>&1; then
+                echo "Holding the worker-slot lock."
+                return 0
+              fi
+              HELD_UNTIL=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.expires}" 2>/dev/null || true)
+              if [ -n "$HELD_UNTIL" ] && [ "$HELD_UNTIL" -lt "$(date +%s)" ]; then
+                echo "The worker-slot lock expired without being released - taking it over."
+                flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+                continue
+              fi
+              echo "  another workflow is changing worker slots - waiting ($attempt/120)"
+              sleep 10
+            done
+            echo "::error::Another workflow held the worker-slot lock for over 20 minutes."
+            return 1
+          }
+
+          flarops_slots_unlock() {
+            HOLDER=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.owner}" 2>/dev/null || true)
+            if [ "$HOLDER" = "$FLAROPS_LOCK_OWNER" ]; then
+              flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+              echo "Released the worker-slot lock."
+            fi
+          }
+
+          EC2_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          if [ -n "$EC2_IP" ] && flarops_ssh "$EC2_IP" "sudo k3s kubectl get --raw /readyz" > /dev/null 2>&1; then
+            flarops_slots_lock "$EC2_IP"
+            trap 'flarops_slots_unlock "$EC2_IP"' EXIT
+          fi
+
           if ! ALL_OUTPUTS=$(terraform output -json 2>&1); then
             echo "::error::Could not read Terraform outputs, refusing to apply: $ALL_OUTPUTS"
             exit 1
@@ -108,17 +196,17 @@ jobs:
           echo "Preserving existing worker slots: $CURRENT_SLOTS"
           terraform apply -var="worker_slots=$CURRENT_SLOTS" -auto-approve -lock-timeout=5m
 
-      - name: Setup SSH
-        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-
       - name: Fetch Kubeconfig from EC2
         working-directory: deploy/terraform
         run: |
           set -euo pipefail
 
-          export EC2_IP=$(terraform output -raw public_ip)
+          EC2_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - the apply above did not create the server."
+            exit 1
+          fi
+          export EC2_IP
 
           flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
 
@@ -174,6 +262,8 @@ jobs:
 
       - name: Setup Werf
         uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
+        with:
+          version: v2.78.2
 
       - name: Login to Docker Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
@@ -193,8 +283,9 @@ jobs:
           REGISTRY_SERVER: https://index.docker.io/v1/
         run: |
           umask 077
-          export TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
-          export TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
+          TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          export TF_INSTANCE_TYPE TF_VOLUME_SIZE
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
@@ -207,7 +298,9 @@ name: Flarops PR Capsule
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, closed]
+    types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [closed]
 
 permissions:
   contents: read
@@ -249,6 +342,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.15.8
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -268,7 +363,12 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-          export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
+          EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - production has not been deployed yet. Run the deploy workflow on the main branch first."
+            exit 1
+          fi
+          export EC2_IP
 
           flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
 
@@ -322,6 +422,21 @@ jobs:
           sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
           test -s ~/.kube/config
 
+      - name: Setup Werf
+        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
+        with:
+          version: v2.78.2
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: docker.io
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Build images
+        run: |
+          werf build --repo docker.io/${{ env.REGISTRY_USER }}/e-nocompose
+
       - name: Decide where this capsule goes
         env:
           TF_VAR_domain: ${{ env.BASE_DOMAIN }}
@@ -371,8 +486,43 @@ jobs:
           }
 
 
-          TARGET_NODE=$(kubectl get pods -n "${{ env.PR_NAMESPACE }}" \
-            -l component=database -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
+          FLAROPS_LOCK_OWNER="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          flarops_kubectl() { flarops_ssh "$1" "sudo k3s kubectl -n default $2"; }
+
+          flarops_slots_lock() {
+            for attempt in $(seq 1 120); do
+              EXPIRES=$(( $(date +%s) + 1200 ))
+              if flarops_kubectl "$1" "create configmap flarops-slots-lock --from-literal=owner=$FLAROPS_LOCK_OWNER --from-literal=expires=$EXPIRES" > /dev/null 2>&1; then
+                echo "Holding the worker-slot lock."
+                return 0
+              fi
+              HELD_UNTIL=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.expires}" 2>/dev/null || true)
+              if [ -n "$HELD_UNTIL" ] && [ "$HELD_UNTIL" -lt "$(date +%s)" ]; then
+                echo "The worker-slot lock expired without being released - taking it over."
+                flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+                continue
+              fi
+              echo "  another workflow is changing worker slots - waiting ($attempt/120)"
+              sleep 10
+            done
+            echo "::error::Another workflow held the worker-slot lock for over 20 minutes."
+            return 1
+          }
+
+          flarops_slots_unlock() {
+            HOLDER=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.owner}" 2>/dev/null || true)
+            if [ "$HOLDER" = "$FLAROPS_LOCK_OWNER" ]; then
+              flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+              echo "Released the worker-slot lock."
+            fi
+          }
+
+          TARGET_NODE=$(kubectl get pvc -n "${{ env.PR_NAMESPACE }}" \
+            -o jsonpath='{range .items[*]}{.metadata.annotations.volume\.kubernetes\.io/selected-node}{"\n"}{end}' 2>/dev/null | grep -m1 . || true)
+          if [ -z "$TARGET_NODE" ]; then
+            TARGET_NODE=$(kubectl get pods -n "${{ env.PR_NAMESPACE }}" \
+              -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null | grep -m1 . || true)
+          fi
 
           if [ -n "$TARGET_NODE" ]; then
             echo "Capsule already runs on $TARGET_NODE - keeping it there."
@@ -462,19 +612,26 @@ jobs:
             terraform init
             terraform workspace select -or-create main
 
+            EC2_IP=$(terraform output -raw public_ip)
+            flarops_slots_lock "$EC2_IP"
+            trap 'flarops_slots_unlock "$EC2_IP"' EXIT
             ALL_OUTPUTS=$(terraform output -json)
             CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
             NEW_SLOTS=$(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; s=[int(x) for x in json.load(sys.stdin)]; f=next(n for n in range(1,1000) if n not in s); print(json.dumps(sorted(s+[f])))")
+            NEW_SLOT=$(CURRENT_SLOTS="$CURRENT_SLOTS" NEW_SLOTS="$NEW_SLOTS" python3 -c "import json,os; print(sorted(set(json.loads(os.environ['NEW_SLOTS'])) - set(json.loads(os.environ['CURRENT_SLOTS'])))[0])")
+            INSTANCE_NAME=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('instance_name',{}).get('value',''))")
+            if [ -z "$INSTANCE_NAME" ]; then
+              echo "::error::Could not read instance_name from Terraform - cannot name the new worker's node."
+              exit 1
+            fi
+            NEW_NODE="${INSTANCE_NAME}-worker-${NEW_SLOT}"
+            flarops_ssh "$EC2_IP" "sudo k3s kubectl delete node ${NEW_NODE} --ignore-not-found" > /dev/null
             echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
             terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
-            EC2_IP=$(terraform output -raw public_ip)
+            flarops_slots_unlock "$EC2_IP"
+            trap - EXIT
             cd - > /dev/null
 
-            echo "Waiting for the new worker to join..."
-            NEW_SLOT=$(CURRENT_SLOTS="$CURRENT_SLOTS" NEW_SLOTS="$NEW_SLOTS" python3 -c "import json,os; print(sorted(set(json.loads(os.environ['NEW_SLOTS'])) - set(json.loads(os.environ['CURRENT_SLOTS'])))[0])")
-            NEW_NODE="${INSTANCE_NAME:-}"
-            if [ -z "$NEW_NODE" ]; then NEW_NODE=$(terraform -chdir=deploy/terraform output -raw instance_name); fi
-            NEW_NODE="${NEW_NODE}-worker-${NEW_SLOT}"
             echo "Waiting for $NEW_NODE to join..."
             flarops_wait_for_k3s "$EC2_IP"
             NODE_SEEN=""
@@ -514,15 +671,6 @@ jobs:
           echo "Capsule will be placed on $TARGET_NODE"
           echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
 
-      - name: Setup Werf
-        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
-
-      - name: Login to Docker Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
-        with:
-          registry: docker.io
-          username: ${{ env.REGISTRY_USER }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
       - name: Deploy application with Werf
         env:
           SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
@@ -530,8 +678,9 @@ jobs:
           REGISTRY_SERVER: https://index.docker.io/v1/
         run: |
           umask 077
-          export TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
-          export TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
+          TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          export TF_INSTANCE_TYPE TF_VOLUME_SIZE
           python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
           werf converge \
             --parallel-tasks-limit=3 \
@@ -562,6 +711,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.15.8
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -581,7 +732,12 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-          export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
+          EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - production has not been deployed yet. Run the deploy workflow on the main branch first."
+            exit 1
+          fi
+          export EC2_IP
 
           flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
 
@@ -637,6 +793,8 @@ jobs:
 
       - name: Setup Werf
         uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
+        with:
+          version: v2.78.2
 
       - name: Login to Docker Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
@@ -658,9 +816,90 @@ jobs:
         run: |
           set -euo pipefail
 
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+
+
+          FLAROPS_LOCK_OWNER="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          flarops_kubectl() { flarops_ssh "$1" "sudo k3s kubectl -n default $2"; }
+
+          flarops_slots_lock() {
+            for attempt in $(seq 1 120); do
+              EXPIRES=$(( $(date +%s) + 1200 ))
+              if flarops_kubectl "$1" "create configmap flarops-slots-lock --from-literal=owner=$FLAROPS_LOCK_OWNER --from-literal=expires=$EXPIRES" > /dev/null 2>&1; then
+                echo "Holding the worker-slot lock."
+                return 0
+              fi
+              HELD_UNTIL=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.expires}" 2>/dev/null || true)
+              if [ -n "$HELD_UNTIL" ] && [ "$HELD_UNTIL" -lt "$(date +%s)" ]; then
+                echo "The worker-slot lock expired without being released - taking it over."
+                flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+                continue
+              fi
+              echo "  another workflow is changing worker slots - waiting ($attempt/120)"
+              sleep 10
+            done
+            echo "::error::Another workflow held the worker-slot lock for over 20 minutes."
+            return 1
+          }
+
+          flarops_slots_unlock() {
+            HOLDER=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.owner}" 2>/dev/null || true)
+            if [ "$HOLDER" = "$FLAROPS_LOCK_OWNER" ]; then
+              flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+              echo "Released the worker-slot lock."
+            fi
+          }
+
           cd deploy/terraform
           terraform init
           terraform workspace select -or-create main
+          EC2_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - nothing to reclaim workers from."
+            exit 1
+          fi
+          flarops_slots_lock "$EC2_IP"
+          trap 'flarops_slots_unlock "$EC2_IP"' EXIT
           if ! ALL_OUTPUTS=$(terraform output -json 2>&1); then
             echo "::error::Could not read Terraform outputs: $ALL_OUTPUTS"
             exit 1
@@ -865,7 +1104,6 @@ AWS_REGION=us-west-2
   "dbPasswordKey": "DATABASE_PASSWORD",
   "hasDbPassword": false,
   "dbUrlVars": [],
-  "databaseUrlsDeclared": true,
   "apiRoutes": [
     {
       "path": "/api",
@@ -874,7 +1112,10 @@ AWS_REGION=us-west-2
   ],
   "apiHealthRoute": null,
   "apiHealthPort": null,
-  "hasCloudflare": false
+  "hasCloudflare": false,
+  "apiReplicas": 1,
+  "frontendReplicas": 1,
+  "dbReplicas": 1
 }
 
 # ===== deploy/helm/Chart.yaml
@@ -982,29 +1223,7 @@ spec:
 {{- end -}}
 
 {{- define "flarops.urlencode" -}}
-{{- $s := . | toString -}}
-{{- $s = $s | replace "%" "%25" -}}
-{{- $s = $s | replace " " "%20" -}}
-{{- $s = $s | replace "\"" "%22" -}}
-{{- $s = $s | replace "#" "%23" -}}
-{{- $s = $s | replace "$" "%24" -}}
-{{- $s = $s | replace "&" "%26" -}}
-{{- $s = $s | replace "'" "%27" -}}
-{{- $s = $s | replace "(" "%28" -}}
-{{- $s = $s | replace ")" "%29" -}}
-{{- $s = $s | replace "*" "%2A" -}}
-{{- $s = $s | replace "+" "%2B" -}}
-{{- $s = $s | replace "," "%2C" -}}
-{{- $s = $s | replace "/" "%2F" -}}
-{{- $s = $s | replace ":" "%3A" -}}
-{{- $s = $s | replace ";" "%3B" -}}
-{{- $s = $s | replace "=" "%3D" -}}
-{{- $s = $s | replace "?" "%3F" -}}
-{{- $s = $s | replace "@" "%40" -}}
-{{- $s = $s | replace "[" "%5B" -}}
-{{- $s = $s | replace "\\" "%5C" -}}
-{{- $s = $s | replace "]" "%5D" -}}
-{{- $s -}}
+{{- . | toString | urlquery | replace "+" "%20" -}}
 {{- end -}}
 
 {{- define "flarops.replicas" -}}
@@ -1056,6 +1275,11 @@ spec:
 {{- if $.Values.dataNodeSelector }}
       nodeSelector:
 {{ toYaml $.Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
 {{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:
@@ -1065,6 +1289,12 @@ spec:
       containers:
         - name: api
           image: {{ if .Values.werf }}{{ .Values.werf.image.api }}{{ else }}{{ .Values.images.api | default "api:latest" }}{{ end }}
+{{- if .Values.api.command }}
+          args:
+{{- range $arg := .Values.api.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1392,7 +1622,7 @@ hasFrontend: false
 apiServesFrontend: false
 images:
   api: api:latest
-  db: postgres:18-alpine
+  db: "postgres:18-alpine"
 
 dbCloneSource: ""
 dbType: null
@@ -1445,6 +1675,7 @@ terraform {
     encrypt      = true
     use_lockfile = true
   }
+  required_version = "~> 1.15"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -1715,7 +1946,7 @@ resource "aws_instance" "worker" {
     INSTALL_K3S_VERSION="${var.k3s_version}" \
       K3S_URL="https://${aws_instance.server.private_ip}:6443" \
       K3S_TOKEN="${random_password.k3s_token.result}" \
-      INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" \
+      INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --node-taint flarops.io/capsule=true:NoSchedule" \
       sh /tmp/k3s-install.sh
 
     for attempt in $(seq 1 60); do
@@ -1829,6 +2060,18 @@ repositorySettings:
                                     # null for none - on Docker Hub, your own user
   repository: e-nocompose           # repository the images are pushed to
 
+# sync lock
+# Files "flarops sync" must not overwrite - for a change Flarops cannot
+# express, made by hand in a chart template or a workflow. List each with
+# true; sync then leaves it as it is and says which changes did not reach it:
+#
+# syncLock:
+#   deploy/helm/templates/api.yaml: true
+#   .github/workflows/deploy.yml: true
+#
+# deploy/helm/values.yaml and werf.yaml cannot be locked.
+syncLock: {}
+
 api:
   dockerfile: Dockerfile
   context: backend
@@ -1855,8 +2098,8 @@ api:
 # Each top-level key is a service name (must be unique, RFC-1123 compatible).
 # A service MUST have either `image` OR `dockerfile` + `context`, and `replicas`.
 #
-# Paths in `dockerfile` and `context` are RELATIVE TO THE PROJECT ROOT
-# (not relative to the deploy directory, and not the way werf spells them).
+# `context` is RELATIVE TO THE PROJECT ROOT (not to the deploy directory);
+# `dockerfile` is relative to `context`, as in docker-compose and werf.
 #
 # --- Required fields --------------------------------------------------------
 #
@@ -1865,8 +2108,8 @@ api:
 #   image: "registry.example.com/org/image:tag"
 #
 #   # OPTION B: built from a Dockerfile in this repository
-#   dockerfile: "path/to/Dockerfile"        # relative to project root
 #   context: "path/to"                      # Docker build context, relative to project root
+#   dockerfile: "Dockerfile"                # relative to context (path/to/Dockerfile here)
 #
 #   replicas: 1                             # number of pod replicas
 #
@@ -1926,11 +2169,14 @@ api:
 #                                            #  reverse proxy did it before
 #
 #   db:                                     # per-service database (generates its own StatefulSet)
-#     type: "postgres"                      # postgres | mysql | mariadb | mongodb
-#     image: "postgres:18-alpine"
-#     port: 5432
-#     user: "postgres"
-#     name: "mydb"
+#     type: "postgres"                      # required: postgres | mysql | mariadb | mongodb
+#     secretEnvs:                           # required: the password, as for a service
+#       POSTGRES_PASSWORD: MY_SERVICE_DB_PASSWORD
+#     image: "postgres:18-alpine"           # optional, like the rest: the engine's
+#     port: 5432                            #  defaults fill in what is left out;
+#     user: "postgres"                      #  port moves the Service address only -
+#     name: "mydb"                          #  the server keeps its own port
+#     replicas: 1                           # 0 or 1
 #     command:                              # server settings, as in compose;
 #       - "postgres"                        #  the same field works on the
 #       - "-c"                              #  top-level database: block
@@ -1956,8 +2202,8 @@ deploy:
   helmChartDir: deploy/helm
 ---
 image: api
-dockerfile: Dockerfile
-context: backend
+dockerfile: "Dockerfile"
+context: "backend"
 ---
 image: dashboard
 dockerfile: Dockerfile

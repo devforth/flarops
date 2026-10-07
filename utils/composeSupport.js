@@ -47,8 +47,21 @@ function readSection(block, sectionName) {
   return out;
 }
 
+// A "#" starts a comment only after whitespace and outside quotes.
 function stripInlineComment(value) {
-  return value.replace(/\s+#.*$/, '').trim();
+  let quote = null;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (quote) {
+      if (c === '\\' && quote === '"') i++;
+      else if (c === quote) quote = null;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (c === '#' && i > 0 && /\s/.test(value[i - 1])) {
+      return value.slice(0, i).trim();
+    }
+  }
+  return value.trim();
 }
 
 function unquote(value) {
@@ -98,14 +111,25 @@ function extractPorts(block, image) {
   return Array.from(ports);
 }
 
+// `environment:` as a map (KEY: value) or a list (- KEY=value, quoted or not), read as YAML.
 function extractEnv(block) {
   const env = {};
   for (const entry of readSection(block, 'environment')) {
     const raw = entry.line;
     if (!raw) continue;
-    const m = raw.match(/^[ \t]*(?:-\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*[:=]\s*([\s\S]*)$/);
+    const listItem = raw.match(/^[ \t]*-\s+([\s\S]*)$/);
+    if (listItem) {
+      // The whole item is one scalar: unquote it first, then split at the first "=".
+      const text = parseComposeScalar(listItem[1]);
+      const eq = text.indexOf('=');
+      if (eq === -1) continue; // "- KEY" passes the host's value through; there is none here
+      const key = text.slice(0, eq).trim();
+      if (/^[A-Za-z_][A-Za-z0-9_.]*$/.test(key)) env[key] = text.slice(eq + 1);
+      continue;
+    }
+    const m = raw.match(/^[ \t]*([A-Za-z_][A-Za-z0-9_.]*)\s*:(?:\s+([\s\S]*))?$/);
     if (!m) continue;
-    env[m[1]] = parseComposeScalar(m[2]);
+    env[m[1]] = m[2] === undefined ? '' : parseComposeScalar(m[2]);
   }
   return env;
 }
@@ -187,10 +211,20 @@ function splitFlowItems(body) {
   return items.map(s => s.trim()).filter(s => s !== '');
 }
 
-// `command:` in every form compose accepts: block list, flow list or a single string.
+// `command:` in every form compose accepts: block list, flow list, a single string, or a block
+// scalar (| or >) holding that string.
 function extractCommand(block) {
   const args = [];
   const section = readSection(block, 'command');
+  const head = section[0] && section[0].inline ? stripInlineComment(section[0].inline) : null;
+  if (head && /^[|>][-+]?\d*$/.test(head)) {
+    const lines = section.slice(1).map(e => e.line || '');
+    const indent = Math.min(...lines.filter(l => l.trim() !== '').map(l => l.match(/^[ \t]*/)[0].length));
+    const body = lines.map(l => l.slice(indent));
+    const text = head[0] === '>' ? body.join(' ') : body.join('\n');
+    const words = tokenizeShellWords(text.trim());
+    return words.length > 0 ? words : null;
+  }
   for (const entry of section) {
     if (entry.inline) {
       const inline = stripInlineComment(entry.inline);
@@ -238,27 +272,63 @@ function extractEnvFiles(block) {
   return out.filter(e => e.path);
 }
 
-// A named volume becomes a PVC; a bind mount ships host files and is handled separately.
+// A named volume becomes a PVC; a bind mount ships host files and is handled separately. Short
+// ("data:/data"), long (type/source/target) and flow ([...]) forms are read; anything else is
+// returned as unparsed so the caller can say so.
 function extractVolumes(block) {
   const persistent = [];
   const bindMounts = [];
-  for (const entry of readSection(block, 'volumes')) {
-    const raw = entry.line;
-    if (!raw) continue;
-    const item = raw.match(/^\s*-\s*([\s\S]+)$/);
-    if (!item) continue;
-    const spec = unquote(stripInlineComment(item[1]));
-    const parts = spec.split(':');
-    if (parts.length < 2) continue;
-    const source = parts[0];
-    const target = parts[1];
-    if (source.startsWith('.') || source.startsWith('/') || source.startsWith('~')) {
+  const unparsed = [];
+
+  const add = (source, target, type) => {
+    if (!source || !target || !target.startsWith('/')) return false;
+    if (type === 'bind' || source.startsWith('.') || source.startsWith('/') || source.startsWith('~')) {
       bindMounts.push({ source, target });
-    } else if (/^[A-Za-z0-9._-]+$/.test(source)) {
-      persistent.push({ name: source, target });
+      return true;
     }
+    if ((type === undefined || type === 'volume') && /^[A-Za-z0-9._-]+$/.test(source)) {
+      persistent.push({ name: source, target });
+      return true;
+    }
+    return false;
+  };
+  const addShort = (spec) => {
+    const parts = spec.split(':');
+    if (parts.length < 2 || !add(parts[0], parts[1])) unparsed.push(spec);
+  };
+
+  // Items: short-form strings, or long-form maps spread over several lines.
+  const items = [];
+  for (const entry of readSection(block, 'volumes')) {
+    if (entry.inline) {
+      const inline = stripInlineComment(entry.inline);
+      if (inline.startsWith('[')) {
+        for (const part of splitFlowItems(inline.replace(/^\[/, '').replace(/\]\s*$/, ''))) items.push(parseComposeScalar(part));
+      }
+      continue;
+    }
+    const raw = entry.line;
+    const item = raw.match(/^\s*-\s*([\s\S]+)$/);
+    // "type: volume" is a field; "pgdata:/var/lib/postgresql" is a short-form volume (no space).
+    const field = (text) => text.match(/^([A-Za-z_]+):(?:\s+([\s\S]*))?$/);
+    if (item) {
+      const text = stripInlineComment(item[1]);
+      const f = field(text);
+      if (f && !text.startsWith('"') && !text.startsWith("'")) items.push({ [f[1]]: parseComposeScalar(f[2] || '') });
+      else items.push(parseComposeScalar(text));
+      continue;
+    }
+    const last = items[items.length - 1];
+    const f = field(stripInlineComment(raw.trim()));
+    if (last && typeof last === 'object' && f) last[f[1]] = parseComposeScalar(f[2] || '');
   }
-  return { persistent, bindMounts };
+
+  for (const item of items) {
+    if (typeof item === 'string') { addShort(item); continue; }
+    if (item.type === 'tmpfs') continue;
+    if (!add(item.source, item.target, item.type)) unparsed.push(JSON.stringify(item));
+  }
+  return { persistent, bindMounts, unparsed };
 }
 
 function extractBuildArgs(block) {
@@ -288,12 +358,14 @@ function looksLikeNodeAgent(bindMounts) {
     NODE_AGENT_HOST_PATHS.some((p) => source === p || source.startsWith(p + '/')));
 }
 
-// RFC 1123 object name: lowercase alphanumerics and "-", starting and ending alphanumeric, max 63.
+// A Service name (RFC 1035 label): lowercase alphanumerics and "-", starting with a letter, ending
+// alphanumeric, max 63.
 function toK8sName(raw) {
   let name = String(raw).toLowerCase().replace(/[^a-z0-9-]/g, '-');
   name = name.replace(/-+/g, '-').replace(/^-+/, '').replace(/-+$/, '');
-  if (name.length > 63) name = name.slice(0, 63).replace(/-+$/, '');
   if (name === '') return null;
+  if (/^[0-9]/.test(name)) name = `svc-${name}`;
+  if (name.length > 63) name = name.slice(0, 63).replace(/-+$/, '');
   return name;
 }
 
@@ -301,7 +373,7 @@ function parseSupportService(composeName, block) {
   const image = extractImage(block);
   if (!image) return null;
   if (!toK8sName(composeName)) return null;
-  const { persistent, bindMounts } = extractVolumes(block);
+  const { persistent, bindMounts, unparsed } = extractVolumes(block);
   return {
     composeName,
     name: toK8sName(composeName),
@@ -311,6 +383,7 @@ function parseSupportService(composeName, block) {
     command: extractCommand(block),
     volumes: persistent,
     bindMounts,
+    unparsedVolumes: unparsed,
     isNodeAgent: looksLikeNodeAgent(bindMounts),
   };
 }
@@ -336,12 +409,17 @@ const SECRET_FILENAME_REGEX = /(^|[-_.])(id_rsa|id_dsa|id_ecdsa|id_ed25519)($|[-
 
 const SECRET_CONTENT_REGEX = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|-----BEGIN PGP PRIVATE|-----BEGIN OPENSSH PRIVATE KEY-----|PuTTY-User-Key-File/;
 
-const SECRET_ASSIGNMENT_REGEX = /^[ \t]*["']?[A-Za-z0-9_.-]*(PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL)[A-Za-z0-9_.-]*["']?[ \t]*[:=][ \t]*["']?(?!\s*$)(?!\$\{)(?!<)(?!changeme\b)(?!change_me\b)(?!your[-_])(?!example\b)(?!placeholder\b)(?!todo\b)(?!tbd\b)(?!""|'')\S/im;
+// Bounded repetition: an unbounded run of name characters before and after the keyword makes a long
+// line take quadratic time.
+const NOT_A_PLACEHOLDER = `["']?(?!\\s*$)(?!\\$\\{)(?!<)(?!changeme\\b)(?!change_me\\b)(?!your[-_])(?!example\\b)(?!placeholder\\b)(?!todo\\b)(?!tbd\\b)(?!""|'')\\S`;
+const SECRET_ASSIGNMENT_REGEX = new RegExp(`^[ \\t]*["']?[A-Za-z0-9_.-]{0,64}(PASSWORD|PASSWD|(?<![A-Za-z0-9])PASS\\b|SECRET|TOKEN|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL)[A-Za-z0-9_.-]{0,64}["']?[ \\t]*[:=][ \\t]*${NOT_A_PLACEHOLDER}`, 'im');
+// Directives that take the secret after a space: redis.conf, and the like.
+const SECRET_DIRECTIVE_REGEX = new RegExp(`^[ \\t]*(requirepass|masterauth|masterpass)[ \\t]+${NOT_A_PLACEHOLDER}`, 'im');
 
 function secretMaterialReason(name, content) {
   if (SECRET_FILENAME_REGEX.test(name)) return `"${name}" is named like key or credential material`;
   if (SECRET_CONTENT_REGEX.test(content)) return `"${name}" contains a private key block`;
-  if (SECRET_ASSIGNMENT_REGEX.test(content)) return `"${name}" assigns a credential a real value`;
+  if (SECRET_ASSIGNMENT_REGEX.test(content) || SECRET_DIRECTIVE_REGEX.test(content)) return `"${name}" assigns a credential a real value`;
   return null;
 }
 
@@ -349,7 +427,9 @@ function isProbablyText(buf) {
   return !buf.includes(0);
 }
 
-function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
+// Paths resolve against baseDir (the compose file's directory); nothing outside rootDir (the
+// repository) is read.
+function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts, rootDir = baseDir) {
   const data = {};
   const fileMounts = [];
   const dirMounts = [];
@@ -387,9 +467,9 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
     }
     let realBase;
     try {
-      realBase = fsMod.realpathSync(baseDir);
+      realBase = fsMod.realpathSync(rootDir);
     } catch (e) {
-      realBase = baseDir;
+      realBase = rootDir;
     }
     const rel = pathMod.relative(realBase, realAbs);
     if (rel.startsWith('..') || pathMod.isAbsolute(rel)) {
@@ -421,7 +501,10 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
       for (const entry of entries) {
         if (!entry.isFile()) continue;
         let buf;
-        try { buf = fsMod.readFileSync(pathMod.join(abs, entry.name)); } catch (e) { continue; }
+        try {
+          if (fsMod.statSync(pathMod.join(abs, entry.name)).size > MAX_CONFIG_FILE_BYTES) continue;
+          buf = fsMod.readFileSync(pathMod.join(abs, entry.name));
+        } catch (e) { continue; }
         if (!isProbablyText(buf)) continue;
         const reason = secretMaterialReason(entry.name, buf.toString('utf8'));
         if (reason) { dirSecretReason = reason; break; }
@@ -452,4 +535,4 @@ function materializeBindMounts(fsMod, pathMod, baseDir, bindMounts) {
   return { data: carried ? data : null, fileMounts, dirMounts, unresolved };
 }
 
-module.exports = { parseSupportService, extractBuildArgs, extractCommand, extractEnvFiles, parseComposeScalar, extractVolumes, looksLikeNodeAgent, materializeBindMounts, secretMaterialReason, toK8sName, tokenizeShellWords, WELL_KNOWN_IMAGE_PORTS };
+module.exports = { parseSupportService, extractEnv, extractBuildArgs, extractCommand, extractEnvFiles, parseComposeScalar, extractVolumes, looksLikeNodeAgent, materializeBindMounts, secretMaterialReason, toK8sName, tokenizeShellWords, WELL_KNOWN_IMAGE_PORTS };

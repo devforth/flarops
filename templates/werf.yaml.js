@@ -1,9 +1,18 @@
+// werf.yaml is itself a Go template: a value is written as a quoted YAML string whose "{{" is
+// printed, not evaluated.
+function werfString(value) {
+  const yaml = String(value)
+    .replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+  return `"${yaml.replace(/\{\{/g, '{{ "{{" }}')}"`;
+}
+
 // build.args reach the image build only through werf.
 function renderBuildArgs(args) {
   if (!args || Object.keys(args).length === 0) return '';
   let out = 'args:\n';
   for (const [key, value] of Object.entries(args)) {
-    out += `  ${key}: "${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"\n`;
+    out += `  ${key}: ${werfString(value)}\n`;
   }
   return out;
 }
@@ -17,22 +26,22 @@ deploy:
   if (config.backendPath) {
     yaml += `---
 image: api
-dockerfile: ${config.apiDockerfile}
-context: ${config.backendPath === '.' ? '.' : config.backendPath}
+dockerfile: ${werfString(config.apiDockerfile)}
+context: ${werfString(config.backendPath)}
 ${renderBuildArgs(config.apiBuildArgs)}`;
   }
   if (config.frontendPath) {
     yaml += `---
 image: frontend
-dockerfile: ${config.frontendDockerfile}
-context: ${config.frontendPath}
+dockerfile: ${werfString(config.frontendDockerfile)}
+context: ${werfString(config.frontendPath)}
 ${renderBuildArgs(config.frontendBuildArgs)}`;
   }
   if (config.dbHasLocalDockerfile) {
     yaml += `---
 image: db
-dockerfile: ${config.dbLocalDockerfile}
-context: ${config.dbContext === '.' ? '.' : config.dbContext}
+dockerfile: ${werfString(config.dbLocalDockerfile)}
+context: ${werfString(config.dbContext || '.')}
 `;
   }
   
@@ -48,8 +57,8 @@ context: ${config.dbContext === '.' ? '.' : config.dbContext}
 
       yaml += `---
 image: ${s.name}
-dockerfile: ${dockerfilePath}
-context: ${context}
+dockerfile: ${werfString(dockerfilePath)}
+context: ${werfString(context)}
 ${renderBuildArgs(s.buildArgs)}`;
     }
   }

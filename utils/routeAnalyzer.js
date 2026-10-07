@@ -1,4 +1,4 @@
-const fs = require('fs').promises;
+const fs = require('./textFs.js');
 const path = require('path');
 const { walkDir, logDebug } = require('./fsHelper');
 const { COMMON_API_PREFIXES } = require('./constants');

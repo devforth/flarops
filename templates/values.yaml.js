@@ -21,7 +21,7 @@ ${generateEnvString(s.env, context, '      ')}
     secretKeys:
 ${s.secretKeys.map(k => '      - ' + k).join('\n')}
     ports:${s.ports.length === 0 ? ' []' : '\n' + s.ports.map(p => '      - ' + p).join('\n')}
-    replicas: ${s.replicas || 1}
+    replicas: ${s.replicas ?? 1}
     healthRoute: ${s.healthRoute ? '"' + yamlEscapeDoubleQuoted(s.healthRoute) + '"' : 'null'}
     healthPort: ${s.healthPort || 'null'}
     exposedRoutes:
@@ -35,7 +35,7 @@ ${s.command ? `    command:\n${s.command.map(a => '      - "' + yamlEscapeDouble
       port: ${s.db.port}
       user: "${yamlEscapeDoubleQuoted(s.db.user)}"
       name: "${yamlEscapeDoubleQuoted(s.db.name)}"
-      replicas: ${s.db.replicas || 1}
+      replicas: ${s.db.replicas ?? 1}
       storage: "10Gi"
 ${s.db.command ? `      command:\n${s.db.command.map(a => '        - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}` : ''}`;
     }
@@ -49,7 +49,7 @@ ${s.db.command ? `      command:\n${s.db.command.map(a => '        - "' + yamlEs
     for (const s of config.supportServices) {
       supportServicesYaml += `  - name: ${s.name}
     image: "${yamlEscapeDoubleQuoted(s.image)}"
-    replicas: ${s.replicas || 1}
+    replicas: ${s.replicas ?? 1}
     env:
 ${generateEnvString(s.env, context, '      ')}
     secretKeys:
@@ -71,7 +71,7 @@ hasFrontend: ${config.hasFrontend}
 apiServesFrontend: ${!!config.apiServesFrontend}
 images:
 ${config.hasBackend ? `  api: ${config.images.api}` : ''}
-  db: ${config.images.db}
+  db: ${config.images.db ? '"' + yamlEscapeDoubleQuoted(config.images.db) + '"' : 'null'}
 ${config.hasFrontend ? `  frontend: ${config.images.frontend}` : ''}
 dbCloneSource: "${yamlEscapeDoubleQuoted(config.dbCloneSource)}"
 dbType: ${config.dbType ? '"' + config.dbType + '"' : 'null'}
@@ -80,12 +80,12 @@ database:
   user: "${yamlEscapeDoubleQuoted(config.dbUser)}"
   password: null
   name: "${yamlEscapeDoubleQuoted(config.dbName)}"
-  replicas: ${config.dbReplicas || 1}
+  replicas: ${config.dbReplicas ?? 1}
   storage: "${yamlEscapeDoubleQuoted(config.dbStorage || '10Gi')}"
 ${config.dbCommand ? `  command:\n${config.dbCommand.map(a => '    - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}  env:
     # KEY: "VALUE"
 ${config.hasBackend ? `api:
-  replicas: ${config.apiReplicas || 1}
+  replicas: ${config.apiReplicas ?? 1}
   healthRoute: ${config.apiHealthRoute ? '"' + yamlEscapeDoubleQuoted(config.apiHealthRoute) + '"' : 'null'}
   healthPort: ${config.apiHealthPort || 'null'}
   secretKeys:
@@ -95,7 +95,7 @@ ${generateEnvString(config.apiEnv || {}, context)}
 ${config.apiCommand ? `  command:\n${config.apiCommand.map(a => '    - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}apiPorts:
 ${config.apiPorts.map(p => '  - ' + p).join('\n')}` : ''}
 ${config.hasFrontend ? `frontend:
-  replicas: ${config.frontendReplicas || 1}
+  replicas: ${config.frontendReplicas ?? 1}
   secretKeys:
 ${config.frontendSecretKeys.map(k => '    - ' + k).join('\n')}
   env:

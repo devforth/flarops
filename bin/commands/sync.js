@@ -9,10 +9,10 @@ const { readState, writeState, STATE_FILE } = require('../../utils/state.js');
 const { makeServiceEntry } = require('../../utils/analyzer.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
 const { unmountedSecretKeys } = require('../../utils/secretWiring.js');
-const { validateDeclarations, validateRepositorySettings } = require('../../utils/flaropsValidate.js');
+const { validateDeclarations, validateRepositorySettings, validateSyncLock } = require('../../utils/flaropsValidate.js');
 const { isDockerHub } = require('../../utils/registry.js');
-const { defaultUserFor } = require('../../utils/dbDefaults.js');
-const { renderChartTemplates } = require('../../templates/chart.js');
+const { defaultUserFor, defaultImageFor, defaultPortFor } = require('../../utils/dbDefaults.js');
+const { renderChartTemplates, ChartConflict } = require('../../templates/chart.js');
 const renderValues = require('../../templates/values.yaml.js');
 const renderWerf = require('../../templates/werf.yaml.js');
 const renderDeployWorkflow = require('../../templates/deploy.yml.js');
@@ -45,30 +45,73 @@ const ALWAYS_PRESENT = new Set([
 
 // Not a service: the image repository settings at the top of flarops.yaml.
 const REPOSITORY_SETTINGS = 'repositorySettings';
+// Not a service either: the files sync must leave as they are.
+const SYNC_LOCK = 'syncLock';
 
-function declaredServices(text) {
+// Reads flarops.yaml once: the services, the repository settings and the locked files.
+function readFlaropsYaml(text) {
   const doc = parse(text);
-  const out = new Map();
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new YamlError('flarops.yaml must be a map of service blocks');
+  }
+  return {
+    declared: declaredServices(doc),
+    repository: declaredRepositorySettings(doc),
+    locked: declaredSyncLock(doc),
+  };
+}
+
+function declaredServices(doc) {
+  if (typeof doc === 'string') doc = parse(doc);
+  const raw = new Map();
   for (const [name, body] of Object.entries(doc)) {
-    if (name === REPOSITORY_SETTINGS) continue;
+    if (name === REPOSITORY_SETTINGS || name === SYNC_LOCK) continue;
     if (body !== null && typeof body !== 'object') {
       throw new YamlError(`"${name}" must be a service block, not a single value`);
     }
     if (Array.isArray(body)) {
       throw new YamlError(`"${name}" must be a service block, not a list`);
     }
-    out.set(name, { ...SERVICE_DEFAULTS, ...(body || {}) });
+    raw.set(name, body || {});
   }
-  validateDeclarations(out);
+  // Validated as written, before the defaults are laid over it.
+  validateDeclarations(raw);
+  const out = new Map();
+  for (const [name, body] of raw) out.set(name, { ...SERVICE_DEFAULTS, ...body });
   return out;
 }
 
 // The repositorySettings block, or null when the file has none (written before it existed).
-function declaredRepositorySettings(text) {
-  const block = parse(text)[REPOSITORY_SETTINGS];
+function declaredRepositorySettings(doc) {
+  const block = doc[REPOSITORY_SETTINGS];
   if (block === undefined) return null;
   validateRepositorySettings(block);
   return block;
+}
+
+function declaredSyncLock(doc) {
+  const block = doc[SYNC_LOCK];
+  validateSyncLock(block);
+  return new Set(Object.entries(block || {}).filter(([, locked]) => locked).map(([file]) => file));
+}
+
+// Lockable: the chart templates and the workflows. values.yaml and werf.yaml carry flarops.yaml
+// itself, and the state is sync's own memory - locking those would make flarops.yaml a no-op.
+const UNLOCKABLE = new Map([
+  ['deploy/helm/values.yaml', 'it carries flarops.yaml\'s values into the chart'],
+  ['werf.yaml', 'it carries flarops.yaml\'s images into the build'],
+  ['deploy/.flarops-state.json', 'it is what sync remembers about the project'],
+]);
+
+function checkSyncLock(locked, lockable) {
+  for (const file of locked) {
+    if (UNLOCKABLE.has(file)) {
+      throw new YamlError(`"syncLock.${file}" cannot be locked: ${UNLOCKABLE.get(file)}`);
+    }
+    if (!lockable.has(file)) {
+      throw new YamlError(`"syncLock.${file}" is not a file sync writes - lock a chart template under deploy/helm/templates/, .github/workflows/deploy.yml or .github/workflows/pr-capsule.yml`);
+    }
+  }
 }
 
 // secretEnvs is "env name: Secret key"; the chart splits same-name keys from renamed ones.
@@ -122,22 +165,24 @@ function asList(value) {
 
 // databaseUrls: env names that get the URL of the service's database - its own db: if it has one,
 // otherwise the top-level database. What init learned about each name (scheme, database, query)
-// is kept. Absent means none, except in state from before the field existed: there the URLs
-// init built stay until flarops.yaml names them.
+// is kept.
 function declaredUrlVars(config, decl, previous) {
-  if (decl.databaseUrls === undefined || decl.databaseUrls === null) {
-    return config.databaseUrlsDeclared ? [] : (previous || []);
-  }
   return asList(decl.databaseUrls).map(String).map(key => (previous || []).find(v => v.key === key) || { key });
 }
 
 function makeRecorder(changes) {
   // "absent" and "empty" are the same to every consumer; do not report them as a change.
+  // Key order is not a change either.
+  const sorted = (v) => {
+    if (Array.isArray(v)) return v.map(sorted);
+    if (v && typeof v === 'object') return Object.fromEntries(Object.keys(v).sort().map(k => [k, sorted(v[k])]));
+    return v;
+  };
   const normalize = (v) => {
     if (v === undefined || v === null || v === false) return null;
-    if (Array.isArray(v)) return v.length === 0 ? null : v;
+    if (Array.isArray(v)) return v.length === 0 ? null : sorted(v);
     if (typeof v === 'object' && Object.keys(v).length === 0) return null;
-    return v;
+    return sorted(v);
   };
   const same = (a, b) => JSON.stringify(normalize(a)) === JSON.stringify(normalize(b));
   return function set(target, key, value, label) {
@@ -147,6 +192,13 @@ function makeRecorder(changes) {
   };
 }
 
+// An empty value ("KEY:") is an empty string, not the text "null".
+function envOf(decl) {
+  const out = {};
+  for (const [key, value] of Object.entries(decl.env || {})) out[key] = value === null ? '' : value;
+  return out;
+}
+
 function applyPrimary(config, name, decl, set) {
   const prefix = name === 'api' ? 'api' : 'frontend';
   const { secretKeys, extraSecretEnvMappings } = splitSecretEnvs(decl.secretEnvs);
@@ -154,7 +206,7 @@ function applyPrimary(config, name, decl, set) {
 
   set(config, `${prefix}Replicas`, decl.replicas, `${name}.replicas`);
   set(config, `${prefix}Ports`, asList(decl.ports).map(Number), `${name}.ports`);
-  set(config, `${prefix}Env`, decl.env || {}, `${name}.env`);
+  set(config, `${prefix}Env`, envOf(decl), `${name}.env`);
   set(config, `${prefix}SecretKeys`,
     withoutDedicatedKeys(secretKeys, config.hasDbPassword ? config.dbPasswordKey : null),
     `${name}.secretEnvs (same name)`);
@@ -166,7 +218,11 @@ function applyPrimary(config, name, decl, set) {
     set(config, prefix === 'api' ? 'backendPath' : 'frontendPath', String(decl.context), `${name}.context`);
   }
   if (prefix === 'api') {
-    set(config, 'dbUrlVars', declaredUrlVars(config, decl, config.dbUrlVars), 'api.databaseUrls');
+    const urlVars = declaredUrlVars(config, decl, config.dbUrlVars);
+    if (urlVars.length > 0 && !config.hasDb) {
+      throw new YamlError('"api.databaseUrls" needs a database: declare a top-level database: block');
+    }
+    set(config, 'dbUrlVars', urlVars, 'api.databaseUrls');
     set(config, 'apiHealthRoute', decl.healthRoute, 'api.healthRoute');
     set(config, 'apiHealthPort', decl.healthPort, 'api.healthPort');
     set(config, 'apiRoutes', normalizeRoutes(asList(decl.exposedRoutes)), 'api.exposedRoutes');
@@ -177,7 +233,14 @@ function applyPrimary(config, name, decl, set) {
 function applyDatabase(config, decl, set) {
   set(config, 'dbReplicas', decl.replicas, 'database.replicas');
   if (decl.image) set(config.images, 'db', String(decl.image), 'database.image');
-  if (decl.type) set(config, 'dbType', String(decl.type), 'database.type');
+  if (decl.dockerfile) {
+    set(config, 'dbHasLocalDockerfile', true, 'database.dockerfile');
+    set(config, 'dbLocalDockerfile', String(decl.dockerfile), 'database.dockerfile');
+    set(config, 'dbContext', decl.context === null || decl.context === undefined ? '.' : String(decl.context), 'database.context');
+  } else if (decl.image) {
+    set(config, 'dbHasLocalDockerfile', false, 'database.image');
+  }
+  if (decl.type) set(config, 'dbType', String(decl.type).toLowerCase(), 'database.type');
   if (decl.port) set(config, 'dbPort', Number(decl.port), 'database.port');
   if (decl.user) set(config, 'dbUser', String(decl.user), 'database.user');
   if (decl.name) set(config, 'dbName', String(decl.name), 'database.name');
@@ -186,7 +249,6 @@ function applyDatabase(config, decl, set) {
   // all the chart needs. A second distinct key cannot be mounted; unmountedSecretKeys reports it.
   const distinctKeys = [...new Set(Object.values(decl.secretEnvs || {}).map(String))];
   if (distinctKeys.length > 0) set(config, 'dbPasswordKey', distinctKeys[0], 'database.secretEnvs');
-  set(config, 'hasDb', true, 'database present');
 }
 
 function newService(name, decl) {
@@ -205,20 +267,34 @@ function newService(name, decl) {
   });
 }
 
-function applyService(service, decl, set, label) {
+// A db: block is the service's own database, built from what it declares and the engine's defaults.
+function ownDatabaseOf(name, declDb, previous) {
+  const type = String(declDb.type).toLowerCase();
+  const db = {
+    type,
+    image: declDb.image ? String(declDb.image) : defaultImageFor(type),
+    port: Number(declDb.port || defaultPortFor(type)),
+    user: declDb.user ? String(declDb.user) : defaultUserFor(type),
+    name: declDb.name ? String(declDb.name) : `${name}db`,
+    passwordKey: String(Object.values(declDb.secretEnvs)[0]),
+  };
+  if (declDb.replicas !== null && declDb.replicas !== undefined) db.replicas = declDb.replicas;
+  if (declDb.command) db.command = asList(declDb.command).map(String);
+  if (previous && previous.composeServiceName) db.composeServiceName = previous.composeServiceName;
+  return db;
+}
+
+function applyService(service, decl, set, label, notes) {
   const { secretKeys, extraSecretEnvMappings } = splitSecretEnvs(decl.secretEnvs);
   set(service, 'replicas', decl.replicas, `${label}.replicas`);
   set(service, 'ports', asList(decl.ports).map(Number), `${label}.ports`);
-  set(service, 'env', decl.env || {}, `${label}.env`);
+  set(service, 'env', envOf(decl), `${label}.env`);
   set(service, 'secretKeys',
     withoutDedicatedKeys(secretKeys, service.dbPasswordKey, service.springDatasourcePasswordSecretKey),
     `${label}.secretEnvs (same name)`);
   set(service, 'extraSecretEnvMappings', extraSecretEnvMappings, `${label}.secretEnvs (renamed)`);
   set(service, 'exposedRoutes', normalizeRoutes(asList(decl.exposedRoutes)), `${label}.exposedRoutes`);
   set(service, 'volumes', parseVolumes(decl.volumes), `${label}.volumes`);
-  if (decl.oneShot && asList(decl.exposedRoutes).length > 0) {
-    throw new YamlError(`"${label}" is oneShot, so it has no Service and cannot own exposedRoutes`);
-  }
   set(service, 'oneShot', !!decl.oneShot, `${label}.oneShot`);
   set(service, 'healthRoute', decl.healthRoute, `${label}.healthRoute`);
   set(service, 'healthPort', decl.healthPort, `${label}.healthPort`);
@@ -229,14 +305,13 @@ function applyService(service, decl, set, label) {
     set(service, 'relativePath', String(decl.context), `${label}.context`);
   }
   if (decl.image) set(service, 'image', String(decl.image), `${label}.image`);
+
+  const previousOwn = service.db && !service.db.shared ? service.db : null;
   if (decl.db) {
-    const db = { ...(service.db || {}), ...decl.db };
-    const dbKeys = Object.values(decl.db.secretEnvs || {});
-    if (dbKeys.length > 0) db.passwordKey = String(dbKeys[0]);
-    if (decl.db.command) db.command = asList(decl.db.command).map(String);
-    else delete db.command;
-    delete db.secretEnvs;
-    set(service, 'db', db, `${label}.db`);
+    set(service, 'db', ownDatabaseOf(label, decl.db, previousOwn), `${label}.db`);
+  } else if (previousOwn) {
+    set(service, 'db', null, `${label}.db removed`);
+    notes.push(`${label}'s own database is removed from the chart. Its data volume (PVC data-${label}-db-0) stays in the cluster until you delete it - "kubectl delete pvc data-${label}-db-0" once nothing needs it.`);
   }
 }
 
@@ -268,15 +343,20 @@ function applyDatabaseUrls(config, service, decl, set, label) {
 
 // Older state has no replica counts; absent means the default, or every sync would report changes.
 function normalizeState(config) {
-  // State written before repositorySettings existed: the defaults init would have recorded.
-  config.dockerRepository = config.dockerRepository || config.projectName;
-  if (config.dockerProject === undefined) config.dockerProject = null;
-  config.apiReplicas = config.apiReplicas || SERVICE_DEFAULTS.replicas;
-  config.frontendReplicas = config.frontendReplicas || SERVICE_DEFAULTS.replicas;
-  config.dbReplicas = config.dbReplicas || SERVICE_DEFAULTS.replicas;
-  if (config.dbCommand === undefined) config.dbCommand = null;
+  config.apiReplicas = config.apiReplicas ?? SERVICE_DEFAULTS.replicas;
+  config.frontendReplicas = config.frontendReplicas ?? SERVICE_DEFAULTS.replicas;
+  config.dbReplicas = config.dbReplicas ?? SERVICE_DEFAULTS.replicas;
+  if (config.dbType) config.dbType = String(config.dbType).toLowerCase();
   for (const service of [...(config.additionalServices || []), ...(config.supportServices || [])]) {
-    service.replicas = service.replicas || SERVICE_DEFAULTS.replicas;
+    service.replicas = service.replicas ?? SERVICE_DEFAULTS.replicas;
+    // init records the repository root as "", flarops.yaml spells it ".".
+    if (service.relativePath === '') service.relativePath = '.';
+    // A URL naming the database it was built for follows that database when it is renamed; only a
+    // different database on the same server keeps its own name.
+    const dbName = service.db ? (service.db.shared ? config.dbName : service.db.name) : null;
+    for (const v of service.dbUrlVars || []) {
+      if (v.dbName && v.dbName === dbName) delete v.dbName;
+    }
   }
 }
 
@@ -297,7 +377,7 @@ function secretKeysFor(declared, config) {
     for (const secretKey of Object.values(decl.secretEnvs || {})) add(String(secretKey));
     for (const secretKey of Object.values((decl.db || {}).secretEnvs || {})) add(String(secretKey));
   }
-  add(config.dbPasswordKey);
+  if (config.hasDb) add(config.dbPasswordKey);
   for (const key of ALWAYS_PASSED) add(key);
 
   // Keep the existing order so an unchanged sync produces no diff in the workflows.
@@ -308,6 +388,7 @@ function secretKeysFor(declared, config) {
 
 function applyDeclarations(state, declared, repository = null) {
   const changes = [];
+  const notes = [];
   const set = makeRecorder(changes);
   const config = state;
   normalizeState(config);
@@ -329,12 +410,23 @@ function applyDeclarations(state, declared, repository = null) {
     }
   }
 
+  // What exists is settled first, so no block depends on where it sits in the file.
+  if (!declared.has('api')) set(config, 'hasBackend', false, 'api removed');
+  if (!declared.has('frontend')) set(config, 'hasFrontend', false, 'frontend removed');
+  if (declared.has('database')) {
+    set(config, 'hasDb', true, 'database present');
+    applyDatabase(config, declared.get('database'), set);
+  } else {
+    set(config, 'hasDb', false, 'database removed');
+    set(config, 'dbType', null, 'database removed');
+  }
+
   const seenAdditional = new Set();
   const seenSupport = new Set();
 
   for (const [name, decl] of declared) {
+    if (name === 'database') continue;
     if (name === 'api' || name === 'frontend') { applyPrimary(config, name, decl, set); continue; }
-    if (name === 'database') { applyDatabase(config, decl, set); continue; }
 
     const isBuilt = !!decl.dockerfile;
     const list = isBuilt ? (config.additionalServices ||= []) : (config.supportServices ||= []);
@@ -346,7 +438,7 @@ function applyDeclarations(state, declared, repository = null) {
       list.push(service);
       changes.push({ label: `${name}: created from the shared template`, from: null, to: name });
     }
-    applyService(service, decl, set, name);
+    applyService(service, decl, set, name, notes);
     if (isBuilt) applyDatabaseUrls(config, service, decl, set, name);
   }
 
@@ -370,11 +462,7 @@ function applyDeclarations(state, declared, repository = null) {
     config.envKeysToPass = secretKeys;
   }
 
-  if (!declared.has('api')) set(config, 'hasBackend', false, 'api removed');
-  if (!declared.has('frontend')) set(config, 'hasFrontend', false, 'frontend removed');
-  if (!declared.has('database')) { set(config, 'hasDb', false, 'database removed'); set(config, 'dbType', null, 'database removed'); }
-
-  return { config, changes };
+  return { config, changes, notes };
 }
 
 function expectedTemplateNames(config, templatesDir) {
@@ -428,10 +516,9 @@ module.exports = async function sync() {
 
   let declared;
   let repository = null;
+  let locked = new Set();
   try {
-    const text = fs.readFileSync(flaropsYamlFile, 'utf8');
-    declared = declaredServices(text);
-    repository = declaredRepositorySettings(text);
+    ({ declared, repository, locked } = readFlaropsYaml(fs.readFileSync(flaropsYamlFile, 'utf8')));
   } catch (e) {
     if (e instanceof YamlError) {
       console.error(`\x1b[31mERROR: flarops.yaml could not be read - ${e.message}\x1b[0m`);
@@ -445,9 +532,45 @@ module.exports = async function sync() {
     process.exit(1);
   }
 
-  let config, changes;
+  // What the previous sync rendered: which files sync owns, and what a locked file would have become.
+  const previousState = JSON.parse(JSON.stringify(state));
+  normalizeState(previousState);
+  let previousRender = null;
   try {
-    ({ config, changes } = applyDeclarations(state, declared, repository));
+    previousRender = new Map([
+      ...renderChartTemplates(previousState, templatesDir).map(t => [t.file, t.content]),
+      [path.join(currentDir, '.github', 'workflows', 'deploy.yml'), renderDeployWorkflow(previousState)],
+      [path.join(currentDir, '.github', 'workflows', 'pr-capsule.yml'), renderPrCapsuleWorkflow(previousState)],
+    ]);
+  } catch (e) {
+    console.warn(`\x1b[33mWARNING: the recorded state could not be rendered (${e.message}), so sync cannot tell which templates it generated before - none are removed this time.\x1b[0m`);
+  }
+
+  let config, changes, notes, valuesYaml, templates, werfYaml, workflows;
+  const context = { hasLocalhostWarnings: false };
+  try {
+    ({ config, changes, notes } = applyDeclarations(state, declared, repository));
+    // Render everything first, so a template that throws leaves nothing half-written.
+    valuesYaml = renderValues(config, context);
+    templates = renderChartTemplates(config, templatesDir);
+    werfYaml = renderWerf(config);
+    workflows = [
+      { file: path.join(currentDir, '.github', 'workflows', 'deploy.yml'), content: renderDeployWorkflow(config) },
+      { file: path.join(currentDir, '.github', 'workflows', 'pr-capsule.yml'), content: renderPrCapsuleWorkflow(config) },
+    ].filter(w => fs.existsSync(path.dirname(w.file)));
+  } catch (e) {
+    if (e instanceof YamlError || e instanceof ChartConflict) {
+      console.error(`\x1b[31mERROR: flarops.yaml cannot be applied - ${e.message}\x1b[0m`);
+      process.exit(1);
+    }
+    throw e;
+  }
+
+  const relative = (file) => path.relative(currentDir, file).split(path.sep).join('/');
+  const present = fs.existsSync(templatesDir) ? fs.readdirSync(templatesDir).filter(f => /\.(yaml|tpl)$/.test(f)) : [];
+  try {
+    checkSyncLock(locked, new Set([...templates, ...workflows].map(t => relative(t.file))
+      .concat(present.map(f => relative(path.join(templatesDir, f))))));
   } catch (e) {
     if (e instanceof YamlError) {
       console.error(`\x1b[31mERROR: flarops.yaml cannot be applied - ${e.message}\x1b[0m`);
@@ -462,45 +585,62 @@ module.exports = async function sync() {
     console.warn(`\x1b[33mWARNING: CI passes these Secret keys but no workload reads them: ${unmounted.join(', ')}. They reach the cluster's Secret and no container - which looks exactly like the secret not working. Declare each under the secretEnvs of the service that needs it in flarops.yaml and run sync again, or remove it if nothing needs it.\x1b[0m`);
   }
 
-  if (changes.length === 0) {
+  // Only templates sync generated itself are removed; a file added by hand is left alone.
+  const expected = new Set([...templates.map(t => path.basename(t.file)), ...ALWAYS_PRESENT]);
+  const ownedBefore = previousRender
+    ? new Set([...[...previousRender.keys()].map(f => path.basename(f)), ...ALWAYS_PRESENT])
+    : new Set();
+  const orphans = present.filter(f => ownedBefore.has(f) && !expected.has(f));
+  const lockedOrphans = orphans.filter(f => locked.has(relative(path.join(templatesDir, f))));
+  if (lockedOrphans.length > 0) {
+    console.error(`\x1b[31mERROR: ${lockedOrphans.map(f => relative(path.join(templatesDir, f))).join(', ')} belong to services flarops.yaml no longer declares, but syncLock keeps them - Helm would go on deploying those services. Remove them from syncLock, or delete the files yourself.\x1b[0m`);
+    process.exit(1);
+  }
+
+  const outputs = [
+    { file: path.join(helmDir, 'values.yaml'), content: valuesYaml },
+    ...templates,
+    { file: path.join(currentDir, 'werf.yaml'), content: werfYaml },
+    ...workflows,
+  ];
+  // Line endings are not a difference: a checkout with autocrlf would otherwise be rewritten each time.
+  const differs = (o) => !fs.existsSync(o.file) || fs.readFileSync(o.file, 'utf8').replace(/\r\n/g, '\n') !== o.content;
+  const toWrite = outputs.filter(o => !locked.has(relative(o.file)) && differs(o));
+  // A locked file is reported only when what sync renders for it changed - not merely because it was edited.
+  const heldBack = outputs
+    .filter(o => locked.has(relative(o.file)))
+    .filter(o => (previousRender && previousRender.has(o.file) ? previousRender.get(o.file) !== o.content : differs(o)))
+    .map(o => relative(o.file));
+
+  if (changes.length === 0 && toWrite.length === 0 && orphans.length === 0) {
     console.log('Deployment already matches flarops.yaml - nothing to do.');
+    if (heldBack.length > 0) {
+      console.warn(`\x1b[33mWARNING: syncLock kept these files as they are, so what changed in them did not reach them: ${heldBack.join(', ')}.\x1b[0m`);
+    }
     return;
   }
 
-  console.log('Applying flarops.yaml:');
-  for (const c of changes) {
-    if (c.from === null && c.to !== null && /created|removed/.test(c.label)) console.log(`  ${c.label}`);
-    else console.log(`  ${c.label}: ${describe(c.from)} -> ${describe(c.to)}`);
+  if (changes.length > 0) {
+    console.log('Applying flarops.yaml:');
+    for (const c of changes) {
+      if (c.from === null && c.to !== null && /created|removed/.test(c.label)) console.log(`  ${c.label}`);
+      else console.log(`  ${c.label}: ${describe(c.from)} -> ${describe(c.to)}`);
+    }
+  } else {
+    console.log('flarops.yaml is unchanged; these files are rewritten from this version of Flarops\' templates:');
+    for (const o of toWrite) console.log(`  ${relative(o.file)}`);
   }
   console.log('');
 
-  // Render everything first, so a template that throws leaves nothing half-written.
-  const context = { hasLocalhostWarnings: false };
-  const valuesYaml = renderValues(config, context);
-  const templates = renderChartTemplates(config, templatesDir);
-  const werfYaml = renderWerf(config);
-  const workflows = [
-    { file: path.join(currentDir, '.github', 'workflows', 'deploy.yml'), content: renderDeployWorkflow(config) },
-    { file: path.join(currentDir, '.github', 'workflows', 'pr-capsule.yml'), content: renderPrCapsuleWorkflow(config) },
-  ];
-
-  fs.writeFileSync(path.join(helmDir, 'values.yaml'), valuesYaml);
-  for (const t of templates) fs.writeFileSync(t.file, t.content);
-  fs.writeFileSync(path.join(currentDir, 'werf.yaml'), werfYaml);
-  for (const w of workflows) {
-    if (fs.existsSync(path.dirname(w.file))) fs.writeFileSync(w.file, w.content);
-  }
+  for (const o of toWrite) fs.writeFileSync(o.file, o.content);
   writeState(currentDir, config);
 
-  const expected = expectedTemplateNames(config, templatesDir);
-  for (const name of ALWAYS_PRESENT) expected.add(name);
-  const orphans = fs.readdirSync(templatesDir)
-    .filter(f => /\.(yaml|tpl)$/.test(f))
-    .filter(f => !expected.has(f));
   for (const f of orphans) fs.unlinkSync(path.join(templatesDir, f));
   if (orphans.length > 0) {
     console.log(`Removed ${orphans.length} template(s) for services flarops.yaml no longer declares: ${orphans.join(', ')}`);
   }
+
+  for (const note of notes) console.warn(`\x1b[33mNOTE: ${note}\x1b[0m`);
 
   const needed = new Set();
   for (const decl of declared.values()) {
@@ -522,8 +662,13 @@ module.exports = async function sync() {
 
   console.log('\x1b[32mdeploy/helm, werf.yaml and the recorded state now match flarops.yaml.\x1b[0m');
   console.log('Review the diff, commit it, and redeploy.');
+
+  if (heldBack.length > 0) {
+    console.warn(`\x1b[33mWARNING: syncLock kept these files as they are, so the changes above did not reach them: ${heldBack.join(', ')}. Carry what they need over by hand, or remove them from syncLock and run sync again.\x1b[0m`);
+  }
 };
 
 module.exports.findOrphanTemplates = findOrphanTemplates;
 module.exports.applyDeclarations = applyDeclarations;
 module.exports.declaredServices = declaredServices;
+module.exports.normalizeState = normalizeState;

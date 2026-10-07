@@ -66,6 +66,45 @@ flarops_wait_for_k3s() {
 `, indent);
 }
 
+// One workflow at a time reads worker_slots, decides, and applies: a second one acting on what it
+// read before the first applied would destroy a busy worker or recreate an idle one. The lock is a
+// ConfigMap on the server - creating it is atomic - owned by this run and expiring on its own.
+const SLOT_LOCK_MINUTES = 20;
+const SLOT_LOCK_ATTEMPTS = 120; // x 10s = 20 minutes of waiting for another run to finish
+
+function slotLock(indent = '          ') {
+  return indentBlock(`FLAROPS_LOCK_OWNER="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+flarops_kubectl() { flarops_ssh "$1" "sudo k3s kubectl -n default $2"; }
+
+flarops_slots_lock() {
+  for attempt in $(seq 1 ${SLOT_LOCK_ATTEMPTS}); do
+    EXPIRES=$(( $(date +%s) + ${SLOT_LOCK_MINUTES * 60} ))
+    if flarops_kubectl "$1" "create configmap flarops-slots-lock --from-literal=owner=$FLAROPS_LOCK_OWNER --from-literal=expires=$EXPIRES" > /dev/null 2>&1; then
+      echo "Holding the worker-slot lock."
+      return 0
+    fi
+    HELD_UNTIL=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.expires}" 2>/dev/null || true)
+    if [ -n "$HELD_UNTIL" ] && [ "$HELD_UNTIL" -lt "$(date +%s)" ]; then
+      echo "The worker-slot lock expired without being released - taking it over."
+      flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+      continue
+    fi
+    echo "  another workflow is changing worker slots - waiting ($attempt/${SLOT_LOCK_ATTEMPTS})"
+    sleep 10
+  done
+  echo "::error::Another workflow held the worker-slot lock for over ${SLOT_LOCK_MINUTES} minutes."
+  return 1
+}
+
+flarops_slots_unlock() {
+  HOLDER=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.owner}" 2>/dev/null || true)
+  if [ "$HOLDER" = "$FLAROPS_LOCK_OWNER" ]; then
+    flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+    echo "Released the worker-slot lock."
+  fi
+}`, indent);
+}
+
 function fetchKubeconfig(indent = '          ') {
   return helpers(indent) + '\n' + indentBlock(`
 flarops_wait_for_k3s "$EC2_IP"
@@ -78,4 +117,4 @@ sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
 test -s ~/.kube/config`, indent);
 }
 
-module.exports = { SSH_OPTS, helpers, fetchKubeconfig };
+module.exports = { SSH_OPTS, helpers, fetchKubeconfig, slotLock };

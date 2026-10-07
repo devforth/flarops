@@ -85,7 +85,21 @@ Then commit what it changed (`flarops.yaml`, `deploy/`, `werf.yaml`, `werf-giter
 
 **Sync is a merge, not a regeneration.** `init` learned things by reading your code that you cannot reasonably be asked to write down again — the database URLs it builds for each container, a migration step it found, SQL that seeds the database on first start. Those live in `deploy/.flarops-state.json` (committed, and not meant to be edited). Your edits are laid over them, so changing one line does not erase the rest.
 
-Sync refuses rather than guessing. Unreadable YAML is reported with its line number and nothing is written. An empty `flarops.yaml` is treated as a truncated file, not as an instruction to delete your deployment. Values that would end up somewhere they cannot be — a service name that is not a valid Kubernetes name, a secret name GitHub would not accept, a port outside 1–65535, a `context` outside the repository — are refused with the field named, before anything is written.
+**Sync also keeps the generated files current.** It renders every file it owns on each run and rewrites the ones that differ — after you upgrade Flarops, or when a generated file was edited by hand — even if `flarops.yaml` did not change. It says which files it rewrote. "Nothing to do" means no file changed.
+
+Sync refuses rather than guessing. Unreadable YAML is reported with its line number and nothing is written. An empty `flarops.yaml` is treated as a truncated file, not as an instruction to delete your deployment. Values that would end up somewhere they cannot be — a service name that is not a valid Kubernetes name, a secret name GitHub would not accept, a port outside 1–65535, a `context` outside the repository, a field that does not exist (a typo such as `replcas:` is an error, not ignored) — are refused with the field named, before anything is written.
+
+**Changes Flarops cannot express: `syncLock`.** When a chart template or a workflow needs something `flarops.yaml` has no field for — a sidecar in the backend's Deployment, an extra step in the deploy workflow — edit the file by hand and list it under `syncLock` in `flarops.yaml`:
+
+```yaml
+syncLock:
+  deploy/helm/templates/api.yaml: true
+  .github/workflows/deploy.yml: true
+```
+
+Sync then leaves those files as they are. When something you changed in `flarops.yaml` would have changed one of them, its last message names that file, so you know to carry the change over by hand — or remove the line (or set it to `false`) and the next sync rewrites the file. Only chart templates under `deploy/helm/templates/` and the two workflows can be locked: `deploy/helm/values.yaml` and `werf.yaml` carry `flarops.yaml` itself, and locking them would make it a no-op. A locked template of a service you remove from `flarops.yaml` stops sync — left in place, Helm would keep deploying that service.
+
+A template you add to `deploy/helm/templates/` yourself (an extra ConfigMap, a CronJob) is yours: sync only removes templates it generated, so it needs no lock.
 
 ## `flarops.yaml` — the file you edit
 
@@ -194,7 +208,7 @@ The name on the **left** is the environment variable your code reads. The name o
     - DATABASE_URL     # postgresql://<user>:<password>@database:5432/<name>
 ```
 
-The URL points at the service's own `db:` if it has one, otherwise at the top-level `database:`. It works on `api` and on services built here. A name listed here cannot also be in `env` or `secretEnvs`. `init` writes the field wherever it builds a URL. In a project generated before the field existed, sync keeps the URLs `init` built until flarops.yaml names them; write `databaseUrls: []` to stop one.
+The URL points at the service's own `db:` if it has one, otherwise at the top-level `database:`, and follows it when the database is renamed. It works on `api`, on services built here and on `oneShot` tasks. A name listed here cannot also be in `env` or `secretEnvs`. `init` writes the field wherever it builds a URL. In a project generated before the field existed, sync keeps the URLs `init` built until flarops.yaml names them; write `databaseUrls: []` to stop one.
 
 **`exposedRoutes`** — the URL prefixes the outside world reaches this service through.
 
@@ -265,15 +279,19 @@ reporting:
   dockerfile: Dockerfile
   context: reporting
   replicas: 1
+  databaseUrls:
+    - DATABASE_URL
   db:
-    type: postgres          # postgres | mysql | mariadb | mongodb
+    type: postgres          # required: postgres | mysql | mariadb | mongodb
+    secretEnvs:             # required: where its password comes from
+      POSTGRES_PASSWORD: REPORTING_DB_PASSWORD
     image: "postgres:16-alpine"
-    port: 5432
-    user: postgres
     name: reports
 ```
 
-It gets its own StatefulSet and its own storage.
+It gets its own StatefulSet and its own storage. Only `type` and `secretEnvs` are required; `image`, `port`, `user` and `name` default to the engine's (`name` to `<service>db`). Removing `db:` removes the database from the chart — its data volume stays in the cluster until you delete it, and sync says so.
+
+For any database, `replicas` is 0 or 1: more would be separate databases, each with its own data, behind one address. `port` changes the address other services use; the server keeps listening on its engine's port.
 
 ### Database server settings
 
@@ -311,7 +329,7 @@ This is the one part you do by hand, so it is worth seeing whole.
 
 A secret is missing from step 3 → the pod cannot start. A secret exists but no service declares it in `secretEnvs` → it sits in the cluster unused. Both are reported; neither is guessed at.
 
-Values from `.env.example`, `.env.sample` and `.env.template` are never used: those files are committed, so their values are public. Their keys still count — the secret is wired and listed — but its value is left empty, marked `<- no value found; you must supply one`. The same goes for an obvious placeholder in a real `.env` (`changeme`, `your-…-here`, `replace_me`). A database password taken from one of those, or set to the engine's default (`postgres`, `root`, `admin`), is replaced with a random one. `init` lists every value it set aside.
+Values from `.env.example`, `.env.sample` and `.env.template` are never used: those files are committed, so their values are public. Values from `.env.development` are not used either — it says which variables exist, not what production should set them to. For the rest, `.env.production` wins over `.env`, which wins over `.env.local`. A value in any file git tracks — or would take with the next `git add .`, because nothing ignores it — counts as public too. Their keys still count — the secret is wired and listed — but its value is left empty, marked `<- no value found; you must supply one`. The same goes for an obvious placeholder in a real `.env` (`changeme`, `your-…-here`, `replace_me`). A database password taken from one of those, or set to the engine's default (`postgres`, `root`, `admin`), is replaced with a random one. `init` lists every value it set aside.
 
 **Variables Flarops cannot see are yours to add.** It reads `.env` files, `environment:` and `env_file:` in `docker-compose.yml`, and the variables your source reads directly. Anything else — fields of a settings class (pydantic `BaseSettings`, …), variables a library reads by itself (`AUTH_SECRET` for next-auth, …), values only your README mentions — add to `flarops.yaml` (`env` or `secretEnvs`) and run `sync`. A required variable that is missing usually shows up as a container that exits at start.
 
@@ -413,6 +431,8 @@ Opening a pull request deploys it to its own address, with the production databa
 
 Before deploying, the pipeline asks the dashboard which machine has room for the environment, sized by what the same application uses in production right now. If none has room, it adds a worker machine — after waiting for any that another pull request is already adding. A "yes" reserves the machine until the environment appears, so two pull requests cannot be sent to the same room. All of one environment's pods run on its machine, so closing the PR leaves that machine empty and it can be removed.
 
+Workers carry the taint `flarops.io/capsule=true:NoSchedule`: only pull-request environments run on them, so production never lands on a worker and keeps it from being reclaimed. (In a project whose Terraform was generated before this, add `--node-taint flarops.io/capsule=true:NoSchedule` to the worker's `INSTALL_K3S_EXEC` in `deploy/terraform/main.tf`.) Workflows that add or remove workers take a lock on the cluster first, so two of them never act on the same view of the workers. Closing a pull request tears its environment down even if the PR has a merge conflict (the teardown runs from the base branch and runs no code from the PR).
+
 A pull request environment runs with the production secrets and a copy of the production data. That is intended for **private repositories**, where everyone who can open a pull request is trusted. Pull requests from forks receive no secrets, and their pipelines fail.
 
 ## What it deploys
@@ -443,6 +463,8 @@ Terraform files are never touched again after `init`, so edit them freely. The c
 - **Terraform is written once.** `init` generates `deploy/terraform/`; `sync` does not touch it, and keeping it up to date is up to you. Changes to the AMI or to the instance's startup script reach new instances only — replace one deliberately (`terraform apply -replace=aws_instance.server`), remembering that its disk holds the cluster's data.
 - **It costs money.** EC2 instances, their volumes, the Elastic IP and the S3 bucket are billed to your AWS account. A worker added for a pull request is billed until the PR is closed and the worker is reclaimed.
 - **amd64 only.** The instances and the k3s install are x86_64.
+- **Pinned tools.** CI installs Terraform `1.15.8` and werf `v2.78.2`, never whatever is newest; Flarops raises them deliberately.
+- **Init refuses symlinks where it writes.** If `deploy/.env`, `.keys` or another path init writes to is a symlink, init stops: it would otherwise write the deploy key and the secrets wherever the link points.
 
 ## Features
 

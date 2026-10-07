@@ -442,6 +442,19 @@ async function urlBreakingPasswordSurvives() {
       }
     }
 
+    // expected-files.json: text each generated file must hold ("!text": must not).
+    const expectedFiles = path.join(FIXTURES, name, 'expected-files.json');
+    if (fs.existsSync(expectedFiles)) {
+      for (const [rel, needles] of Object.entries(JSON.parse(fs.readFileSync(expectedFiles, 'utf8')))) {
+        const text = fs.existsSync(path.join(result.dir, rel)) ? fs.readFileSync(path.join(result.dir, rel), 'utf8') : '';
+        for (const needle of needles) {
+          const absent = needle.startsWith('!');
+          const wanted = absent ? needle.slice(1) : needle;
+          check(`${rel} ${absent ? 'does not hold' : 'holds'} ${JSON.stringify(wanted).slice(0, 50)}`, text.includes(wanted) !== absent);
+        }
+      }
+    }
+
     const expect = ['deploy/helm/values.yaml', 'deploy/.env', 'werf.yaml',
       '.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml', 'flarops.yaml'];
     for (const rel of expect) {
@@ -509,6 +522,12 @@ async function urlBreakingPasswordSurvives() {
       }
     }
 
+    // What init wrote is what sync would write: a first sync with no edits changes nothing.
+    {
+      const r = require('child_process').spawnSync('node', [path.join(__dirname, '..', 'bin', 'index.js'), 'sync'], { cwd: result.dir, encoding: 'utf8' });
+      check('a sync right after init changes nothing', r.status === 0 && /nothing to do/.test(r.stdout || ''), (r.stdout || '') + (r.stderr || ''));
+    }
+
     fs.rmSync(result.parent, { recursive: true, force: true });
   }
 
@@ -519,6 +538,32 @@ async function urlBreakingPasswordSurvives() {
 
   console.log('\n  declined variant compose file');
   await declinedVariantComposeIsSkipped();
+
+  console.log('\n  a repository that redirects what init writes');
+  {
+    // deploy/.env as a symlink would put the deploy key and every secret wherever it points.
+    const parent = fs.mkdtempSync(path.join(require('os').tmpdir(), 'flarops-symlink-'));
+    const fixture = path.join(parent, 'a-full');
+    fs.cpSync(path.join(FIXTURES, 'a-full'), fixture, { recursive: true });
+    fs.mkdirSync(path.join(fixture, 'public'), { recursive: true });
+    fs.mkdirSync(path.join(fixture, 'deploy'), { recursive: true });
+    fs.symlinkSync('../public/env.txt', path.join(fixture, 'deploy', '.env'));
+    const result = await generate(fixture);
+    check('init refuses to write through a symlink', !result.ok && /deploy\/\.env is a symlink/.test(result.log), result.log.slice(-400));
+    check('nothing reached the symlink\'s target', !fs.existsSync(path.join(result.dir, 'public', 'env.txt')));
+    fs.rmSync(result.parent, { recursive: true, force: true });
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+
+  console.log('\n  a repository with no commits yet');
+  {
+    // Files git does not ignore go in with the next "git add .": their values are as public as committed ones.
+    const result = await generate(path.join(FIXTURES, 'k-support'), undefined, { commit: false });
+    check('generates', result.ok, result.error && result.error.stack);
+    check('an uncommitted, unignored value is withheld like a committed one', /RABBITMQ_DEFAULT_PASS \(docker-compose\.yml: committed to git \(or not git-ignored/.test(result.log),
+      result.log.split('\n').filter(l => /WARNING/.test(l)).join('\n').slice(0, 600));
+    fs.rmSync(result.parent, { recursive: true, force: true });
+  }
 
   console.log('\n  flarops.yaml reader');
   yamlTests.run(check);

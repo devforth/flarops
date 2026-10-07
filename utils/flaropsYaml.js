@@ -9,10 +9,13 @@ function yamlScalar(value) {
   const s = String(value);
   // Quote YAML 1.1 booleans (yes/no/on/off) and anything else a parser could misread.
   const YAML_11_BOOLEANS = /^(y|n|yes|no|true|false|on|off)$/i;
+  // Anything that reads as a number (-0700, +1, .5), and any control character or edge whitespace.
   if (s === '' || s === 'null' || s === '~' || YAML_11_BOOLEANS.test(s) ||
-      /^[\d.]+$/.test(s) || /[:#\[\]{}&*!|>'"%@`]/.test(s) ||
-      s.includes('\n') || s.startsWith(' ') || s.endsWith(' ')) {
-    return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"';
+      /^[-+]?[\d.]/.test(s) || /^[-?:](\s|$)/.test(s) || /[:#\[\]{}&*!|>'"%@`]/.test(s) ||
+      /[\u0000-\u001f\u007f]/.test(s) || /^\s|\s$/.test(s)) {
+    return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+      .replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')) + '"';
   }
   return s;
 }
@@ -208,8 +211,8 @@ const TEMPLATE_COMMENT = `
 # Each top-level key is a service name (must be unique, RFC-1123 compatible).
 # A service MUST have either \`image\` OR \`dockerfile\` + \`context\`, and \`replicas\`.
 #
-# Paths in \`dockerfile\` and \`context\` are RELATIVE TO THE PROJECT ROOT
-# (not relative to the deploy directory, and not the way werf spells them).
+# \`context\` is RELATIVE TO THE PROJECT ROOT (not to the deploy directory);
+# \`dockerfile\` is relative to \`context\`, as in docker-compose and werf.
 #
 # --- Required fields --------------------------------------------------------
 #
@@ -218,8 +221,8 @@ const TEMPLATE_COMMENT = `
 #   image: "registry.example.com/org/image:tag"
 #
 #   # OPTION B: built from a Dockerfile in this repository
-#   dockerfile: "path/to/Dockerfile"        # relative to project root
 #   context: "path/to"                      # Docker build context, relative to project root
+#   dockerfile: "Dockerfile"                # relative to context (path/to/Dockerfile here)
 #
 #   replicas: 1                             # number of pod replicas
 #
@@ -279,11 +282,14 @@ const TEMPLATE_COMMENT = `
 #                                            #  reverse proxy did it before
 #
 #   db:                                     # per-service database (generates its own StatefulSet)
-#     type: "postgres"                      # postgres | mysql | mariadb | mongodb
-#     image: "postgres:18-alpine"
-#     port: 5432
-#     user: "postgres"
-#     name: "mydb"
+#     type: "postgres"                      # required: postgres | mysql | mariadb | mongodb
+#     secretEnvs:                           # required: the password, as for a service
+#       POSTGRES_PASSWORD: MY_SERVICE_DB_PASSWORD
+#     image: "postgres:18-alpine"           # optional, like the rest: the engine's
+#     port: 5432                            #  defaults fill in what is left out;
+#     user: "postgres"                      #  port moves the Service address only -
+#     name: "mydb"                          #  the server keeps its own port
+#     replicas: 1                           # 0 or 1
 #     command:                              # server settings, as in compose;
 #       - "postgres"                        #  the same field works on the
 #       - "-c"                              #  top-level database: block
@@ -305,6 +311,21 @@ function repositorySettingsBlock(config) {
     line(`  repository: ${yamlScalar(repository)}`, 'repository the images are pushed to'),
   ].join('\n');
 }
+
+// Files "flarops sync" leaves alone; init writes the key empty so the option is visible.
+const SYNC_LOCK_BLOCK = [
+  '# sync lock',
+  '# Files "flarops sync" must not overwrite - for a change Flarops cannot',
+  '# express, made by hand in a chart template or a workflow. List each with',
+  '# true; sync then leaves it as it is and says which changes did not reach it:',
+  '#',
+  '# syncLock:',
+  '#   deploy/helm/templates/api.yaml: true',
+  '#   .github/workflows/deploy.yml: true',
+  '#',
+  '# deploy/helm/values.yaml and werf.yaml cannot be locked.',
+  'syncLock: {}',
+].join('\n');
 
 function generateFlaropsYaml(config, {
   apiEnv, frontendEnv, apiSecretKeys, frontendSecretKeys,
@@ -412,7 +433,7 @@ function generateFlaropsYaml(config, {
     }));
   }
 
-  return repositorySettingsBlock(config) + '\n\n' + blocks.join('\n\n') + '\n\n' + TEMPLATE_COMMENT + '\n';
+  return repositorySettingsBlock(config) + '\n\n' + SYNC_LOCK_BLOCK + '\n\n' + blocks.join('\n\n') + '\n\n' + TEMPLATE_COMMENT + '\n';
 }
 
 module.exports = { generateFlaropsYaml };

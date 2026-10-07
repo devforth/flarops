@@ -1,6 +1,6 @@
 // A supporting service from docker-compose (cache, broker, identity provider): Deployment + Service.
 const { renderVolumes } = require('./volumes.js');
-const { secretRefs, urlEncodedRef, alreadyEmitted } = require('./env.js');
+const { secretRefs, urlEncodedRef, alreadyEmitted, helmLiteral } = require('./env.js');
 const { imageHost, isDockerHub } = require('../../utils/registry.js');
 
 module.exports = (service) => {
@@ -34,11 +34,9 @@ metadata:
     component: ${service.name}
 data:
 `;
+    // Printed by Helm as text: a "{{" in a config file is the file's, not the chart's.
     for (const [key, content] of Object.entries(service.configMapData)) {
-      // Block scalar: copied verbatim.
-      const body = String(content).replace(/\r\n/g, '\n').replace(/\n$/, '')
-        .split('\n').map(l => (l === '' ? '' : '    ' + l)).join('\n');
-      configMap += `  ${key}: |\n${body}\n`;
+      configMap += `  ${helmLiteral(key)}: ${helmLiteral(content)}\n`;
     }
 
     let volIdx = 0;
@@ -46,8 +44,8 @@ data:
       const volName = `${service.name}-config-${volIdx++}`;
       configVolumeMounts += `
             - name: ${volName}
-              mountPath: ${mount.mountPath}
-              subPath: ${mount.key}
+              mountPath: ${helmLiteral(mount.mountPath)}
+              subPath: ${helmLiteral(mount.key)}
               readOnly: true`;
       configVolumes += `
         - name: ${volName}
@@ -58,7 +56,7 @@ data:
       const volName = `${service.name}-config-${volIdx++}`;
       configVolumeMounts += `
             - name: ${volName}
-              mountPath: ${mount.mountPath}
+              mountPath: ${helmLiteral(mount.mountPath)}
               readOnly: true`;
       configVolumes += `
         - name: ${volName}
@@ -67,8 +65,8 @@ data:
             items:`;
       for (const item of mount.items) {
         configVolumes += `
-              - key: ${item.key}
-                path: ${item.path}`;
+              - key: ${helmLiteral(item.key)}
+                path: ${helmLiteral(item.path)}`;
       }
     }
   }
@@ -138,6 +136,11 @@ ${hasVolumes ? `  strategy:
 {{- if $.Values.dataNodeSelector }}
       nodeSelector:
 {{ toYaml $.Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
 {{- end }}
 ${pullsFromPrivateRegistry ? `{{- if .Values.imagePullSecret }}
       imagePullSecrets:

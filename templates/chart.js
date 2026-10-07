@@ -29,6 +29,9 @@ function urlEncodedSecretKeys(config) {
   return [...keys];
 }
 
+// Two parts of the chart written to one file: the later one would silently replace the earlier.
+class ChartConflict extends Error {}
+
 function renderChartTemplates(config, templatesDir) {
   const at = (name) => path.join(templatesDir, name);
   const files = [
@@ -72,7 +75,15 @@ function renderChartTemplates(config, templatesDir) {
     files.push({ file: at('database.yaml'), content: dbServiceTemplate(config) + '\n---\n' + dbDeploymentTemplate(config) });
   }
 
+  const seen = new Set();
+  for (const f of files) {
+    const name = path.basename(f.file);
+    if (seen.has(name)) {
+      throw new ChartConflict(`two parts of the chart would both be written to deploy/helm/templates/${name} - rename the service whose name produces it`);
+    }
+    seen.add(name);
+  }
   return files;
 }
 
-module.exports = { renderChartTemplates };
+module.exports = { renderChartTemplates, ChartConflict };

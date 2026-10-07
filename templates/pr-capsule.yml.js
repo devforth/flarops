@@ -1,6 +1,7 @@
 const ciSsh = require('./ciSsh');
 const { registrySettings, imageRepository, isDockerHub } = require('../utils/registry.js');
 const werfCleanupStep = require('./werfCleanup.js');
+const { TERRAFORM_VERSION, WERF_VERSION } = require('../utils/toolVersions.js');
 
 module.exports = function prCapsuleYmlTemplate(config) {
   const registry = registrySettings(config);
@@ -46,11 +47,6 @@ module.exports = function prCapsuleYmlTemplate(config) {
           TF_VAR_domain: \${{ env.BASE_DOMAIN }}
 `;
 
-  // Repository values are written as single-line quoted scalars, never raw.
-  const yamlScalar = (value) => JSON.stringify(String(value == null ? '' : value)
-    .replace(/[\r\n\t]+/g, ' ')
-    .trim());
-
   const mainExec = `kubectl exec -n \${{ env.MAIN_NAMESPACE }} database-0 --`;
   const prExec = `kubectl exec -i -n \${{ env.PR_NAMESPACE }} database-0 --`;
 
@@ -67,8 +63,11 @@ module.exports = function prCapsuleYmlTemplate(config) {
       dbDumpCmd = `${mainExec} sh -c 'MYSQL_PWD="$${passVar}" $(command -v mariadb-dump || command -v mysqldump) --single-transaction --routines --triggers -u root "$${dbVar}"' \\
             | ${prExec} sh -c 'MYSQL_PWD="$${passVar}" $(command -v mariadb || command -v mysql) -u root "$${dbVar}"'`;
     } else if (config.dbType === 'mongodb') {
-      dbDumpCmd = `${mainExec} sh -c 'mongodump --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --db "$MONGO_INITDB_DATABASE" --archive' \\
-            | ${prExec} sh -c 'mongorestore --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --archive --nsInclude="$MONGO_INITDB_DATABASE.*" --drop'`;
+      // The password goes in a config file inside the pod, not on the command line.
+      // A block scalar with an explicit indent takes the password verbatim: no character in it is YAML syntax.
+      const mongoConfig = `umask 077; printf "password: |2-\\n  %s\\n" "$MONGO_INITDB_ROOT_PASSWORD" > /tmp/flarops-mongo.yaml`;
+      dbDumpCmd = `${mainExec} sh -c '${mongoConfig}; mongodump --quiet --config /tmp/flarops-mongo.yaml -u "$MONGO_INITDB_ROOT_USERNAME" --authenticationDatabase admin --db "$MONGO_INITDB_DATABASE" --archive; rc=$?; rm -f /tmp/flarops-mongo.yaml; exit $rc' \\
+            | ${prExec} sh -c '${mongoConfig}; mongorestore --quiet --config /tmp/flarops-mongo.yaml -u "$MONGO_INITDB_ROOT_USERNAME" --authenticationDatabase admin --archive --nsInclude="$MONGO_INITDB_DATABASE.*" --drop; rc=$?; rm -f /tmp/flarops-mongo.yaml; exit $rc'`;
     }
   }
 
@@ -98,8 +97,6 @@ module.exports = function prCapsuleYmlTemplate(config) {
           fi
 ` : '';
 
-  const envsBlock = config.hasDb ? `  DB_USER: ${yamlScalar(config.dbUser || 'root')}
-  DB_NAME: ${yamlScalar(config.dbName || 'appdb')}` : '';
 
   const domainParts = config.domain.split('.');
   let prDomainLogic;
@@ -119,11 +116,16 @@ module.exports = function prCapsuleYmlTemplate(config) {
   if (config.additionalServices && config.additionalServices.length > 0) requiredMi += config.additionalServices.length * 128;
   if (requiredMi === 0) requiredMi = 256;
 
+  // Teardown runs on pull_request_target: GitHub runs pull_request workflows only while a PR merges
+  // cleanly, so a PR closed with a conflict would leave its capsule behind. It checks out the base
+  // branch and runs no code from the PR.
   return `name: Flarops PR Capsule
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, closed]
+    types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [closed]
 
 permissions:
   contents: read
@@ -141,7 +143,7 @@ env:
   PR_NAMESPACE: ${config.projectName}-pr-\${{ github.event.pull_request.number }}
   PR_ENV_NAME: pr-\${{ github.event.pull_request.number }}
   PR_DOMAIN: ${prDomainLogic}
-${envsBlock ? envsBlock + '\n' : ''}${registryEnv ? '  ' + registryEnv + '\n' : ''}
+${registryEnv ? '  ' + registryEnv + '\n' : ''}
 
 jobs:
   deploy-capsule:
@@ -165,6 +167,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${TERRAFORM_VERSION}
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -184,9 +188,23 @@ jobs:
           printf '%s\\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-          export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
+          EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - production has not been deployed yet. Run the deploy workflow on the main branch first."
+            exit 1
+          fi
+          export EC2_IP
 
 ${ciSsh.fetchKubeconfig()}
+
+      - name: Setup Werf
+        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
+        with:
+          version: ${WERF_VERSION}
+${loginStep}
+      - name: Build images
+        run: |
+          werf build --repo ${repoString}
 
       - name: Decide where this capsule goes
 ${terraformProviderEnv}        run: |
@@ -194,8 +212,14 @@ ${terraformProviderEnv}        run: |
 
 ${ciSsh.helpers()}
 
-          TARGET_NODE=$(kubectl get pods -n "\${{ env.PR_NAMESPACE }}" \\
-            -l component=database -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
+${ciSsh.slotLock()}
+
+          TARGET_NODE=$(kubectl get pvc -n "\${{ env.PR_NAMESPACE }}" \\
+            -o jsonpath='{range .items[*]}{.metadata.annotations.volume\\.kubernetes\\.io/selected-node}{"\\n"}{end}' 2>/dev/null | grep -m1 . || true)
+          if [ -z "$TARGET_NODE" ]; then
+            TARGET_NODE=$(kubectl get pods -n "\${{ env.PR_NAMESPACE }}" \\
+              -o jsonpath='{range .items[*]}{.spec.nodeName}{"\\n"}{end}' 2>/dev/null | grep -m1 . || true)
+          fi
 
           if [ -n "$TARGET_NODE" ]; then
             echo "Capsule already runs on $TARGET_NODE - keeping it there."
@@ -285,19 +309,26 @@ ${ciSsh.helpers()}
             terraform init
             terraform workspace select -or-create main
 
+            EC2_IP=$(terraform output -raw public_ip)
+            flarops_slots_lock "$EC2_IP"
+            trap 'flarops_slots_unlock "$EC2_IP"' EXIT
             ALL_OUTPUTS=$(terraform output -json)
             CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
             NEW_SLOTS=$(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; s=[int(x) for x in json.load(sys.stdin)]; f=next(n for n in range(1,1000) if n not in s); print(json.dumps(sorted(s+[f])))")
+            NEW_SLOT=$(CURRENT_SLOTS="$CURRENT_SLOTS" NEW_SLOTS="$NEW_SLOTS" python3 -c "import json,os; print(sorted(set(json.loads(os.environ['NEW_SLOTS'])) - set(json.loads(os.environ['CURRENT_SLOTS'])))[0])")
+            INSTANCE_NAME=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('instance_name',{}).get('value',''))")
+            if [ -z "$INSTANCE_NAME" ]; then
+              echo "::error::Could not read instance_name from Terraform - cannot name the new worker's node."
+              exit 1
+            fi
+            NEW_NODE="\${INSTANCE_NAME}-worker-\${NEW_SLOT}"
+            flarops_ssh "$EC2_IP" "sudo k3s kubectl delete node \${NEW_NODE} --ignore-not-found" > /dev/null
             echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
             terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
-            EC2_IP=$(terraform output -raw public_ip)
+            flarops_slots_unlock "$EC2_IP"
+            trap - EXIT
             cd - > /dev/null
 
-            echo "Waiting for the new worker to join..."
-            NEW_SLOT=$(CURRENT_SLOTS="$CURRENT_SLOTS" NEW_SLOTS="$NEW_SLOTS" python3 -c "import json,os; print(sorted(set(json.loads(os.environ['NEW_SLOTS'])) - set(json.loads(os.environ['CURRENT_SLOTS'])))[0])")
-            NEW_NODE="\${INSTANCE_NAME:-}"
-            if [ -z "$NEW_NODE" ]; then NEW_NODE=$(terraform -chdir=deploy/terraform output -raw instance_name); fi
-            NEW_NODE="\${NEW_NODE}-worker-\${NEW_SLOT}"
             echo "Waiting for $NEW_NODE to join..."
             flarops_wait_for_k3s "$EC2_IP"
             NODE_SEEN=""
@@ -337,17 +368,15 @@ ${ciSsh.helpers()}
           echo "Capsule will be placed on $TARGET_NODE"
           echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
 
-      - name: Setup Werf
-        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
-${loginStep}
       - name: Deploy application with Werf
         env:
 ${secretEnvBlock}${dbPasswordEnvLine}          SECRET_REGISTRY_PASSWORD: \${{ secrets.REGISTRY_PASSWORD }}
           REGISTRY_SERVER: ${registryServerForPull}
         run: |
           umask 077
-          export TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
-          export TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
+          TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          export TF_INSTANCE_TYPE TF_VOLUME_SIZE
           ${buildValuesScript}
           werf converge \\
             --parallel-tasks-limit=3 \\
@@ -355,9 +384,8 @@ ${secretEnvBlock}${dbPasswordEnvLine}          SECRET_REGISTRY_PASSWORD: \${{ se
             --env \${{ env.PR_ENV_NAME }} \\
             --set domain=\${{ env.PR_DOMAIN }} \\
             --set "dataNodeSelector.kubernetes\\.io/hostname=$TARGET_NODE" \\
-            --values deploy/helm/flarops-ci-values.json${onDockerHub ? '' : `
-${werfCleanupStep(repoString)}`}
-${dbCloningLogic}
+            --values deploy/helm/flarops-ci-values.json
+${dbCloningLogic}${onDockerHub ? '' : werfCleanupStep(repoString) + '\n'}
   cleanup-capsule:
     name: Teardown PR Capsule
     if: github.event.action == 'closed'
@@ -379,6 +407,8 @@ ${dbCloningLogic}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${TERRAFORM_VERSION}
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -398,12 +428,19 @@ ${dbCloningLogic}
           printf '%s\\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-          export EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
+          EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - production has not been deployed yet. Run the deploy workflow on the main branch first."
+            exit 1
+          fi
+          export EC2_IP
 
 ${ciSsh.fetchKubeconfig()}
 
       - name: Setup Werf
         uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
+        with:
+          version: ${WERF_VERSION}
 ${loginStep}
       - name: Dismiss application with Werf
         continue-on-error: true
@@ -417,9 +454,20 @@ ${loginStep}
 ${terraformProviderEnv}        run: |
           set -euo pipefail
 
+${ciSsh.helpers()}
+
+${ciSsh.slotLock()}
+
           cd deploy/terraform
           terraform init
           terraform workspace select -or-create main
+          EC2_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - nothing to reclaim workers from."
+            exit 1
+          fi
+          flarops_slots_lock "$EC2_IP"
+          trap 'flarops_slots_unlock "$EC2_IP"' EXIT
           if ! ALL_OUTPUTS=$(terraform output -json 2>&1); then
             echo "::error::Could not read Terraform outputs: $ALL_OUTPUTS"
             exit 1

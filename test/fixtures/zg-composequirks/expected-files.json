@@ -1,0 +1,24 @@
+{
+  "flarops.yaml": [
+    "    - 4000",
+    "    PORT: \"4000\"",
+    "    BACKUP_DIR: /var/backups/db",
+    "    DEBUG: \"\"",
+    "    LOG_LEVEL: info",
+    "cache:\n  image: \"redis:7.2\"",
+    "prometheus:\n  image: \"prom/prometheus:v2.53.0\"\n  replicas: 1\n  ports:\n    - 9090",
+    "  volumes:\n    - name: miniodata\n      path: /data",
+    "    - \":9001 #not-a-comment\"",
+    "  command:\n    - postgres\n    - -c\n    - wal_level=logical\n    - -c\n    - max_wal_senders=10",
+    "!DEBUG: \"true\"",
+    "!LOG_LEVEL: debug"
+  ],
+  "deploy/.env": [
+    "JWT_PRIVATE_KEY=\"-----BEGIN PRIVATE KEY-----\nMIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\nQ0A=\n-----END PRIVATE KEY-----\""
+  ],
+  "deploy/helm/templates/database.yaml": [
+    "{{ \"1-tables.sql\" | quote }}",
+    "{{ \"2-data.sql\" | quote }}",
+    "Hello {{ .Name }}"
+  ]
+}

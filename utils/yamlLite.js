@@ -19,8 +19,16 @@ function parseScalar(raw, lineNo) {
     }
     const body = text.slice(1, -1);
     if (quote === "'") return body.replace(/''/g, "'");
-    return body.replace(/\\(["\\/nrt])/g, (m, c) =>
-      ({ '"': '"', '\\': '\\', '/': '/', n: '\n', r: '\r', t: '\t' }[c]));
+    return body.replace(/\\(u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|.)/g, (m, c) => {
+      if (c[0] === 'u' || c[0] === 'x') return String.fromCharCode(parseInt(c.slice(1), 16));
+      const simple = { '"': '"', '\\': '\\', '/': '/', n: '\n', r: '\r', t: '\t', 0: '\0', ' ': ' ' }[c];
+      if (simple === undefined) throw new YamlError(`unsupported escape \\${c} in a double-quoted string`, lineNo);
+      return simple;
+    });
+  }
+
+  if (text[0] === '!') {
+    throw new YamlError(`tags such as ${JSON.stringify(text.split(/\s/)[0])} are not supported here - quote the value instead`, lineNo);
   }
 
   if (text === '|' || text === '>' || text.startsWith('|') || text.startsWith('>')) {
@@ -70,11 +78,16 @@ function parseFlowCollection(text, lineNo, resolve) {
   return out;
 }
 
-// Aliased nodes are copied, not shared: sync writes through these objects.
-function deepCopy(value) {
-  if (Array.isArray(value)) return value.map(deepCopy);
+// Aliased nodes are copied, not shared: sync writes through these objects. The copies are counted,
+// so a few nested aliases cannot expand into millions of nodes.
+const MAX_ALIAS_NODES = 100000;
+
+function deepCopy(value, budget, lineNo) {
+  budget.left--;
+  if (budget.left < 0) throw new YamlError('aliases expand into too many values', lineNo);
+  if (Array.isArray(value)) return value.map(v => deepCopy(v, budget, lineNo));
   if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, deepCopy(v)]));
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, deepCopy(v, budget, lineNo)]));
   }
   return value;
 }
@@ -98,7 +111,7 @@ function stripComment(line) {
 
 function parse(text) {
   const rows = [];
-  text.split('\n').forEach((raw, i) => {
+  text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n').forEach((raw, i) => {
     const lineNo = i + 1;
     if (/^\s*$/.test(raw)) return;
     if (/^\s*#/.test(raw)) return;
@@ -115,6 +128,7 @@ function parse(text) {
 
   let pos = 0;
   const anchors = new Map();
+  const budget = { left: MAX_ALIAS_NODES };
 
   function resolveInline(text, lineNo) {
     const trimmed = text.trim();
@@ -123,7 +137,7 @@ function parse(text) {
       if (!anchors.has(name)) {
         throw new YamlError(`*${name} refers to an anchor that has not been defined above it`, lineNo);
       }
-      return deepCopy(anchors.get(name));
+      return deepCopy(anchors.get(name), budget, lineNo);
     }
     if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
       const closer = trimmed[0] === '[' ? ']' : '}';
@@ -197,6 +211,9 @@ function parse(text) {
       }
       const [seqAnchor, inline] = takeAnchor(row.text === '-' ? '' : row.text.slice(2).trim());
       pos++;
+      if (inline.startsWith('- ') || inline === '-') {
+        throw new YamlError('a list inside a list item ("- - ...") is not supported here', row.lineNo);
+      }
 
       if (inline === '') {
         const nested = (pos < rows.length && rows[pos].indent > indent) ? parseBlock(rows[pos].indent) : null;

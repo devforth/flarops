@@ -1,3 +1,4 @@
+const { helmLiteral } = require('../generic/env.js');
 // Postgres 18+ images manage a per-version layout under /var/lib/postgresql: mount one level up.
 function getPostgresMajorVersion(image) {
   const tag = (image || '').split(':')[1] || '';
@@ -124,10 +125,9 @@ metadata:
     component: database
 data:
 `;
+    // Printed by Helm as text: seed data may hold "{{", and its first line may be indented.
     for (const [key, content] of Object.entries(initFiles)) {
-      const body = String(content).replace(/\r\n/g, '\n').replace(/\n$/, '')
-        .split('\n').map(l => (l === '' ? '' : '    ' + l)).join('\n');
-      initConfigMap += `  ${key}: |\n${body}\n`;
+      initConfigMap += `  ${helmLiteral(key)}: ${helmLiteral(content)}\n`;
     }
   }
 
@@ -161,6 +161,11 @@ spec:
 {{- if .Values.dataNodeSelector }}
       nodeSelector:
 {{ toYaml .Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
 {{- end }}
 {{- if .Values.dbCloneSource }}
       initContainers:

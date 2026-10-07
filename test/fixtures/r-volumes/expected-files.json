@@ -1,0 +1,6 @@
+{
+  "flarops.yaml": [
+    "  volumes:\n    - name: cachedata\n      path: /data",
+    "  volumes:\n    - name: brokerdata\n      path: /var/lib/rabbitmq"
+  ]
+}

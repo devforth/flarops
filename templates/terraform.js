@@ -1,6 +1,7 @@
 // Generates deploy/terraform/{main.tf,variables.tf}.
 
 const fs = require('fs');
+const { TERRAFORM_REQUIRED } = require('../utils/toolVersions.js');
 const path = require('path');
 
 // Escapes a value for a double-quoted HCL string, including HCL's own ${ and %{.
@@ -63,6 +64,7 @@ provider "cloudflare" {
     encrypt      = true
     use_lockfile = true
   }
+  required_version = "${TERRAFORM_REQUIRED}"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -283,7 +285,7 @@ ${installerDownload}
     INSTALL_K3S_VERSION="\${var.k3s_version}" \\
       K3S_URL="https://\${aws_instance.server.private_ip}:6443" \\
       K3S_TOKEN="\${random_password.k3s_token.result}" \\
-      INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi" \\
+      INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --node-taint flarops.io/capsule=true:NoSchedule" \\
       sh /tmp/k3s-install.sh
 
     for attempt in $(seq 1 60); do
@@ -316,6 +318,27 @@ resource "cloudflare_record" "domain" {
   count   = var.cloudflare_zone_id != "" ? 1 : 0
   zone_id = var.cloudflare_zone_id
   name    = var.domain
+  value   = aws_eip.eip.public_ip
+  type    = "A"
+  proxied = true
+}
+
+# PR and dashboard hosts sit one label below the domain's parent (pr-7.example.com,
+# app-pr-7.example.com). When that parent is not the zone itself, "*" does not reach them.
+data "cloudflare_zone" "zone" {
+  count   = var.cloudflare_zone_id != "" ? 1 : 0
+  zone_id = var.cloudflare_zone_id
+}
+
+locals {
+  domain_labels = split(".", var.domain)
+  domain_parent = length(local.domain_labels) > 2 ? join(".", slice(local.domain_labels, 1, length(local.domain_labels))) : var.domain
+}
+
+resource "cloudflare_record" "parent_wildcard" {
+  count   = var.cloudflare_zone_id != "" && endswith(local.domain_parent, ".\${try(data.cloudflare_zone.zone[0].name, "")}") ? 1 : 0
+  zone_id = var.cloudflare_zone_id
+  name    = "*.\${local.domain_parent}"
   value   = aws_eip.eip.public_ip
   type    = "A"
   proxied = true

@@ -1,0 +1,14 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: rabbitprodpw
+  api:
+    build: ./backend
+    ports: ["4000:4000"]
+    environment:
+      PORT: 4000
+      JWT_SECRET: "prodJwtKey$$abc123"
+      AMQP_URL: amqp://app:rabbitprodpw@rabbitmq:5672
+    depends_on: [rabbitmq]

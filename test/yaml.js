@@ -23,6 +23,8 @@ const CASES = [
     'a:\n  env: &shared\n    X: "1"\nb:\n  env: *shared\n',
     { a: { env: { X: '1' } }, b: { env: { X: '1' } } }],
   ['an anchor on a scalar', 'a: &n 5\nb: *n\n', { a: 5, b: 5 }],
+  ['unicode and hex escapes', 'a: "\\u0041\\x42\\t"\n', { a: 'AB\t' }],
+  ['a byte-order mark and CRLF line endings', '\uFEFFa: 1\r\nb: 2\r\n', { a: 1, b: 2 }],
   ['a merge key folds the aliased mapping in',
     'base: &b\n  X: "1"\n  Y: "2"\nsvc:\n  <<: *b\n  Y: "overridden"\n',
     { base: { X: '1', Y: '2' }, svc: { X: '1', Y: 'overridden' } }],
@@ -36,6 +38,14 @@ const REFUSALS = [
   ['an unclosed flow collection', 'a: [1, 2\n', /flow|expected/],
   ['a block scalar', 'a: |\n  text\n', /block scalar/],
   ['multiple documents', 'a: 1\n---\nb: 2\n', /multiple documents/],
+  ['a tag', 'a: !!str 80\n', /tags such as/],
+  ['an unknown escape', 'a: "x\\qy"\n', /unsupported escape/],
+  ['a list inside a list item', 'a:\n  - - b\n', /list inside a list item/],
+  ['aliases that expand without bound', (() => {
+    let t = 'l0: &l0 [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]\n';
+    for (let i = 1; i < 9; i++) t += `l${i}: &l${i} [${Array(10).fill('*l' + (i - 1)).join(', ')}]\n`;
+    return t;
+  })(), /too many values/],
 ];
 
 function run(check) {

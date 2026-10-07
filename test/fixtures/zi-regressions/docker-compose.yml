@@ -1,0 +1,38 @@
+services:
+  worker:
+    build: ./worker
+    environment:
+      DATABASE_URL: postgres://postgres:pw@db:5432/app
+    depends_on: [db]
+  backend:
+    build: ./backend
+    ports: ["4000:4000"]
+    command: ["node", "index.js", "--log-file", "-"]
+    environment:
+      PORT: 4000
+      DATABASE_URL: postgres://postgres:pw@db:5432/app
+      ANALYTICS_ADDR: "user:pw@tcp(db:5432)/app"
+      CONFIG_JSON: '{"db":"db:5432"}'
+      VAULT_ADDR: http://secret:8200
+      REDIS_HOST: cache
+      PROXY_URL: http://proxy:8080
+    depends_on: [db, cache, secret, proxy]
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: pw
+      POSTGRES_DB: app
+  cache:
+    image: redis:7
+    volumes:
+      - cachedata:/data
+  secret:
+    image: hashicorp/vault:1.17
+    ports: ["8200:8200"]
+  proxy:
+    image: nginx:1.27
+    ports: ["8080:8080"]
+    volumes:
+      - ./proxy/proxy.conf:/etc/nginx/proxy.conf
+volumes:
+  cachedata:

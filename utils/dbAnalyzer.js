@@ -1,4 +1,4 @@
-const fs = require('fs').promises;
+const fs = require('./textFs.js');
 const path = require('path');
 const { listComposeFiles } = require('./composeFiles');
 const { walkDir, logDebug } = require('./fsHelper');
@@ -515,13 +515,16 @@ async function parseComposeServices(baseDir) {
 
     const servicesMatch = content.match(/^services:\s*$/m);
     if (!servicesMatch) continue;
-    const afterServices = content.slice(servicesMatch.index + servicesMatch[0].length);
+    // Only the services: section - entries under networks: or volumes: are not services.
+    const afterServices = (content.slice(servicesMatch.index + servicesMatch[0].length) + '\n').split(/\n(?=[^\s#])/)[0];
 
     const firstServiceMatch = afterServices.match(/^([ \t]+)([a-zA-Z0-9_-]+):\s*$/m);
     if (!firstServiceMatch) continue;
     const indent = firstServiceMatch[1];
 
-    const serviceBlockRegex = new RegExp('^' + indent + '([a-zA-Z0-9_-]+):\\s*$([\\s\\S]*?)(?=^' + indent + '[a-zA-Z0-9_-]+:\\s*$|(?![\\s\\S]))', 'gm');
+    // A block ends at the next service or at the next top-level key (networks:, volumes:), whose
+    // entries would otherwise be read as services and replace real ones of the same name.
+    const serviceBlockRegex = new RegExp('^' + indent + '([a-zA-Z0-9_.-]+):\\s*$([\\s\\S]*?)(?=^' + indent + '[a-zA-Z0-9_.-]+:\\s*$|^\\S|(?![\\s\\S]))', 'gm');
     const services = {};
     let m;
     while ((m = serviceBlockRegex.exec(afterServices)) !== null) {

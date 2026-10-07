@@ -1,4 +1,5 @@
 const { normalizeRoutes, stripMiddlewareNames } = require('../utils/routes.js');
+const { helmLiteral } = require('./generic/env.js');
 
 module.exports = (config) => {
   // Traefik applies middlewares per Ingress, so each stripped prefix gets its own Middleware and Ingress.
@@ -30,7 +31,7 @@ metadata:
 spec:
   stripPrefix:
     prefixes:
-      - ${route.path}
+      - ${helmLiteral(route.path)}
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -51,7 +52,7 @@ spec:
     - http:
 {{- end }}
         paths:
-          - path: ${route.path}
+          - path: ${helmLiteral(route.path)}
             pathType: Prefix
             backend:
               service:

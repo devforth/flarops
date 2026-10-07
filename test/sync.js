@@ -54,7 +54,7 @@ function run(check, dir, helmRenders) {
   // 3. A service declared by hand is created from the shared template.
   fs.appendFileSync(path.join(dir, 'flarops.yaml'), `
 mailer:
-  dockerfile: "mailer/Dockerfile"
+  dockerfile: "Dockerfile"
   context: "mailer"
   replicas: 2
   ports:
@@ -101,7 +101,7 @@ mailer:
   // 3b. Storage on a service this repository builds.
   fs.appendFileSync(path.join(dir, 'flarops.yaml'), `
 archiver:
-  dockerfile: "archiver/Dockerfile"
+  dockerfile: "Dockerfile"
   context: "archiver"
   replicas: 1
   volumes:
@@ -114,7 +114,7 @@ archiver:
   const archiver = read(dir, 'deploy/helm/templates/archiver.yaml');
   check('a claim is written for it', /kind: PersistentVolumeClaim/.test(archiver) && /name: archiver-spool/.test(archiver), archiver.slice(0, 400));
   check('the declared size is used', /storage: "40Gi"/.test(archiver), archiver.slice(0, 600));
-  check('it is mounted where declared', /mountPath: \/var\/spool\/archiver/.test(archiver));
+  check('it is mounted where declared', /mountPath: \{\{ "\/var\/spool\/archiver" \| quote \}\}/.test(archiver), archiver.slice(0, 900));
   check('a volume forces Recreate', /type: Recreate/.test(archiver), archiver.slice(0, 700));
 
   const beforeBad = read(dir, 'deploy/helm/values.yaml');
@@ -188,7 +188,7 @@ broken:
     const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
     const reporter = `
 reporter:
-  dockerfile: "reporter/Dockerfile"
+  dockerfile: "Dockerfile"
   context: "reporter"
   replicas: 1
   ports:
@@ -223,27 +223,200 @@ reporter:
     r = runSync(dir);
     check('removing databaseUrls stops the URL', r.status === 0 && !/name: DATABASE_URL/.test(read(dir, 'deploy/helm/templates/reporter.yaml')), r.err || r.out);
 
-    // State from before the field: what init built stays until flarops.yaml names it.
+    // On api, and taken away again by leaving the field out.
     fs.writeFileSync(path.join(dir, 'flarops.yaml'), original.replace(/^api:\n/m, 'api:\n  databaseUrls:\n    - DATABASE_URL\n'));
     r = runSync(dir);
     check('databaseUrls on api builds its URL', r.status === 0 && /- name: DATABASE_URL/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.err || r.out);
-    const statePath = path.join(dir, 'deploy/.flarops-state.json');
-    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    delete state.databaseUrlsDeclared;
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n');
     fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
     r = runSync(dir);
-    check('older state keeps the URLs init built when flarops.yaml does not name them',
-      /nothing to do/.test(r.out) && /- name: DATABASE_URL/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.err || r.out);
-    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original.replace(/^api:\n/m, 'api:\n  databaseUrls: []\n'));
+    check('leaving databaseUrls out of api removes its URL', r.status === 0 && !/- name: DATABASE_URL/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.err || r.out);
+  }
+
+  // 3a''''. syncLock: files sync leaves as they are.
+  {
+    const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+    check('init writes an empty syncLock', /^syncLock: \{\}$/m.test(original));
+    const withLock = (entries) => original.replace(/^syncLock: \{\}$/m, 'syncLock:\n' + entries.map(e => '  ' + e).join('\n'));
+    const apiFile = path.join(dir, 'deploy/helm/templates/api.yaml');
+    const handEdited = read(dir, 'deploy/helm/templates/api.yaml') + '# changed by hand\n';
+    fs.writeFileSync(apiFile, handEdited);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), withLock(['deploy/helm/templates/api.yaml: true']));
+    editService(dir, 'api', 'replicas', '4');
     r = runSync(dir);
-    check('databaseUrls: [] removes them there', r.status === 0 && !/- name: DATABASE_URL/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.err || r.out);
-    state.databaseUrlsDeclared = true;
-    state.dbUrlVars = [];
-    fs.writeFileSync(statePath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statePath, 'utf8')), databaseUrlsDeclared: true }, null, 2) + '\n');
+    check('sync applies changes with a template locked', r.status === 0 && /api\.replicas/.test(r.out), r.err || r.out);
+    check('the locked template is left as it is', read(dir, 'deploy/helm/templates/api.yaml') === handEdited);
+    check('the rest still follows flarops.yaml', /^api:\n  replicas: 4$/m.test(read(dir, 'deploy/helm/values.yaml')));
+    check('a change that does not touch the locked file is not reported against it', !/syncLock kept/.test(r.err), r.err);
+
+    // A renamed secret is written into api.yaml itself.
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), read(dir, 'flarops.yaml')
+      .replace('    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n', '    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    LOG_TOKEN: LOG_SINK_TOKEN\n'));
+    r = runSync(dir);
+    check('the locked template is still left as it is', read(dir, 'deploy/helm/templates/api.yaml') === handEdited);
+    const lastLine = (r.out + r.err).trim().split('\n').pop();
+    check('a change that would reach the locked file is the last thing sync says', /syncLock kept these files.*deploy\/helm\/templates\/api\.yaml/.test(lastLine), lastLine);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), withLock(['deploy/helm/templates/api.yaml: false']));
+    editService(dir, 'api', 'replicas', '2');
+    r = runSync(dir);
+    check('false unlocks it', r.status === 0 && read(dir, 'deploy/helm/templates/api.yaml') !== handEdited && !/syncLock kept/.test(r.err), r.err || r.out);
+
+    const before = read(dir, 'deploy/helm/values.yaml');
+    for (const [entry, label, message] of [
+      ['deploy/helm/values.yaml: true', 'values.yaml', /cannot be locked/],
+      ['werf.yaml: true', 'werf.yaml', /cannot be locked/],
+      ['deploy/.flarops-state.json: true', 'the state file', /cannot be locked/],
+      ['deploy/helm/templates/apii.yaml: true', 'a file sync does not write', /not a file sync writes/],
+      ['../outside.yaml: true', 'a path outside the project', /relative to the project root/],
+      ['deploy/helm/templates/api.yaml: yes', 'a value other than true or false', /true or false/],
+    ]) {
+      fs.writeFileSync(path.join(dir, 'flarops.yaml'), withLock([entry]));
+      editService(dir, 'api', 'replicas', '3');
+      r = runSync(dir);
+      check(`locking ${label} is refused`, r.status === 1 && message.test(r.err), r.err || r.out);
+    }
+    check('nothing was written on those refusals', read(dir, 'deploy/helm/values.yaml') === before);
+
+    // A locked template of a removed service.
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), withLock(['.github/workflows/deploy.yml: true']) + `
+pinger:
+  dockerfile: "Dockerfile"
+  context: "pinger"
+  replicas: 1
+  ports:
+    - 8080
+  secretEnvs:
+    PINGER_TOKEN: PINGER_TOKEN
+`);
+    r = runSync(dir);
+    check('a workflow can be locked', r.status === 0 && /syncLock kept these files.*deploy\.yml/.test(r.err)
+      && !read(dir, '.github/workflows/deploy.yml').includes('SECRET_ENV_PINGER_TOKEN'), r.err || r.out);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), withLock(['deploy/helm/templates/pinger.yaml: true']));
+    r = runSync(dir);
+    check('removing a service whose template is locked is refused', r.status === 1 && /no longer declares/.test(r.err), r.err || r.out);
+    check('its template is still there', exists(dir, 'deploy/helm/templates/pinger.yaml'));
+
     fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
     r = runSync(dir);
-    check('back to the original flarops.yaml', r.status === 0, r.err || r.out);
+    check('without the lock the service is removed again', r.status === 0 && !exists(dir, 'deploy/helm/templates/pinger.yaml'), r.err || r.out);
+  }
+
+  // 3c. What flarops.yaml may say: refusals that name the field, nothing written.
+  {
+    const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+    const valuesBefore = read(dir, 'deploy/helm/values.yaml');
+    const append = (block) => original + block;
+    const refused = [
+      ['a misspelled field', original.replace(/^(api:\n)/m, '$1  replcas: 3\n'), /api\.replcas" is not a field/],
+      ['an unknown key in db:', append('\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  db:\n    type: postgres\n    secretEnvs:\n      POSTGRES_PASSWORD: W_PW\n    passwordKey: "W_PW"\n'), /worker\.db\.passwordKey" is not a field/],
+      ['a db: without its password', append('\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  db:\n    type: postgres\n'), /worker\.db\.secretEnvs" is required/],
+      ['redis as a database', append('\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  db:\n    type: redis\n    secretEnvs:\n      REDIS_PASSWORD: W_PW\n'), /worker\.db\.type" must be one of/],
+      ['two replicas of a database', original.replace(/^(database:\n(?:  .*\n)*?)  replicas: 1\n/m, '$1  replicas: 2\n'), /database\.replicas" must be 0 or 1/],
+      ['the deploy pipeline\'s own credential', original.replace('    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n', '    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    LOG_KEY: AWS_SECRET_ACCESS_KEY\n'), /deploy pipeline's own credentials/],
+      ['braces in a route', original.replace(/^    - \/api$/m, '    - path: /x{{.Values.database.password}}\n      stripPrefix: true'), /without spaces, quotes, backslashes or braces/],
+      ['a service named like a chart file', append('\nsecret:\n  image: "nginx:1"\n  replicas: 1\n'), /"secret" is a name Flarops or YAML already uses/],
+      ['a service name starting with a digit', append('\n9worker:\n  image: "nginx:1"\n  replicas: 1\n'), /not a valid service name/],
+      ['a service named after another\'s database', append('\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  db:\n    type: postgres\n    secretEnvs:\n      POSTGRES_PASSWORD: W_PW\nworker-db:\n  image: "nginx:1"\n'), /is the name of worker's own database/],
+      ['one name in env and secretEnvs', original.replace('    DB_HOST: database\n', '    DB_HOST: database\n    POSTGRES_PASSWORD: plain\n'), /api\.env\.POSTGRES_PASSWORD" is also under secretEnvs/],
+      ['a support service without an image', append('\ncache:\n  replicas: 1\n'), /needs either image/],
+      ['a pipeline credential in lower case', original.replace('    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n', '    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    LOG_KEY: aws_secret_access_key\n'), /deploy pipeline's own credentials/],
+      ['a GITHUB_ secret', original.replace('    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n', '    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    GH: GITHUB_TOKEN\n'), /deploy pipeline's own credentials/],
+      ['a secret with no name', original.replace('    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n', '    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    TOKEN:\n'), /needs the name of the GitHub secret/],
+      ['a command that is a map', original.replace(/^(api:\n)/m, '$1  command: {a: 1}\n'), /api\.command" must be a list of arguments/],
+      ['a build arg without "="', original.replace(/^(api:\n)/m, '$1  buildArgs:\n    - NOEQUALS\n'), /not written as KEY=value/],
+      ['a YAML tag', original.replace(/^(api:\n)/m, '$1  replicas: !!int 3\n').replace(/^  replicas: 1\n(?=  ports:\n    - 4000)/m, ''), /tags such as/],
+    ];
+    for (const [label, text, message] of refused) {
+      fs.writeFileSync(path.join(dir, 'flarops.yaml'), text);
+      r = runSync(dir);
+      check(`refuses ${label}`, r.status === 1 && message.test(r.err), r.err || r.out);
+    }
+    check('nothing was written on those refusals', read(dir, 'deploy/helm/values.yaml') === valuesBefore);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('back to the original after the refusals', r.status === 0, r.err || r.out);
+  }
+
+  // 3d. A service's own database: defaults, switching to and from the shared one, renames.
+  {
+    const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+    const shared = original + '\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  replicas: 1\n  ports: []\n  databaseUrls:\n    - DATABASE_URL\n';
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), shared);
+    r = runSync(dir);
+    check('a service on the top-level database syncs', r.status === 0, r.err || r.out);
+    check('its URL points at the top-level database', /@database:5432\//.test(read(dir, 'deploy/helm/templates/worker.yaml')));
+
+    const own = shared + '  db:\n    type: PostgreSQL\n    secretEnvs:\n      POSTGRES_PASSWORD: WORKER_DB_PASSWORD\n';
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), own);
+    r = runSync(dir);
+    check('adding db: gives it a database of its own', r.status === 0 && exists(dir, 'deploy/helm/templates/worker-db.yaml'), r.err || r.out);
+    const values = read(dir, 'deploy/helm/values.yaml');
+    check('the engine fills in what db: leaves out', /    db:\n      type: "postgresql"\n      image: "postgres:18-alpine"\n      port: 5432\n      user: "postgres"\n      name: "workerdb"/.test(values), values.match(/    db:\n(?:      .*\n)*/) && values.match(/    db:\n(?:      .*\n)*/)[0]);
+    check('nothing renders as undefined', !/undefined/.test(values + read(dir, 'deploy/helm/templates/worker-db.yaml') + read(dir, 'deploy/helm/templates/worker.yaml')));
+    check('the URL now points at its own database', /@worker-db:5432\/workerdb"/.test(read(dir, 'deploy/helm/templates/worker.yaml')), read(dir, 'deploy/helm/templates/worker.yaml').match(/DATABASE_URL[\s\S]{0,160}/));
+    r = runSync(dir);
+    check('that settles: the next sync has nothing to do', /nothing to do/.test(r.out), r.out);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), own.replace('    secretEnvs:\n      POSTGRES_PASSWORD: WORKER_DB_PASSWORD\n', '    name: jobs\n    secretEnvs:\n      POSTGRES_PASSWORD: WORKER_DB_PASSWORD\n'));
+    r = runSync(dir);
+    check('renaming its database moves the URL with it', r.status === 0 && /@worker-db:5432\/jobs"/.test(read(dir, 'deploy/helm/templates/worker.yaml')), r.err || r.out);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), shared);
+    r = runSync(dir);
+    check('removing db: removes its database', r.status === 0 && !exists(dir, 'deploy/helm/templates/worker-db.yaml'), r.err || r.out);
+    check('and says the data volume stays', /PVC data-worker-db-0/.test(r.err), r.err);
+    check('the URL is back on the top-level database', /@database:5432\//.test(read(dir, 'deploy/helm/templates/worker.yaml')));
+
+    // The top-level database: block may come after the services that use it.
+    const reordered = shared.replace(/^database:\n(?:  .*\n|    .*\n)*/m, '') + '\n' + original.match(/^database:\n(?:  .*\n)*/m)[0].replace(/  port: 5432\n/, '  port: 5433\n');
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), reordered);
+    r = runSync(dir);
+    check('a database declared below its users applies in one sync', r.status === 0 && /@database:5433\//.test(read(dir, 'deploy/helm/templates/worker.yaml')), r.err || r.out);
+    r = runSync(dir);
+    check('and the next sync has nothing to do', /nothing to do/.test(r.out), r.out);
+    const svc = read(dir, 'deploy/helm/templates/database.yaml');
+    check('the database port moves the Service, not the server', /port: \{\{ \.Values\.dbPort \| default 5433 \}\}\n      targetPort: 5432/.test(svc), svc.slice(0, 500));
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), reordered.replace(/^database:\n(?:  .*\n)*/m, '').replace(/^(api:\n(?:  .*\n|    .*\n)*?)  secretEnvs:\n    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n/m, '$1'));
+    r = runSync(dir);
+    check('removing the database while a service uses it is refused', r.status === 1 && /worker\.databaseUrls" needs a database/.test(r.err), r.err || r.out);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('back to the original after the database changes', r.status === 0, r.err || r.out);
+  }
+
+  // 3e. Files sync did not generate, files that drifted, and what the values may say.
+  {
+    const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+    fs.writeFileSync(path.join(dir, 'deploy/helm/templates/extra-config.yaml'), 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: extra\n');
+    editService(dir, 'api', 'replicas', '0');
+    r = runSync(dir);
+    check('a template added by hand is left alone', r.status === 0 && exists(dir, 'deploy/helm/templates/extra-config.yaml') && !/extra-config/.test(r.out), r.out);
+    check('replicas: 0 scales to 0', /^api:\n  replicas: 0$/m.test(read(dir, 'deploy/helm/values.yaml')));
+    r = runSync(dir);
+    check('and stays there', /nothing to do/.test(r.out), r.out);
+    fs.unlinkSync(path.join(dir, 'deploy/helm/templates/extra-config.yaml'));
+
+    const apiFile = path.join(dir, 'deploy/helm/templates/api.yaml');
+    fs.writeFileSync(apiFile, read(dir, 'deploy/helm/templates/api.yaml') + '# drifted\n');
+    r = runSync(dir);
+    check('a generated file that drifted is rewritten even with flarops.yaml unchanged', r.status === 0 && /rewritten from this version/.test(r.out) && !/# drifted/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.out);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original
+      .replace(/^(api:\n)/m, '$1  command: ["node", "server.js", "--greeting={{ hello }}"]\n')
+      + '\nmigrate:\n  dockerfile: Dockerfile\n  context: migrate\n  oneShot: true\n  ports: []\n  databaseUrls:\n    - DATABASE_URL\n');
+    r = runSync(dir);
+    check('a one-shot task with databaseUrls syncs', r.status === 0, r.err || r.out);
+    check('the task gets its URL', /- name: DATABASE_URL\n\s+value: "postgres(ql)?:\/\/[^"]*@database:/.test(read(dir, 'deploy/helm/templates/migrate.yaml')), read(dir, 'deploy/helm/templates/migrate.yaml'));
+    if (helmRenders) {
+      const err = helmRenders(dir);
+      check('"{{" in an api argument stays text', !err, err);
+    }
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('back to the original after the file checks', r.status === 0, r.err || r.out);
   }
 
   // 3b'. Values pasted unescaped into file names and workflows must be refused.
@@ -310,7 +483,7 @@ topic-setup:
   r = runSync(dir);
   check('sync accepts a stripped route', r.status === 0, r.err);
   const ingress = read(dir, 'deploy/helm/templates/01-ingress.yaml');
-  check('a Middleware is generated for it', /kind: Middleware/.test(ingress) && /- \/api$/m.test(ingress), ingress.slice(-900));
+  check('a Middleware is generated for it', /kind: Middleware/.test(ingress) && /- \{\{ "\/api" \| quote \}\}$/m.test(ingress), ingress.slice(-900));
   check('it gets an Ingress of its own', (ingress.match(/kind: Ingress/g) || []).length >= 2);
   check('the middleware is referenced by annotation',
     /traefik\.ingress\.kubernetes\.io\/router\.middlewares/.test(ingress), ingress.slice(-900));

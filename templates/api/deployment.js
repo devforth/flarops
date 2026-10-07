@@ -32,9 +32,10 @@ module.exports = (config) => {
     dbUrlEnvBlock += urlEncodedRef(config.dbPasswordKey, '.');
 
     for (const urlVar of config.dbUrlVars) {
-      let query = urlVar.query || '';
+      // Read from the project's own URL: nothing in it may open a Helm action or end the YAML string.
+      let query = String(urlVar.query || '').replace(/[{}"\\]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
       if (scheme === 'mongodb' && !query.includes('authSource')) {
-        query += (query ? '&' : '') + mongoAuth;
+        query += query ? '&' + mongoAuth.slice(1) : mongoAuth;
       }
 
       dbUrlEnvBlock += `
@@ -77,9 +78,13 @@ ${dbPasswordBlock}${dbUrlEnvBlock}${extraSecretEnvBlock}
 {{- end }}`;
 
   // A migration step runs as an initContainer; checkFile gates it so a wrong guess is a no-op.
-  const apiArgsBlock = (Array.isArray(config.apiCommand) && config.apiCommand.length > 0) ? `
+  const apiArgsBlock = `
+{{- if .Values.api.command }}
           args:
-${config.apiCommand.map(a => `            - ${JSON.stringify(String(a))}`).join('\n')}` : '';
+{{- range $arg := .Values.api.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}`;
 
   const prestartInitContainer = config.apiMigrationStep ? `
       initContainers:
@@ -120,6 +125,11 @@ spec:
 {{- if $.Values.dataNodeSelector }}
       nodeSelector:
 {{ toYaml $.Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
 {{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:

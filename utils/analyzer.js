@@ -1,4 +1,4 @@
-const fs = require('fs').promises;
+const fs = require('./textFs.js');
 const path = require('path');
 const { listComposeFiles, composeBaseDir } = require('./composeFiles');
 const { walkDir, logDebug } = require('./fsHelper');
@@ -51,7 +51,8 @@ function splitComposeServiceBlocks(content) {
   const blocks = {};
   const servicesMatch = content.match(/^services:\s*$/m);
   if (!servicesMatch) return blocks;
-  const afterServices = content.slice(servicesMatch.index + servicesMatch[0].length);
+  // Only the services: section - entries under networks: or volumes: are not services.
+  const afterServices = (content.slice(servicesMatch.index + servicesMatch[0].length) + '\n').split(/\n(?=[^\s#])/)[0];
 
   const firstServiceMatch = afterServices.match(/^([ \t]+)([a-zA-Z0-9_.-]+):\s*$/m);
   if (!firstServiceMatch) return blocks;

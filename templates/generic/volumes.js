@@ -36,7 +36,7 @@ spec:
 `;
     volumeMounts += `
 ${mountPad}- name: ${claimName}
-${mountPad}  mountPath: ${v.target}`;
+${mountPad}  mountPath: {{ ${JSON.stringify(String(v.target))} | quote }}`;
     volumes += `
 ${volumePad}- name: ${claimName}
 ${volumePad}  persistentVolumeClaim:

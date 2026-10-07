@@ -1,7 +1,7 @@
 // Everything `flarops init` asks the operator, in one place (stubbed by test/harness.js).
 
 const path = require('path');
-const { splitRegistry } = require('../../utils/registry.js');
+const { splitRegistry, REGISTRY_HOST, IMAGE_PATH } = require('../../utils/registry.js');
 // Enter accepts. The one [y/N] prompt (reusing an existing state bucket) lives in utils/awsHelper.js.
 // At least two labels, each 1-63 letters, digits or hyphens, not starting or ending with a hyphen.
 function isDomain(value) {
@@ -17,17 +17,25 @@ module.exports = async function collectOperatorAnswers({
   currentDir, askQuestion, askPassword, execFileSync,
   ensureAwsCli, handleS3Bucket, getDefaultAWSCredentials,
 }) {
-  // "harbor.example.com/team" splits into the registry host and the project inside it; both can be
-  // changed later under repositorySettings in flarops.yaml.
-  const registryAnswer = await askQuestion('Enter docker registry, optionally with a project (e.g. harbor.example.com/team; leave empty for Docker Hub): ');
-  const { host: dockerRegistry, project: dockerProject } = splitRegistry(registryAnswer);
-
+  let dockerRegistry = '';
+  let dockerProject = null;
   let registryUser = '';
   let registryPassword = '';
+  let loginRegistry = 'docker.io';
 
-  const loginRegistry = dockerRegistry || 'docker.io';
-
+  // A failed login asks for the registry again too: a wrong host is as likely as a wrong password.
   while (true) {
+    // "harbor.example.com/team" splits into the registry host and the project inside it; both can be
+    // changed later under repositorySettings in flarops.yaml.
+    const registryAnswer = (await askQuestion('Enter docker registry, optionally with a project (e.g. harbor.example.com/team; leave empty for Docker Hub): '))
+      .trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+    ({ host: dockerRegistry, project: dockerProject } = splitRegistry(registryAnswer));
+    if ((dockerRegistry && !REGISTRY_HOST.test(dockerRegistry)) || (dockerProject && !IMAGE_PATH.test(dockerProject))) {
+      console.log(`"${registryAnswer}" is not a registry - expected a host such as harbor.example.com, optionally followed by /project`);
+      continue;
+    }
+    loginRegistry = dockerRegistry || 'docker.io';
+
     registryUser = (await askQuestion(`Enter username for ${loginRegistry}: `)).trim();
     if (!registryUser) {
       console.log('username is required');
@@ -66,7 +74,9 @@ module.exports = async function collectOperatorAnswers({
       cloudflareZoneId = (await askQuestion('Enter Cloudflare Zone ID: ')).trim();
     }
   }
-  let projectName = path.basename(currentDir).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  // Names "<project>-production" and "<project>-pr-<n>" must stay within Kubernetes' 63 characters.
+  let projectName = path.basename(currentDir).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
+    .slice(0, 50).replace(/-+$/, '');
   if (!projectName) projectName = 'flarops-project';
   let awsCredentials = { accessKey: '', secretKey: '' };
   const accessKeyInput = await askQuestion('Enter project AWS Access Key ID (press Enter to use your default credentials): ');

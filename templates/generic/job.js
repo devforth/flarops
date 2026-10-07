@@ -1,14 +1,20 @@
 // A one-shot task: a Helm hook Job, re-run on every deploy, removed before the next run.
-const { secretRefs, urlEncodedRef, alreadyEmitted } = require('./env.js');
+const { secretRefs, databaseEnv } = require('./env.js');
 
 module.exports = (service, { valuesRef }) => {
   const extraSecretEnvBlock = secretRefs(service.extraSecretEnvMappings);
+  const dbEnv = databaseEnv(service);
 
-  const hasEnvBlock = `{{- if or $svc.env $svc.secretKeys ${extraSecretEnvBlock ? 'true' : 'false'} }}`;
+  const hasEnvBlock = `{{- if or $svc.env $svc.secretKeys ${extraSecretEnvBlock || dbEnv.block ? 'true' : 'false'} }}`;
 
-  const argsBlock = (Array.isArray(service.command) && service.command.length > 0) ? `
+  // From values, like every other workload: an argument holding "{{" stays text.
+  const argsBlock = `
+{{- if $svc.command }}
           args:
-${service.command.map(a => `            - ${JSON.stringify(String(a))}`).join('\n')}` : '';
+{{- range $arg := $svc.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}`;
 
   const image = service.image
     ? `{{ $svc.image | default "${service.image}" }}`
@@ -39,6 +45,11 @@ spec:
 {{- if $.Values.dataNodeSelector }}
       nodeSelector:
 {{ toYaml $.Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
 {{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:
@@ -69,7 +80,7 @@ ${hasEnvBlock}
                   name: {{ $.Values.projectName }}-secrets
                   key: {{ $key }}
 {{- end }}
-{{- end }}${extraSecretEnvBlock}
+{{- end }}${dbEnv.block}${extraSecretEnvBlock}
 {{- end }}
 `.trim();
 };

@@ -1,6 +1,7 @@
 const ciSsh = require('./ciSsh');
 const { registrySettings, imageRepository, isDockerHub } = require('../utils/registry.js');
 const werfCleanupStep = require('./werfCleanup.js');
+const { TERRAFORM_VERSION, WERF_VERSION } = require('../utils/toolVersions.js');
 
 module.exports = function deployYmlTemplate(config) {
   const registry = registrySettings(config);
@@ -74,6 +75,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${TERRAFORM_VERSION}
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -83,6 +86,11 @@ jobs:
         working-directory: deploy/terraform
         run: terraform workspace select -or-create main
 
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387
+        with:
+          ssh-private-key: \${{ secrets.SSH_PRIVATE_KEY }}
+
       - name: Terraform Apply
         working-directory: deploy/terraform
         env:${config.hasCloudflare ? `
@@ -90,7 +98,18 @@ jobs:
           TF_VAR_cloudflare_zone_id: \${{ secrets.CLOUDFLARE_ZONE_ID }}` : ''}
           TF_VAR_domain: \${{ env.BASE_DOMAIN }}
         run: |
-          set -o pipefail
+          set -euo pipefail
+
+${ciSsh.helpers()}
+
+${ciSsh.slotLock()}
+
+          EC2_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          if [ -n "$EC2_IP" ] && flarops_ssh "$EC2_IP" "sudo k3s kubectl get --raw /readyz" > /dev/null 2>&1; then
+            flarops_slots_lock "$EC2_IP"
+            trap 'flarops_slots_unlock "$EC2_IP"' EXIT
+          fi
+
           if ! ALL_OUTPUTS=$(terraform output -json 2>&1); then
             echo "::error::Could not read Terraform outputs, refusing to apply: $ALL_OUTPUTS"
             exit 1
@@ -99,22 +118,24 @@ jobs:
           echo "Preserving existing worker slots: $CURRENT_SLOTS"
           terraform apply -var="worker_slots=$CURRENT_SLOTS" -auto-approve -lock-timeout=5m
 
-      - name: Setup SSH
-        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387
-        with:
-          ssh-private-key: \${{ secrets.SSH_PRIVATE_KEY }}
-
       - name: Fetch Kubeconfig from EC2
         working-directory: deploy/terraform
         run: |
           set -euo pipefail
 
-          export EC2_IP=$(terraform output -raw public_ip)
+          EC2_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - the apply above did not create the server."
+            exit 1
+          fi
+          export EC2_IP
 
 ${ciSsh.fetchKubeconfig()}
 
       - name: Setup Werf
         uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
+        with:
+          version: ${WERF_VERSION}
 ${loginStep}
       - name: Verify Kubeconfig
         run: |
@@ -126,8 +147,9 @@ ${secretEnvBlock}${dbPasswordEnvLine}          SECRET_REGISTRY_PASSWORD: \${{ se
           REGISTRY_SERVER: ${registryServerForPull}
         run: |
           umask 077
-          export TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
-          export TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
+          TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          export TF_INSTANCE_TYPE TF_VOLUME_SIZE
           ${buildValuesScript}
           werf converge \\
             --parallel-tasks-limit=3 \\

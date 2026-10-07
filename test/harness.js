@@ -56,7 +56,8 @@ function installStubs(extraAnswers) {
   };
 }
 
-async function generate(fixtureDir, extraAnswers) {
+// options.commit: false leaves the fixture uncommitted, as in a repository that has no commits yet.
+async function generate(fixtureDir, extraAnswers, options = {}) {
   // The directory's basename becomes projectName, so it must be stable for snapshots.
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-test-'));
   const work = path.join(parent, path.basename(fixtureDir));
@@ -64,9 +65,11 @@ async function generate(fixtureDir, extraAnswers) {
   child_process.execFileSync('git', ['init', '-q'], { cwd: work });
   // .env and .env.local stay out of git, as in a real project: init treats committed values as public.
   fs.appendFileSync(path.join(work, '.git', 'info', 'exclude'), '.env\n.env.local\n');
-  child_process.execFileSync('git', ['add', '-A'], { cwd: work, stdio: 'ignore' });
-  child_process.execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'fixture'],
-    { cwd: work, stdio: 'ignore' });
+  if (options.commit !== false) {
+    child_process.execFileSync('git', ['add', '-A'], { cwd: work, stdio: 'ignore' });
+    child_process.execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'fixture'],
+      { cwd: work, stdio: 'ignore' });
+  }
 
   installStubs(extraAnswers);
   // Reset module-level state between generations.
@@ -85,6 +88,9 @@ async function generate(fixtureDir, extraAnswers) {
   process.chdir(work);
   let ok = true;
   let error = null;
+  // A refusal ends init with process.exit; here it ends this one generation instead of the suite.
+  const realExit = process.exit;
+  process.exit = (code) => { throw new Error(`process.exit(${code})`); };
   try {
     delete require.cache[require.resolve(path.join(REPO, 'bin/commands/init.js'))];
     const init = require(path.join(REPO, 'bin/commands/init.js'));
@@ -93,6 +99,7 @@ async function generate(fixtureDir, extraAnswers) {
     ok = false;
     error = e;
   } finally {
+    process.exit = realExit;
     process.chdir(cwd);
     restoreOut();
     restoreErr();

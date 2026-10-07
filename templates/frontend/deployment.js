@@ -35,6 +35,11 @@ spec:
 {{- if $.Values.dataNodeSelector }}
       nodeSelector:
 {{ toYaml $.Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
 {{- end }}
 {{- if .Values.imagePullSecret }}
       imagePullSecrets:

@@ -1,0 +1,3 @@
+API_TOKEN (backend/.env.production: committed to git (or not git-ignored, so about to be), so the value is public)
+JWT_SECRET (docker-compose.yml: committed to git (or not git-ignored, so about to be), so the value is public)
+api.AMQP_URL (holds RABBITMQ_DEFAULT_PASS)

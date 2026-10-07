@@ -1,0 +1,3055 @@
+# files
+  .github/workflows/deploy.yml
+  .github/workflows/pr-capsule.yml
+  .gitignore
+  .keys/deploy_rsa
+  .keys/deploy_rsa.pub
+  FLAROPS.md
+  backend/.env
+  backend/.env.development
+  backend/Dockerfile
+  backend/index.js
+  backend/package.json
+  deploy/.env
+  deploy/.env.safety
+  deploy/.flarops-state.json
+  deploy/dashboard/Dockerfile
+  deploy/dashboard/auth.go
+  deploy/dashboard/capacity.go
+  deploy/dashboard/collector.go
+  deploy/dashboard/db.go
+  deploy/dashboard/fetcher.go
+  deploy/dashboard/go.mod
+  deploy/dashboard/go.sum
+  deploy/dashboard/k8s.go
+  deploy/dashboard/login.html
+  deploy/dashboard/logout.html
+  deploy/dashboard/main.go
+  deploy/dashboard/nodeagent.go
+  deploy/dashboard/state.go
+  deploy/dashboard/static/index.html
+  deploy/dashboard/static/loader.gif
+  deploy/helm/Chart.yaml
+  deploy/helm/templates/01-ingress.yaml
+  deploy/helm/templates/_helpers.tpl
+  deploy/helm/templates/api.yaml
+  deploy/helm/templates/dashboard.yaml
+  deploy/helm/templates/database.yaml
+  deploy/helm/templates/registry-secret.yaml
+  deploy/helm/templates/secret.yaml
+  deploy/helm/templates/support-cache.yaml
+  deploy/helm/templates/support-minio.yaml
+  deploy/helm/templates/support-prometheus.yaml
+  deploy/helm/values.yaml
+  deploy/terraform/main.tf
+  deploy/terraform/variables.tf
+  docker-compose.yml
+  expected-files.json
+  flarops.yaml
+  monitoring/alerts.yml
+  sql/data.sql
+  sql/tables.sql
+  werf-giterminism.yaml
+  werf.yaml
+
+# ===== .github/workflows/deploy.yml
+name: Flarops CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flarops-deploy-zg-composequirks
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  PROJECT_NAME: zg-composequirks
+  REGISTRY_USER: testuser
+  BASE_DOMAIN: example.test
+
+
+jobs:
+  infrastructure:
+    name: Provision Infrastructure & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.15.8
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: terraform init
+
+      - name: Terraform Workspace
+        working-directory: deploy/terraform
+        run: terraform workspace select -or-create main
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Terraform Apply
+        working-directory: deploy/terraform
+        env:
+          TF_VAR_domain: ${{ env.BASE_DOMAIN }}
+        run: |
+          set -euo pipefail
+
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+
+
+          FLAROPS_LOCK_OWNER="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          flarops_kubectl() { flarops_ssh "$1" "sudo k3s kubectl -n default $2"; }
+
+          flarops_slots_lock() {
+            for attempt in $(seq 1 120); do
+              EXPIRES=$(( $(date +%s) + 1200 ))
+              if flarops_kubectl "$1" "create configmap flarops-slots-lock --from-literal=owner=$FLAROPS_LOCK_OWNER --from-literal=expires=$EXPIRES" > /dev/null 2>&1; then
+                echo "Holding the worker-slot lock."
+                return 0
+              fi
+              HELD_UNTIL=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.expires}" 2>/dev/null || true)
+              if [ -n "$HELD_UNTIL" ] && [ "$HELD_UNTIL" -lt "$(date +%s)" ]; then
+                echo "The worker-slot lock expired without being released - taking it over."
+                flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+                continue
+              fi
+              echo "  another workflow is changing worker slots - waiting ($attempt/120)"
+              sleep 10
+            done
+            echo "::error::Another workflow held the worker-slot lock for over 20 minutes."
+            return 1
+          }
+
+          flarops_slots_unlock() {
+            HOLDER=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.owner}" 2>/dev/null || true)
+            if [ "$HOLDER" = "$FLAROPS_LOCK_OWNER" ]; then
+              flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+              echo "Released the worker-slot lock."
+            fi
+          }
+
+          EC2_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          if [ -n "$EC2_IP" ] && flarops_ssh "$EC2_IP" "sudo k3s kubectl get --raw /readyz" > /dev/null 2>&1; then
+            flarops_slots_lock "$EC2_IP"
+            trap 'flarops_slots_unlock "$EC2_IP"' EXIT
+          fi
+
+          if ! ALL_OUTPUTS=$(terraform output -json 2>&1); then
+            echo "::error::Could not read Terraform outputs, refusing to apply: $ALL_OUTPUTS"
+            exit 1
+          fi
+          CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
+          echo "Preserving existing worker slots: $CURRENT_SLOTS"
+          terraform apply -var="worker_slots=$CURRENT_SLOTS" -auto-approve -lock-timeout=5m
+
+      - name: Fetch Kubeconfig from EC2
+        working-directory: deploy/terraform
+        run: |
+          set -euo pipefail
+
+          EC2_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - the apply above did not create the server."
+            exit 1
+          fi
+          export EC2_IP
+
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+
+
+          flarops_wait_for_k3s "$EC2_IP"
+
+          mkdir -p ~/.kube
+          flarops_ssh "$EC2_IP" "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+          test -s ~/.kube/config
+
+      - name: Setup Werf
+        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
+        with:
+          version: v2.78.2
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: docker.io
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Verify Kubeconfig
+        run: |
+          kubectl get nodes
+
+      - name: Deploy application with Werf
+        env:
+          SECRET_ENV_JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
+          SECRET_ENV_POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
+          SECRET_DB_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          REGISTRY_SERVER: https://index.docker.io/v1/
+        run: |
+          umask 077
+          TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
+          TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          export TF_INSTANCE_TYPE TF_VOLUME_SIZE
+          python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
+          werf converge \
+            --parallel-tasks-limit=3 \
+            --repo docker.io/${{ env.REGISTRY_USER }}/zg-composequirks \
+            --env production \
+            --values deploy/helm/flarops-ci-values.json
+
+# ===== .github/workflows/pr-capsule.yml
+name: Flarops PR Capsule
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flarops-pr-capsule-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  PROJECT_NAME: zg-composequirks
+  REGISTRY_USER: testuser
+  BASE_DOMAIN: example.test
+  MAIN_NAMESPACE: zg-composequirks-production
+  PR_NAMESPACE: zg-composequirks-pr-${{ github.event.pull_request.number }}
+  PR_ENV_NAME: pr-${{ github.event.pull_request.number }}
+  PR_DOMAIN: pr-${{ github.event.pull_request.number }}.example.test
+
+
+jobs:
+  deploy-capsule:
+    name: Deploy PR Capsule
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.15.8
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: terraform init
+
+      - name: Terraform Workspace
+        working-directory: deploy/terraform
+        run: terraform workspace select -or-create main
+
+      - name: Fetch Kubeconfig from EC2
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - production has not been deployed yet. Run the deploy workflow on the main branch first."
+            exit 1
+          fi
+          export EC2_IP
+
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+
+
+          flarops_wait_for_k3s "$EC2_IP"
+
+          mkdir -p ~/.kube
+          flarops_ssh "$EC2_IP" "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+          test -s ~/.kube/config
+
+      - name: Setup Werf
+        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
+        with:
+          version: v2.78.2
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: docker.io
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Build images
+        run: |
+          werf build --repo docker.io/${{ env.REGISTRY_USER }}/zg-composequirks
+
+      - name: Decide where this capsule goes
+        env:
+          TF_VAR_domain: ${{ env.BASE_DOMAIN }}
+        run: |
+          set -euo pipefail
+
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+
+
+          FLAROPS_LOCK_OWNER="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          flarops_kubectl() { flarops_ssh "$1" "sudo k3s kubectl -n default $2"; }
+
+          flarops_slots_lock() {
+            for attempt in $(seq 1 120); do
+              EXPIRES=$(( $(date +%s) + 1200 ))
+              if flarops_kubectl "$1" "create configmap flarops-slots-lock --from-literal=owner=$FLAROPS_LOCK_OWNER --from-literal=expires=$EXPIRES" > /dev/null 2>&1; then
+                echo "Holding the worker-slot lock."
+                return 0
+              fi
+              HELD_UNTIL=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.expires}" 2>/dev/null || true)
+              if [ -n "$HELD_UNTIL" ] && [ "$HELD_UNTIL" -lt "$(date +%s)" ]; then
+                echo "The worker-slot lock expired without being released - taking it over."
+                flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+                continue
+              fi
+              echo "  another workflow is changing worker slots - waiting ($attempt/120)"
+              sleep 10
+            done
+            echo "::error::Another workflow held the worker-slot lock for over 20 minutes."
+            return 1
+          }
+
+          flarops_slots_unlock() {
+            HOLDER=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.owner}" 2>/dev/null || true)
+            if [ "$HOLDER" = "$FLAROPS_LOCK_OWNER" ]; then
+              flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+              echo "Released the worker-slot lock."
+            fi
+          }
+
+          TARGET_NODE=$(kubectl get pvc -n "${{ env.PR_NAMESPACE }}" \
+            -o jsonpath='{range .items[*]}{.metadata.annotations.volume\.kubernetes\.io/selected-node}{"\n"}{end}' 2>/dev/null | grep -m1 . || true)
+          if [ -z "$TARGET_NODE" ]; then
+            TARGET_NODE=$(kubectl get pods -n "${{ env.PR_NAMESPACE }}" \
+              -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null | grep -m1 . || true)
+          fi
+
+          if [ -n "$TARGET_NODE" ]; then
+            echo "Capsule already runs on $TARGET_NODE - keeping it there."
+            echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          REQUIRED_MI=$(kubectl top pods -n "${{ env.MAIN_NAMESPACE }}" --no-headers 2>/dev/null \
+            | awk '$1 !~ /^flarops-(dashboard|node-agent)/ { v = $3; if (v ~ /Gi$/) { sub(/Gi$/, "", v); v = v * 1024 } else if (v ~ /Ki$/) { sub(/Ki$/, "", v); v = v / 1024 } else { sub(/Mi$/, "", v) } s += v } END { printf "%d", s }' || true)
+          if [ -z "$REQUIRED_MI" ] || [ "$REQUIRED_MI" -lt 64 ]; then
+            echo "No usable measurement of ${{ env.MAIN_NAMESPACE }} yet - planning with the generated estimate of 512 MiB."
+            REQUIRED_MI=512
+          else
+            echo "Planning this capsule at $REQUIRED_MI MiB - what the same stack uses in ${{ env.MAIN_NAMESPACE }} right now."
+          fi
+
+          ask_capacity() {
+            kubectl exec -n "${{ env.MAIN_NAMESPACE }}" deploy/flarops-dashboard -- \
+              curl -sS --max-time 10 "http://127.0.0.1:9090/capacity?mib=$REQUIRED_MI&for=${{ env.PR_ENV_NAME }}"
+          }
+
+          OUT=""
+          for attempt in 1 2 3; do
+            if OUT=$(ask_capacity 2>/tmp/capacity.err); then
+              break
+            fi
+            echo "Capacity oracle not answering (attempt $attempt): $(cat /tmp/capacity.err)"
+            OUT=""
+            sleep 10
+          done
+
+          if [ -z "$OUT" ]; then
+            echo "::error::Could not reach the dashboard's capacity oracle. Refusing to guess whether this capsule fits - check that the main deployment is healthy before re-running."
+            exit 1
+          fi
+
+          echo "$OUT"
+          VERDICT=$(printf '%s' "$OUT" | head -1)
+          TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
+
+          if [ "$VERDICT" = "unknown" ]; then
+            echo "::error::The dashboard has no fresh fleet data, so it cannot say whether this capsule fits. Refusing to deploy blind."
+            exit 1
+          fi
+
+          if [ "$VERDICT" = "no" ]; then
+            TF_OUTPUTS=$(terraform -chdir=deploy/terraform output -json 2>/dev/null || echo '{}')
+            KNOWN_SLOTS=$(printf '%s' "$TF_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(' '.join(str(s) for s in (v if isinstance(v,list) else [])))")
+            WORKER_PREFIX=$(printf '%s' "$TF_OUTPUTS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('instance_name',{}).get('value',''))")
+            node_ready() {
+              [ "$(kubectl get node "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)" = "True" ]
+            }
+            JOINING=""
+            if [ -n "$WORKER_PREFIX" ]; then
+              for SLOT in $KNOWN_SLOTS; do
+                if ! node_ready "$WORKER_PREFIX-worker-$SLOT"; then JOINING="$JOINING $WORKER_PREFIX-worker-$SLOT"; fi
+              done
+            fi
+            if [ -n "$JOINING" ]; then
+              echo "Workers still joining:$JOINING - waiting for them before adding another."
+              for attempt in $(seq 1 60); do
+                STILL=""
+                for NODE in $JOINING; do
+                  if ! node_ready "$NODE"; then STILL="$STILL $NODE"; fi
+                done
+                if [ -z "$STILL" ]; then break; fi
+                echo "  still joining:$STILL ($attempt/60)"
+                sleep 10
+              done
+              for attempt in 1 2 3 4 5 6 7 8; do
+                OUT=$(ask_capacity 2>/dev/null || true)
+                if [ "$(printf '%s' "$OUT" | head -1)" = "yes" ]; then
+                  VERDICT=yes
+                  TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
+                  echo "$OUT"
+                  break
+                fi
+                sleep 15
+              done
+            fi
+          fi
+
+          if [ "$VERDICT" = "no" ]; then
+            echo "::warning::No node has room for this capsule. Adding a worker..."
+
+            cd deploy/terraform
+            terraform init
+            terraform workspace select -or-create main
+
+            EC2_IP=$(terraform output -raw public_ip)
+            flarops_slots_lock "$EC2_IP"
+            trap 'flarops_slots_unlock "$EC2_IP"' EXIT
+            ALL_OUTPUTS=$(terraform output -json)
+            CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
+            NEW_SLOTS=$(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; s=[int(x) for x in json.load(sys.stdin)]; f=next(n for n in range(1,1000) if n not in s); print(json.dumps(sorted(s+[f])))")
+            NEW_SLOT=$(CURRENT_SLOTS="$CURRENT_SLOTS" NEW_SLOTS="$NEW_SLOTS" python3 -c "import json,os; print(sorted(set(json.loads(os.environ['NEW_SLOTS'])) - set(json.loads(os.environ['CURRENT_SLOTS'])))[0])")
+            INSTANCE_NAME=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('instance_name',{}).get('value',''))")
+            if [ -z "$INSTANCE_NAME" ]; then
+              echo "::error::Could not read instance_name from Terraform - cannot name the new worker's node."
+              exit 1
+            fi
+            NEW_NODE="${INSTANCE_NAME}-worker-${NEW_SLOT}"
+            flarops_ssh "$EC2_IP" "sudo k3s kubectl delete node ${NEW_NODE} --ignore-not-found" > /dev/null
+            echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
+            terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
+            flarops_slots_unlock "$EC2_IP"
+            trap - EXIT
+            cd - > /dev/null
+
+            echo "Waiting for $NEW_NODE to join..."
+            flarops_wait_for_k3s "$EC2_IP"
+            NODE_SEEN=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$EC2_IP" "sudo k3s kubectl get node/${NEW_NODE}" > /dev/null 2>&1; then NODE_SEEN=yes; break; fi
+              echo "  $NEW_NODE not registered yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$NODE_SEEN" ]; then
+              echo "::error::$NEW_NODE never registered with the cluster within 10 minutes. The instance exists (and is billed) - check its cloud-init log (/var/log/flarops-bootstrap.log on the worker)."
+              exit 1
+            fi
+            flarops_ssh "$EC2_IP" "sudo k3s kubectl wait --for=condition=Ready node/${NEW_NODE} --timeout=240s"
+
+            TARGET_NODE=""
+            for attempt in 1 2 3 4 5 6 7 8; do
+              sleep 15
+              OUT=$(ask_capacity 2>/dev/null || true)
+              if [ "$(printf '%s' "$OUT" | head -1)" = "yes" ]; then
+                TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
+                echo "$OUT"
+                break
+              fi
+            done
+
+            if [ -z "$TARGET_NODE" ]; then
+              echo "::error::A worker was added but no node reports room for this capsule. Not deploying onto a node that cannot hold it."
+              exit 1
+            fi
+          fi
+
+          if [ -z "$TARGET_NODE" ]; then
+            echo "::error::The capacity oracle said yes but named no node."
+            exit 1
+          fi
+
+          echo "Capsule will be placed on $TARGET_NODE"
+          echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
+
+      - name: Deploy application with Werf
+        env:
+          SECRET_ENV_JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
+          SECRET_ENV_POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SECRET_ENV_DASHBOARD_PASSWORD_HASH: ${{ secrets.DASHBOARD_PASSWORD_HASH }}
+          SECRET_DB_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SECRET_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          REGISTRY_SERVER: https://index.docker.io/v1/
+        run: |
+          umask 077
+          TF_INSTANCE_TYPE=$(terraform -chdir=deploy/terraform output -raw instance_type 2>/dev/null || true)
+          TF_VOLUME_SIZE=$(terraform -chdir=deploy/terraform output -raw volume_size 2>/dev/null || true)
+          export TF_INSTANCE_TYPE TF_VOLUME_SIZE
+          python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"
+          werf converge \
+            --parallel-tasks-limit=3 \
+            --repo docker.io/${{ env.REGISTRY_USER }}/zg-composequirks \
+            --env ${{ env.PR_ENV_NAME }} \
+            --set domain=${{ env.PR_DOMAIN }} \
+            --set "dataNodeSelector.kubernetes\.io/hostname=$TARGET_NODE" \
+            --values deploy/helm/flarops-ci-values.json
+
+      - name: Database Clone & Restore
+        run: |
+          set -euo pipefail
+
+          echo "Cloning database from ${{ env.MAIN_NAMESPACE }} to ${{ env.PR_NAMESPACE }}..."
+
+          echo "Waiting for PR database to be ready..."
+          kubectl rollout status statefulset/database -n ${{ env.PR_NAMESPACE }} --timeout=180s
+
+          echo "Checking if PR database was already cloned..."
+          if ! kubectl get configmap flarops-db-cloned -n ${{ env.PR_NAMESPACE }} > /dev/null 2>&1; then
+            echo "Database has not been cloned yet, streaming dump straight into the PR database..."
+            kubectl exec -n ${{ env.MAIN_NAMESPACE }} database-0 -- sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' \
+            | kubectl exec -i -n ${{ env.PR_NAMESPACE }} database-0 -- sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+
+            echo "Marking database as cloned..."
+            kubectl create configmap flarops-db-cloned -n ${{ env.PR_NAMESPACE }}
+
+            echo "Restarting API pod to pick up restored data..."
+            kubectl rollout restart deployment api -n ${{ env.PR_NAMESPACE }} || true
+            kubectl rollout status deployment/api -n ${{ env.PR_NAMESPACE }} --timeout=120s || true
+          else
+            echo "Database was already cloned, skipping clone to preserve data."
+          fi
+
+  cleanup-capsule:
+    name: Teardown PR Capsule
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.15.8
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: terraform init
+
+      - name: Terraform Workspace
+        working-directory: deploy/terraform
+        run: terraform workspace select -or-create main
+
+      - name: Fetch Kubeconfig from EC2
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - production has not been deployed yet. Run the deploy workflow on the main branch first."
+            exit 1
+          fi
+          export EC2_IP
+
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+
+
+          flarops_wait_for_k3s "$EC2_IP"
+
+          mkdir -p ~/.kube
+          flarops_ssh "$EC2_IP" "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
+          test -s ~/.kube/config
+
+      - name: Setup Werf
+        uses: werf/actions/install@49e2d1cf7fcda661767ee6d8205f3fb4687e684d
+        with:
+          version: v2.78.2
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: docker.io
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Dismiss application with Werf
+        continue-on-error: true
+        run: |
+          werf dismiss \
+            --repo docker.io/${{ env.REGISTRY_USER }}/zg-composequirks \
+            --env ${{ env.PR_ENV_NAME }} \
+            --with-namespace
+
+      - name: Reclaim idle worker nodes
+        env:
+          TF_VAR_domain: ${{ env.BASE_DOMAIN }}
+        run: |
+          set -euo pipefail
+
+          flarops_ssh() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$1" "$2"; }
+
+          flarops_dump_bootstrap_log() {
+            echo "----- $1: /var/log/flarops-bootstrap.log (last 200 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 200 /var/log/flarops-bootstrap.log 2>/dev/null || echo '(no bootstrap log - user_data never ran)'" || true
+            echo "----- $1: /var/log/cloud-init-output.log (last 100 lines) -----"
+            flarops_ssh "$1" "sudo tail -n 100 /var/log/cloud-init-output.log 2>/dev/null || echo '(no cloud-init log)'" || true
+          }
+
+          flarops_wait_for_k3s() {
+            FLAROPS_IP="$1"
+            echo "Waiting for SSH on $FLAROPS_IP (terraform returns long before cloud-init has run)..."
+            FLAROPS_SSH_OK=""
+            for attempt in $(seq 1 60); do
+              if flarops_ssh "$FLAROPS_IP" true; then FLAROPS_SSH_OK=yes; break; fi
+              echo "  no SSH yet ($attempt/60)"
+              sleep 10
+            done
+            if [ -z "$FLAROPS_SSH_OK" ]; then
+              echo "::error::$FLAROPS_IP never accepted SSH within 10 minutes. The instance exists but is unreachable - check that it booted, that the security group still allows port 22, and that SSH_PRIVATE_KEY matches the key in deploy/terraform/variables.tf."
+              return 1
+            fi
+
+            echo "Waiting for k3s on $FLAROPS_IP..."
+            for attempt in $(seq 1 90); do
+              if flarops_ssh "$FLAROPS_IP" "sudo test -f /etc/rancher/k3s/k3s.yaml"; then
+                echo "k3s is up on $FLAROPS_IP."
+                return 0
+              fi
+              if flarops_ssh "$FLAROPS_IP" "test -f /var/lib/flarops/bootstrap-failed"; then
+                echo "::error::The k3s install failed on $FLAROPS_IP. Its log follows."
+                flarops_dump_bootstrap_log "$FLAROPS_IP"
+                return 1
+              fi
+              echo "  k3s not ready yet ($attempt/90)"
+              sleep 10
+            done
+            echo "::error::k3s did not finish installing on $FLAROPS_IP within 15 minutes. Its log follows."
+            flarops_dump_bootstrap_log "$FLAROPS_IP"
+            return 1
+          }
+
+
+          FLAROPS_LOCK_OWNER="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          flarops_kubectl() { flarops_ssh "$1" "sudo k3s kubectl -n default $2"; }
+
+          flarops_slots_lock() {
+            for attempt in $(seq 1 120); do
+              EXPIRES=$(( $(date +%s) + 1200 ))
+              if flarops_kubectl "$1" "create configmap flarops-slots-lock --from-literal=owner=$FLAROPS_LOCK_OWNER --from-literal=expires=$EXPIRES" > /dev/null 2>&1; then
+                echo "Holding the worker-slot lock."
+                return 0
+              fi
+              HELD_UNTIL=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.expires}" 2>/dev/null || true)
+              if [ -n "$HELD_UNTIL" ] && [ "$HELD_UNTIL" -lt "$(date +%s)" ]; then
+                echo "The worker-slot lock expired without being released - taking it over."
+                flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+                continue
+              fi
+              echo "  another workflow is changing worker slots - waiting ($attempt/120)"
+              sleep 10
+            done
+            echo "::error::Another workflow held the worker-slot lock for over 20 minutes."
+            return 1
+          }
+
+          flarops_slots_unlock() {
+            HOLDER=$(flarops_kubectl "$1" "get configmap flarops-slots-lock -o jsonpath={.data.owner}" 2>/dev/null || true)
+            if [ "$HOLDER" = "$FLAROPS_LOCK_OWNER" ]; then
+              flarops_kubectl "$1" "delete configmap flarops-slots-lock --ignore-not-found" > /dev/null 2>&1 || true
+              echo "Released the worker-slot lock."
+            fi
+          }
+
+          cd deploy/terraform
+          terraform init
+          terraform workspace select -or-create main
+          EC2_IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          if [ -z "$EC2_IP" ]; then
+            echo "::error::Terraform has no public_ip output - nothing to reclaim workers from."
+            exit 1
+          fi
+          flarops_slots_lock "$EC2_IP"
+          trap 'flarops_slots_unlock "$EC2_IP"' EXIT
+          if ! ALL_OUTPUTS=$(terraform output -json 2>&1); then
+            echo "::error::Could not read Terraform outputs: $ALL_OUTPUTS"
+            exit 1
+          fi
+          CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
+          INSTANCE_NAME=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('instance_name',{}).get('value',''))")
+          cd - > /dev/null
+
+          if [ "$CURRENT_SLOTS" = "[]" ]; then
+            echo "No worker nodes to reclaim."
+            exit 0
+          fi
+          if [ -z "$INSTANCE_NAME" ]; then
+            echo "::error::Could not read instance_name from Terraform. Refusing to guess node names - a wrong guess drains a node that is carrying work."
+            exit 1
+          fi
+
+          FREED=""
+          for SLOT in $(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; print(' '.join(str(s) for s in sorted((int(x) for x in json.load(sys.stdin)), reverse=True)))"); do
+            NODE_NAME="${INSTANCE_NAME}-worker-${SLOT}"
+            echo "Checking $NODE_NAME ..."
+
+            if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" -o json 2>/tmp/kubectl.err); then
+              echo "  could not query pods on $NODE_NAME ($(cat /tmp/kubectl.err)) - leaving it alone."
+              continue
+            fi
+            PODS=$(printf '%s' "$RAW" | python3 -c "
+          import json, sys
+          busy = [p for p in json.load(sys.stdin)['items']
+                  if p['metadata']['namespace'] != 'kube-system'
+                  and not p['metadata'].get('deletionTimestamp')
+                  and p.get('status', {}).get('phase') not in ('Succeeded', 'Failed')
+                  and not any(o.get('kind') == 'DaemonSet' for o in p['metadata'].get('ownerReferences', []))]
+          print(len(busy))")
+
+            if [ "$PODS" -ne 0 ]; then
+              echo "  $PODS active pod(s) - keeping it."
+              continue
+            fi
+
+            echo "  idle - draining and removing."
+            kubectl drain "$NODE_NAME" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s || true
+            kubectl delete node "$NODE_NAME" --ignore-not-found
+            FREED="$FREED $SLOT"
+          done
+
+          if [ -z "$FREED" ]; then
+            echo "Nothing to reclaim."
+            exit 0
+          fi
+
+          NEW_SLOTS=$(FREED="$FREED" CURRENT="$CURRENT_SLOTS" python3 -c "import json,os; c=[int(x) for x in json.loads(os.environ['CURRENT'])]; f={int(x) for x in os.environ['FREED'].split()}; print(json.dumps(sorted(s for s in c if s not in f)))")
+          echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
+          cd deploy/terraform
+          terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
+
+# ===== .gitignore
+#autogenerated by flarops
+.env
+.keys/
+FLAROPS.md
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*tfplan*
+deploy/helm/flarops-ci-values.json
+
+# ===== FLAROPS.md
+# Flarops Deployment Guide
+
+Flarops has successfully generated the infrastructure and CI/CD configuration for your project!
+
+## Next Manual Steps
+
+To complete the setup and perform your first deployment, please follow these instructions:
+
+### 1. Add GitHub Secrets
+You must manually add the generated secrets to your GitHub repository. 
+1. Go to your GitHub repository.
+2. Navigate to **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**.
+3. Open the generated `deploy/.env` file in your project.
+4. For each variable in that file, create a new Repository Secret with the exact same name (e.g., `AWS_ACCESS_KEY_ID`) and its corresponding value.
+*(Note: Be sure to copy multiline secrets like `SSH_PRIVATE_KEY` exactly as they are, including line breaks, without any surrounding quotation marks).*
+
+### 2. Push to your Branch
+Commit the newly generated files to your repository. Flarops has automatically updated your `.gitignore` to exclude sensitive files like `.env` and your local `.keys/` directory.
+
+```bash
+git add .
+git commit -m "chore: setup Flarops CI/CD and infrastructure"
+git push origin main
+```
+
+Once you push to the `main` branch (or trigger it manually), the GitHub Actions workflow (`deploy.yml`) will automatically start provisioning your infrastructure and deploying your application.
+
+# ===== backend/.env
+JWT_PRIVATE_KEY="<PEM>"
+LOG_LEVEL=info
+
+# ===== backend/.env.development
+DEBUG=true
+LOG_LEVEL=debug
+
+# ===== backend/Dockerfile
+FROM node:20
+
+# ===== backend/index.js
+const express=require("express");const app=express();
+const cfg={db:process.env.DATABASE_URL,jwt:process.env.JWT_PRIVATE_KEY,prom:process.env.PROM_URL,redis:process.env.REDIS_HOST,debug:process.env.DEBUG,backups:process.env.BACKUP_DIR,store:process.env.STORE_URL};
+app.get("/api/health",(q,r)=>r.json(cfg));app.listen(process.env.PORT||4000)
+
+# ===== backend/package.json
+{"name":"b","dependencies":{"express":"^4","pg":"^8"}}
+
+# ===== deploy/.env
+# ============================================================================
+# Every NAME below must be created as a GitHub repository secret with the same
+# name and the value shown, or the deployment will not come up:
+#
+#   your repository -> Settings -> Secrets and variables -> Actions
+#                   -> New repository secret
+#
+# This file is NOT committed (deploy/.env is gitignored) and is not read at
+# deploy time - it exists so you know what to create. The sections say where
+# each value came from.
+# ============================================================================
+
+# --- Created by Flarops for the infrastructure it provisions -----------------
+AWS_ACCESS_KEY_ID="AKIATEST"
+AWS_SECRET_ACCESS_KEY="secrettest"
+REGISTRY_PASSWORD="testpass"
+
+# --- Found in your project's own .env files ---------------------------------
+JWT_PRIVATE_KEY="<PEM>"
+POSTGRES_PASSWORD="<SECRET>"
+
+# --- Generated by Flarops for the deployment dashboard ----------------------
+DASHBOARD_PASSWORD_HASH='pbkdf2-sha256$i=600000$<PBKDF2>'
+
+# --- The deploy key Flarops generated for this repository -------------------
+# One value on one very long line. Copy it whole, including both -----markers.
+SSH_PRIVATE_KEY="<PEM>"
+
+# ===== deploy/.env.safety
+DATABASE_USER=
+DATABASE_TYPE=postgres
+DOCKER_REGISTRY=
+DOMAIN=example.test
+AWS_REGION=us-west-2
+
+# ===== deploy/.flarops-state.json
+{
+  "projectName": "zg-composequirks",
+  "domain": "example.test",
+  "dockerRegistry": "",
+  "dockerProject": null,
+  "dockerRepository": "zg-composequirks",
+  "registryUser": "testuser",
+  "envKeysToPass": [
+    "JWT_PRIVATE_KEY",
+    "POSTGRES_PASSWORD",
+    "DASHBOARD_PASSWORD_HASH"
+  ],
+  "backendPath": "backend",
+  "frontendPath": null,
+  "hasBackend": true,
+  "hasFrontend": false,
+  "apiServesFrontend": false,
+  "apiMigrationStep": null,
+  "apiWorkers": 1,
+  "apiDockerfile": "Dockerfile",
+  "frontendDockerfile": "Dockerfile",
+  "apiCommand": null,
+  "frontendCommand": null,
+  "apiBuildArgs": null,
+  "frontendBuildArgs": null,
+  "awsRegion": "us-west-2",
+  "additionalServices": [],
+  "supportServices": [
+    {
+      "composeName": "prometheus",
+      "name": "prometheus",
+      "image": "prom/prometheus:v2.53.0",
+      "ports": [
+        9090
+      ],
+      "env": {},
+      "command": null,
+      "volumes": [],
+      "bindMounts": [
+        {
+          "source": "./monitoring/alerts.yml",
+          "target": "/etc/prometheus/alerts.yml"
+        }
+      ],
+      "unparsedVolumes": [],
+      "isNodeAgent": false,
+      "secretKeys": [],
+      "configMapData": {
+        "alerts.yml": "groups:\n  - name: up\n    rules:\n      - alert: Down\n        expr: up == 0\n        annotations:\n          summary: \"{{ $labels.instance }} is down\"\n"
+      },
+      "configFileMounts": [
+        {
+          "key": "alerts.yml",
+          "mountPath": "/etc/prometheus/alerts.yml"
+        }
+      ],
+      "configDirMounts": [],
+      "replicas": 1
+    },
+    {
+      "composeName": "cache",
+      "name": "cache",
+      "image": "redis:7.2",
+      "ports": [
+        6379
+      ],
+      "env": {},
+      "command": null,
+      "volumes": [],
+      "bindMounts": [],
+      "unparsedVolumes": [],
+      "isNodeAgent": false,
+      "secretKeys": [],
+      "replicas": 1
+    },
+    {
+      "composeName": "minio",
+      "name": "minio",
+      "image": "minio/minio:RELEASE.2024-06-13T22-53-53Z",
+      "ports": [
+        9000,
+        9001
+      ],
+      "env": {},
+      "command": [
+        "server",
+        "/data",
+        "--console-address",
+        ":9001 #not-a-comment"
+      ],
+      "volumes": [
+        {
+          "name": "miniodata",
+          "target": "/data"
+        }
+      ],
+      "bindMounts": [],
+      "unparsedVolumes": [],
+      "isNodeAgent": false,
+      "secretKeys": [],
+      "replicas": 1
+    }
+  ],
+  "apiEnv": {
+    "LOG_LEVEL": "info",
+    "DEBUG": "",
+    "PORT": "4000",
+    "BACKUP_DIR": "/var/backups/db",
+    "PROM_URL": "http://prometheus:9090",
+    "REDIS_HOST": "cache",
+    "STORE_URL": "http://minio:9000"
+  },
+  "frontendEnv": {},
+  "apiUsedEnvVars": [
+    "DATABASE_URL",
+    "JWT_PRIVATE_KEY",
+    "PROM_URL",
+    "REDIS_HOST",
+    "DEBUG",
+    "BACKUP_DIR",
+    "STORE_URL",
+    "PORT"
+  ],
+  "frontendUsedEnvVars": [],
+  "apiSecretKeys": [
+    "JWT_PRIVATE_KEY"
+  ],
+  "frontendSecretKeys": [],
+  "apiExtraSecretEnvMappings": [],
+  "frontendExtraSecretEnvMappings": [],
+  "images": {
+    "api": "api:latest",
+    "db": "postgres:16",
+    "frontend": "frontend:latest"
+  },
+  "dbCloneSource": "",
+  "dbInitFiles": {
+    "1-tables.sql": "  CREATE TABLE greetings (id serial primary key, text varchar(80));\n",
+    "2-data.sql": "INSERT INTO greetings (text) VALUES ('Hello {{ .Name }}');\n"
+  },
+  "hasDb": true,
+  "apiPorts": [
+    4000
+  ],
+  "frontendPorts": [
+    80
+  ],
+  "dbType": "postgres",
+  "dbPort": 5432,
+  "dbUser": "postgres",
+  "dbName": "appdb",
+  "dbHasLocalDockerfile": false,
+  "dbCommand": [
+    "postgres",
+    "-c",
+    "wal_level=logical",
+    "-c",
+    "max_wal_senders=10"
+  ],
+  "dbPasswordKey": "POSTGRES_PASSWORD",
+  "hasDbPassword": true,
+  "dbUrlVars": [
+    {
+      "key": "DATABASE_URL",
+      "query": "",
+      "scheme": "postgresql"
+    }
+  ],
+  "apiRoutes": [
+    {
+      "path": "/api",
+      "stripPrefix": false
+    }
+  ],
+  "apiHealthRoute": "/api/health",
+  "apiHealthPort": null,
+  "hasCloudflare": false,
+  "apiReplicas": 1,
+  "frontendReplicas": 1,
+  "dbReplicas": 1
+}
+
+# ===== deploy/helm/Chart.yaml
+apiVersion: v2
+name: zg-composequirks
+description: A Helm chart for zg-composequirks generated by Flarops
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+# ===== deploy/helm/templates/01-ingress.yaml
+{{- $hasApiRoutes := false }}
+{{- if .Values.hasBackend }}
+{{- range $route := (.Values.apiRoutes | default list) }}
+{{- if not $route.stripPrefix }}{{ $hasApiRoutes = true }}{{ end }}
+{{- end }}
+{{- end }}
+{{- $hasDirect := false }}
+{{- range $service := (.Values.additionalServices | default list) }}
+{{- if $service.exposeDirectly }}
+{{- range $route := ($service.exposedRoutes | default list) }}
+{{- if not $route.stripPrefix }}{{ $hasDirect = true }}{{ end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $hasRoot := or .Values.hasFrontend (and .Values.hasBackend .Values.apiServesFrontend) }}
+{{- if or $hasApiRoutes $hasDirect $hasRoot }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.projectName }}-ingress
+  labels:
+    app: {{ .Values.projectName }}
+  annotations:
+    kubernetes.io/ingress.class: "traefik"
+spec:
+  ingressClassName: traefik
+  rules:
+{{- if .Values.domain }}
+    - host: {{ .Values.domain }}
+      http:
+{{- else }}
+    - http:
+{{- end }}
+        paths:
+{{- if .Values.additionalServices }}
+{{- range $service := .Values.additionalServices }}
+{{- if $service.exposedRoutes }}
+{{- if $service.exposeDirectly }}
+{{- range $route := $service.exposedRoutes }}
+{{- if not $route.stripPrefix }}
+          - path: {{ $route.path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $service.name }}
+                port:
+                  number: {{ index $service.ports 0 | default 80 }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.hasBackend .Values.apiRoutes }}
+{{- range $route := .Values.apiRoutes }}
+{{- if not $route.stripPrefix }}
+          - path: {{ $route.path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: {{ index $.Values.apiPorts 0 | default 3000 }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.hasFrontend }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: {{ index .Values.frontendPorts 0 }}
+{{- else if and .Values.hasBackend .Values.apiServesFrontend }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: {{ index .Values.apiPorts 0 | default 3000 }}
+{{- end }}
+{{- end }}
+
+# ===== deploy/helm/templates/_helpers.tpl
+{{- define "flarops.secretChecksum" -}}
+{{- $env := .env | default dict -}}
+{{- $picked := dict -}}
+{{- range $k := (.keys | default list) -}}
+{{- $_ := set $picked $k (index $env $k | default "") -}}
+{{- end -}}
+{{- printf "%s|%s" (toJson $picked) (toString (.password | default "")) | sha256sum -}}
+{{- end -}}
+
+{{- define "flarops.urlencode" -}}
+{{- . | toString | urlquery | replace "+" "%20" -}}
+{{- end -}}
+
+{{- define "flarops.replicas" -}}
+{{- if kindIs "invalid" . -}}1{{- else -}}{{ . }}{{- end -}}
+{{- end -}}
+
+# ===== deploy/helm/templates/api.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    app: {{ .Values.projectName }}
+    component: api
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: api
+  ports:
+{{- range $port := .Values.apiPorts }}
+    - name: port-{{ $port }}
+      protocol: TCP
+      port: {{ $port }}
+      targetPort: {{ $port }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app: {{ .Values.projectName }}
+    component: api
+spec:
+  replicas: {{ include "flarops.replicas" .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: api
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: api
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat (.Values.api.secretKeys | default list) (list "POSTGRES_PASSWORD" "POSTGRES_PASSWORD_URLENCODED")) "password" ((.Values.database | default dict).password | default "")) }}
+    spec:
+      automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+{{- end }}
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+
+      containers:
+        - name: api
+          image: {{ if .Values.werf }}{{ .Values.werf.image.api }}{{ else }}{{ .Values.images.api | default "api:latest" }}{{ end }}
+{{- if .Values.api.command }}
+          args:
+{{- range $arg := .Values.api.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+
+{{- if or .Values.api.env .Values.api.secretKeys true true false }}
+          env:
+{{- if .Values.api.env }}
+{{- range $key, $value := .Values.api.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+{{- if .Values.api.secretKeys }}
+{{- range $key := .Values.api.secretKeys }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: {{ $key }}
+{{- end }}
+{{- end }}
+
+            - name: {{ "POSTGRES_PASSWORD" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: {{ "POSTGRES_PASSWORD" }}
+            - name: POSTGRES_PASSWORD_URLENCODED
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: POSTGRES_PASSWORD_URLENCODED
+            - name: DATABASE_URL
+              value: "postgresql://{{ include "flarops.urlencode" .Values.database.user }}:$(POSTGRES_PASSWORD_URLENCODED)@database:{{ .Values.dbPort | default 5432 }}/{{ include "flarops.urlencode" .Values.database.name }}"
+{{- end }}
+{{- if .Values.api.healthRoute }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.api.healthRoute }}
+              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.api.healthRoute }}
+              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.api.healthRoute }}
+              port: {{ .Values.api.healthPort | default (index .Values.apiPorts 0) | default 3000 }}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+{{- end }}
+
+# ===== deploy/helm/templates/dashboard.yaml
+{{- if eq .Values.werf.env "production" }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flarops-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.projectName }}-dashboard-role-{{ .Values.werf.env }}
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "namespaces", "persistentvolumeclaims"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.projectName }}-dashboard-binding-{{ .Values.werf.env }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.projectName }}-dashboard-role-{{ .Values.werf.env }}
+subjects:
+- kind: ServiceAccount
+  name: flarops-dashboard
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.projectName }}-dashboard-configmaps-{{ .Values.werf.env }}
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.projectName }}-dashboard-configmaps-binding-{{ .Values.werf.env }}
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.projectName }}-dashboard-configmaps-{{ .Values.werf.env }}
+subjects:
+- kind: ServiceAccount
+  name: flarops-dashboard
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flarops-dashboard-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.dashboard.storage | default "1Gi" }}
+---
+{{- if eq .Values.werf.env "production" }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: flarops-node-agent
+  labels:
+    app: flarops-node-agent
+spec:
+  selector:
+    matchLabels:
+      app: flarops-node-agent
+  template:
+    metadata:
+      labels:
+        app: flarops-node-agent
+    spec:
+      automountServiceAccountToken: false
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-agent
+          image: {{ if .Values.werf }}{{ .Values.werf.image.dashboard }}{{ else }}{{ .Values.images.dashboard | default "dashboard:latest" }}{{ end }}
+          env:
+            - name: FLAROPS_NODE_AGENT
+              value: "1"
+            - name: FLAROPS_HOST_ROOT
+              value: /host
+          ports:
+            - containerPort: 9101
+              name: disk
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "5m"
+            limits:
+              memory: "64Mi"
+              cpu: "50m"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9101
+            periodSeconds: 30
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flarops-dashboard
+spec:
+  replicas: {{ include "flarops.replicas" .Values.dashboard.replicas }}
+  selector:
+    matchLabels:
+      app: flarops-dashboard
+  template:
+    metadata:
+      labels:
+        app: flarops-dashboard
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (list "DASHBOARD_PASSWORD_HASH")) }}
+    spec:
+      serviceAccountName: flarops-dashboard
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: dashboard
+        image: {{ .Values.werf.image.dashboard }}
+        imagePullPolicy: Always
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: DASHBOARD_PASSWORD_HASH
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.projectName }}-secrets
+              key: DASHBOARD_PASSWORD_HASH
+        - name: DASHBOARD_TRUST_PROXY
+          value: "1"
+        - name: DOMAIN
+          value: {{ .Values.domain | quote }}
+        - name: DB_PATH
+          value: "/data/flarops_metrics.db"
+        - name: AWS_REGION
+          value: {{ .Values.aws.region | quote }}
+        - name: FLAROPS_DEFAULT_INSTANCE_TYPE
+          value: {{ .Values.aws.instanceType | default "" | quote }}
+        - name: FLAROPS_EBS_GB
+          value: {{ .Values.aws.volumeSize | default "" | quote }}
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: flarops-dashboard-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flarops-dashboard
+spec:
+  selector:
+    app: flarops-dashboard
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flarops-dashboard
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    kubernetes.io/ingress.class: traefik
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: dashboard.example.test
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: flarops-dashboard
+            port:
+              number: 80
+{{- end }}
+
+# ===== deploy/helm/templates/database.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  labels:
+    app: {{ .Values.projectName }}
+    component: database
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: database
+  ports:
+    - protocol: TCP
+      port: {{ .Values.dbPort | default 5432 }}
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+  labels:
+    app: {{ .Values.projectName }}
+    component: database
+spec:
+  serviceName: database
+  replicas: {{ include "flarops.replicas" .Values.database.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: database
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: database
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "password" ((.Values.database | default dict).password | default "")) }}
+    spec:
+{{- if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.projectName }}-registry
+{{- end }}
+{{- if .Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml .Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+{{- end }}
+{{- if .Values.dbCloneSource }}
+      initContainers:
+        - name: db-clone
+          image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
+          command: ["curl"]
+          args: ["--fail", "--silent", "--show-error", "--location", "--proto", "=https", "-o", "/docker-entrypoint-initdb.d/dump.sql", "{{ .Values.dbCloneSource }}"]
+          volumeMounts:
+            - name: db-init
+              mountPath: /docker-entrypoint-initdb.d
+{{- end }}
+      containers:
+        - name: db
+          image: {{ if and .Values.werf .Values.werf.image.db }}{{ .Values.werf.image.db }}{{ else }}{{ .Values.images.db | default "db:latest" }}{{ end }}
+{{- if (.Values.database | default dict).command }}
+          args:
+{{- range $arg := .Values.database.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.database.user | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.projectName }}-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: {{ .Values.database.name | quote }}
+{{- if .Values.database.env }}
+{{- range $key, $value := .Values.database.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+{{- if .Values.dbCloneSource }}
+            - name: db-init
+              mountPath: /docker-entrypoint-initdb.d
+{{- else }}
+            - name: db-initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+{{- end }}
+      volumes:
+{{- if .Values.dbCloneSource }}
+        - name: db-init
+          emptyDir: {}
+{{- else }}
+        - name: db-initdb
+          configMap:
+            name: database-initdb
+{{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: {{ .Values.database.storage | default "10Gi" }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: database-initdb
+  labels:
+    app: {{ .Values.projectName }}
+    component: database
+data:
+  {{ "1-tables.sql" | quote }}: {{ "  CREATE TABLE greetings (id serial primary key, text varchar(80));\n" | quote }}
+  {{ "2-data.sql" | quote }}: {{ "INSERT INTO greetings (text) VALUES ('Hello {{ .Name }}');\n" | quote }}
+
+# ===== deploy/helm/templates/registry-secret.yaml
+{{- if and .Values.imagePullSecret (kindIs "map" .Values.imagePullSecret) }}
+{{- $reg := .Values.imagePullSecret }}
+{{- $auth := printf "%s:%s" ($reg.username | toString) ($reg.password | toString) | b64enc }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.projectName }}-registry
+  labels:
+    app: {{ .Values.projectName }}
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: {{ dict "auths" (dict ($reg.server | toString) (dict "username" ($reg.username | toString) "password" ($reg.password | toString) "auth" $auth)) | toJson | b64enc }}
+{{- end }}
+
+# ===== deploy/helm/templates/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.projectName }}-secrets
+  labels:
+    app: {{ .Values.projectName }}
+type: Opaque
+stringData:
+{{- if .Values.env }}
+{{- range $key, $value := .Values.env }}
+  {{ $key }}: {{ $value | quote }}
+{{- end }}
+{{- end }}
+{{- with (index (.Values.env | default dict) "POSTGRES_PASSWORD") }}
+  POSTGRES_PASSWORD_URLENCODED: {{ include "flarops.urlencode" . | quote }}
+{{- end }}
+
+# ===== deploy/helm/templates/support-cache.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: cache
+  labels:
+    app: {{ .Values.projectName }}
+    component: cache
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: cache
+  ports:
+{{- range $port := (index .Values.supportServices (index .Values.supportServicesIndices "cache" | int)).ports }}
+    - port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: TCP
+      name: port-{{ $port }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache
+  labels:
+    app: {{ .Values.projectName }}
+    component: cache
+spec:
+  replicas: {{ include "flarops.replicas" (index .Values.supportServices (index .Values.supportServicesIndices "cache" | int)).replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: cache
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: cache
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat ((index .Values.supportServices (index .Values.supportServicesIndices "cache" | int)).secretKeys | default list) (list ))) }}
+    spec:
+      automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+{{- end }}
+{{- $svc := (index .Values.supportServices (index .Values.supportServicesIndices "cache" | int)) }}
+      containers:
+        - name: cache
+          image: {{ $svc.image | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+{{- if $svc.command }}
+          args:
+{{- range $arg := $svc.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+{{- if or $svc.env $svc.secretKeys false }}
+          env:
+{{- range $key, $value := ($svc.env | default dict) }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- range $key := ($svc.secretKeys | default list) }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: {{ $key }}
+{{- end }}
+{{- end }}
+{{- if $svc.ports }}
+          ports:
+{{- range $port := $svc.ports }}
+            - containerPort: {{ $port }}
+{{- end }}
+{{- end }}
+
+# ===== deploy/helm/templates/support-minio.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  labels:
+    app: {{ .Values.projectName }}
+    component: minio
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: minio
+  ports:
+{{- range $port := (index .Values.supportServices (index .Values.supportServicesIndices "minio" | int)).ports }}
+    - port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: TCP
+      name: port-{{ $port }}
+{{- end }}
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-miniodata
+  labels:
+    app: {{ .Values.projectName }}
+    component: minio
+spec:
+  accessModes: [ "ReadWriteOnce" ]
+  resources:
+    requests:
+      storage: "5Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: {{ .Values.projectName }}
+    component: minio
+spec:
+  replicas: {{ include "flarops.replicas" (index .Values.supportServices (index .Values.supportServicesIndices "minio" | int)).replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: minio
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: minio
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat ((index .Values.supportServices (index .Values.supportServicesIndices "minio" | int)).secretKeys | default list) (list ))) }}
+    spec:
+      automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+{{- end }}
+{{- $svc := (index .Values.supportServices (index .Values.supportServicesIndices "minio" | int)) }}
+      containers:
+        - name: minio
+          image: {{ $svc.image | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+{{- if $svc.command }}
+          args:
+{{- range $arg := $svc.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+{{- if or $svc.env $svc.secretKeys false }}
+          env:
+{{- range $key, $value := ($svc.env | default dict) }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- range $key := ($svc.secretKeys | default list) }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: {{ $key }}
+{{- end }}
+{{- end }}
+{{- if $svc.ports }}
+          ports:
+{{- range $port := $svc.ports }}
+            - containerPort: {{ $port }}
+{{- end }}
+{{- end }}
+
+          volumeMounts:
+            - name: minio-miniodata
+              mountPath: {{ "/data" | quote }}
+      volumes:
+        - name: minio-miniodata
+          persistentVolumeClaim:
+            claimName: minio-miniodata
+
+# ===== deploy/helm/templates/support-prometheus.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  labels:
+    app: {{ .Values.projectName }}
+    component: prometheus
+spec:
+  selector:
+    app: {{ .Values.projectName }}
+    component: prometheus
+  ports:
+{{- range $port := (index .Values.supportServices (index .Values.supportServicesIndices "prometheus" | int)).ports }}
+    - port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: TCP
+      name: port-{{ $port }}
+{{- end }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  labels:
+    app: {{ .Values.projectName }}
+    component: prometheus
+data:
+  {{ "alerts.yml" | quote }}: {{ "groups:\n  - name: up\n    rules:\n      - alert: Down\n        expr: up == 0\n        annotations:\n          summary: \"{{ $labels.instance }} is down\"\n" | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  labels:
+    app: {{ .Values.projectName }}
+    component: prometheus
+spec:
+  replicas: {{ include "flarops.replicas" (index .Values.supportServices (index .Values.supportServicesIndices "prometheus" | int)).replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.projectName }}
+      component: prometheus
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.projectName }}
+        component: prometheus
+      annotations:
+        checksum/secret: {{ include "flarops.secretChecksum" (dict "env" (.Values.env | default dict) "keys" (concat ((index .Values.supportServices (index .Values.supportServicesIndices "prometheus" | int)).secretKeys | default list) (list ))) }}
+        checksum/config: 22d46a531fa23ad73b6da7cf92f74019
+    spec:
+      automountServiceAccountToken: false
+{{- if $.Values.dataNodeSelector }}
+      nodeSelector:
+{{ toYaml $.Values.dataNodeSelector | indent 8 }}
+      tolerations:
+        - key: flarops.io/capsule
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+{{- end }}
+{{- $svc := (index .Values.supportServices (index .Values.supportServicesIndices "prometheus" | int)) }}
+      containers:
+        - name: prometheus
+          image: {{ $svc.image | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+{{- if $svc.command }}
+          args:
+{{- range $arg := $svc.command }}
+            - {{ $arg | quote }}
+{{- end }}
+{{- end }}
+{{- if or $svc.env $svc.secretKeys false }}
+          env:
+{{- range $key, $value := ($svc.env | default dict) }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- range $key := ($svc.secretKeys | default list) }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.projectName }}-secrets
+                  key: {{ $key }}
+{{- end }}
+{{- end }}
+{{- if $svc.ports }}
+          ports:
+{{- range $port := $svc.ports }}
+            - containerPort: {{ $port }}
+{{- end }}
+{{- end }}
+
+          volumeMounts:
+            - name: prometheus-config-0
+              mountPath: {{ "/etc/prometheus/alerts.yml" | quote }}
+              subPath: {{ "alerts.yml" | quote }}
+              readOnly: true
+      volumes:
+        - name: prometheus-config-0
+          configMap:
+            name: prometheus-config
+
+# ===== deploy/helm/values.yaml
+projectName: zg-composequirks
+domain: "example.test"
+hasBackend: true
+hasFrontend: false
+apiServesFrontend: false
+images:
+  api: api:latest
+  db: "postgres:16"
+
+dbCloneSource: ""
+dbType: "postgres"
+dbPort: 5432
+database:
+  user: "postgres"
+  password: null
+  name: "appdb"
+  replicas: 1
+  storage: "10Gi"
+  command:
+    - "postgres"
+    - "-c"
+    - "wal_level=logical"
+    - "-c"
+    - "max_wal_senders=10"
+  env:
+    # KEY: "VALUE"
+api:
+  replicas: 1
+  healthRoute: "/api/health"
+  healthPort: null
+  secretKeys:
+    - JWT_PRIVATE_KEY
+  env:
+    LOG_LEVEL: "info"
+    DEBUG: ""
+    PORT: "4000"
+    BACKUP_DIR: "/var/backups/db"
+    PROM_URL: "http://prometheus:9090"
+    REDIS_HOST: "cache"
+    STORE_URL: "http://minio:9000"
+apiPorts:
+  - 4000
+
+
+# Third-party components declared in docker-compose that the application
+# references but this repository does not build. Images are pinned exactly as
+# docker-compose declared them.
+supportServices:
+  - name: prometheus
+    image: "prom/prometheus:v2.53.0"
+    replicas: 1
+    env:
+      # KEY: "VALUE"
+    secretKeys:
+
+    ports:
+      - 9090
+  - name: cache
+    image: "redis:7.2"
+    replicas: 1
+    env:
+      # KEY: "VALUE"
+    secretKeys:
+
+    ports:
+      - 6379
+  - name: minio
+    image: "minio/minio:RELEASE.2024-06-13T22-53-53Z"
+    replicas: 1
+    env:
+      # KEY: "VALUE"
+    secretKeys:
+
+    ports:
+      - 9000
+      - 9001
+    storage: "5Gi"
+    command:
+      - "server"
+      - "/data"
+      - "--console-address"
+      - ":9001 #not-a-comment"
+supportServicesIndices:
+  prometheus: 0
+  cache: 1
+  minio: 2
+
+apiRoutes:
+  - path: "/api"
+
+# instanceType and volumeSize are filled in by CI from Terraform's outputs -
+# change them in deploy/terraform/variables.tf, not here.
+aws:
+  region: "us-west-2"
+  instanceType: null
+  volumeSize: null
+dashboard:
+  replicas: 1
+  storage: "1Gi"
+# Filled in by CI from the registry credentials. Leave null: nothing secret
+# belongs in this committed file.
+imagePullSecret: null
+# Set by the PR-capsule workflow to the node a capsule is placed on. Leave
+# empty here.
+dataNodeSelector: {}
+
+# ===== deploy/terraform/main.tf
+terraform {
+  backend "s3" {
+    bucket = "zg-composequirks-remote-state"
+    key    = "terraform.tfstate"
+    region = "us-west-2"
+    encrypt      = true
+    use_lockfile = true
+  }
+  required_version = "~> 1.15"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 4.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  tags = {
+    Name = "${var.instance_name}-vpc"
+  }
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = "${var.aws_region}a"
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "random_password" "k3s_token" {
+  length  = 32
+  special = false
+}
+
+resource "aws_security_group" "sg" {
+  name        = "${var.instance_name}-sg"
+  description = "Allow SSH, HTTP, and Kubernetes API"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "Intra-cluster communication"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
+  }
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Kubernetes API"
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-*-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_instance" "server" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.sg.id]
+
+  root_block_device {
+    volume_size = var.volume_size
+    volume_type = "gp3"
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+    instance_metadata_tags      = "disabled"
+  }
+
+  user_data = sensitive(<<-EOF
+    #!/bin/bash
+    exec > >(tee -a /var/log/flarops-bootstrap.log) 2>&1
+    set -Eeuo pipefail
+
+    mkdir -p /var/lib/flarops
+    trap 'echo "flarops: bootstrap FAILED at line $LINENO"' ERR
+    trap 'flarops_rc=$?; if [ "$flarops_rc" != 0 ]; then touch /var/lib/flarops/bootstrap-failed; fi' EXIT
+
+    mkdir -p /home/ubuntu/.ssh
+    echo "${var.ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
+    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+    chmod 700 /home/ubuntu/.ssh
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+
+    K3S_INSTALLER_URLS="https://raw.githubusercontent.com/k3s-io/k3s/${var.k3s_version}/install.sh https://get.k3s.io"
+
+    downloaded=""
+    for attempt in $(seq 1 5); do
+      for url in $K3S_INSTALLER_URLS; do
+        if curl -fsSL --retry 3 --retry-delay 5 --retry-connrefused --max-time 180 \
+             -o /tmp/k3s-install.sh "$url" && [ -s /tmp/k3s-install.sh ]; then
+          echo "flarops: got the k3s installer from $url"
+          downloaded=yes
+          break
+        fi
+        echo "flarops: $url did not serve the installer"
+      done
+      if [ -n "$downloaded" ]; then break; fi
+      echo "flarops: no source served the k3s installer (attempt $attempt/5)"
+      if [ "$attempt" = 5 ]; then exit 1; fi
+      sleep 15
+    done
+    test -s /tmp/k3s-install.sh
+
+    echo "flarops: installing k3s server ${var.k3s_version}"
+    INSTALL_K3S_VERSION="${var.k3s_version}" \
+      K3S_TOKEN="${random_password.k3s_token.result}" \
+      INSTALL_K3S_EXEC="server --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --tls-san ${aws_eip.eip.public_ip}" \
+      sh /tmp/k3s-install.sh
+
+    for attempt in $(seq 1 60); do
+      if [ -f /etc/rancher/k3s/k3s.yaml ]; then break; fi
+      sleep 5
+    done
+    test -f /etc/rancher/k3s/k3s.yaml
+
+    echo "flarops: bootstrap OK"
+    touch /var/lib/flarops/bootstrap-ok
+  EOF
+  )
+
+  tags = {
+    Name = var.instance_name
+  }
+
+  lifecycle {
+    # Changes to the AMI or to user_data reach only new instances; replace this
+    # one deliberately (terraform apply -replace=...) to apply them here. The
+    # cluster's data lives on its root volume.
+    ignore_changes = [ami, user_data]
+  }
+}
+
+resource "aws_eip" "eip" {
+  domain = "vpc"
+}
+
+resource "aws_eip_association" "eip_assoc" {
+  instance_id   = aws_instance.server.id
+  allocation_id = aws_eip.eip.id
+}
+
+resource "aws_instance" "worker" {
+  for_each               = toset([for slot in var.worker_slots : tostring(slot)])
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.sg.id]
+
+  root_block_device {
+    volume_size = var.volume_size
+    volume_type = "gp3"
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+    instance_metadata_tags      = "disabled"
+  }
+
+  user_data = sensitive(<<-EOF
+    #!/bin/bash
+    exec > >(tee -a /var/log/flarops-bootstrap.log) 2>&1
+    set -Eeuo pipefail
+
+    mkdir -p /var/lib/flarops
+    trap 'echo "flarops: bootstrap FAILED at line $LINENO"' ERR
+    trap 'flarops_rc=$?; if [ "$flarops_rc" != 0 ]; then touch /var/lib/flarops/bootstrap-failed; fi' EXIT
+
+    HOSTNAME="${var.instance_name}-worker-${each.key}"
+    hostnamectl set-hostname $HOSTNAME
+
+    mkdir -p /home/ubuntu/.ssh
+    echo "${var.ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
+    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+    chmod 700 /home/ubuntu/.ssh
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+
+    K3S_INSTALLER_URLS="https://raw.githubusercontent.com/k3s-io/k3s/${var.k3s_version}/install.sh https://get.k3s.io"
+
+    downloaded=""
+    for attempt in $(seq 1 5); do
+      for url in $K3S_INSTALLER_URLS; do
+        if curl -fsSL --retry 3 --retry-delay 5 --retry-connrefused --max-time 180 \
+             -o /tmp/k3s-install.sh "$url" && [ -s /tmp/k3s-install.sh ]; then
+          echo "flarops: got the k3s installer from $url"
+          downloaded=yes
+          break
+        fi
+        echo "flarops: $url did not serve the installer"
+      done
+      if [ -n "$downloaded" ]; then break; fi
+      echo "flarops: no source served the k3s installer (attempt $attempt/5)"
+      if [ "$attempt" = 5 ]; then exit 1; fi
+      sleep 15
+    done
+    test -s /tmp/k3s-install.sh
+
+    echo "flarops: installing k3s agent ${var.k3s_version}"
+    INSTALL_K3S_VERSION="${var.k3s_version}" \
+      K3S_URL="https://${aws_instance.server.private_ip}:6443" \
+      K3S_TOKEN="${random_password.k3s_token.result}" \
+      INSTALL_K3S_EXEC="agent --kubelet-arg=system-reserved=memory=256Mi --kubelet-arg=kube-reserved=memory=256Mi --node-taint flarops.io/capsule=true:NoSchedule" \
+      sh /tmp/k3s-install.sh
+
+    for attempt in $(seq 1 60); do
+      if systemctl is-active --quiet k3s-agent; then break; fi
+      sleep 5
+    done
+    systemctl is-active --quiet k3s-agent
+
+    echo "flarops: bootstrap OK"
+    touch /var/lib/flarops/bootstrap-ok
+  EOF
+  )
+
+  tags = {
+    Name = "${var.instance_name}-worker-${each.key}"
+    Role = "worker"
+  }
+
+  lifecycle {
+    # Changes to the AMI or to user_data reach only new instances; replace this
+    # one deliberately (terraform apply -replace=...) to apply them here. The
+    # cluster's data lives on its root volume.
+    ignore_changes = [ami, user_data]
+  }
+}
+
+output "public_ip" {
+  value = aws_eip.eip.public_ip
+}
+
+output "instance_name" {
+  value = var.instance_name
+}
+
+output "worker_slots" {
+  value = [for s in sort([for x in var.worker_slots : tostring(x)]) : tonumber(s)]
+}
+
+output "worker_nodes" {
+  description = "Kubernetes node names of the workers, derived from the same values that set their hostnames."
+  value       = sort([for slot in var.worker_slots : "${var.instance_name}-worker-${slot}"])
+}
+
+output "instance_type" {
+  value = var.instance_type
+}
+
+output "volume_size" {
+  value = var.volume_size
+}
+
+# ===== deploy/terraform/variables.tf
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-west-2"
+}
+
+variable "instance_name" {
+  description = "Name tag for the EC2 instance"
+  type        = string
+  default     = "zg-composequirks-instance"
+}
+
+# Worker nodes, by slot number. The PR-capsule workflow adds and removes them;
+# there is no need to edit this by hand.
+variable "worker_slots" {
+  description = "Slot numbers of the worker nodes to run, e.g. [1,3]. Each slot is one instance, addressable independently of the others."
+  type        = set(number)
+  default     = []
+}
+
+variable "instance_type" {
+  description = "Type of the instance"
+  type        = string
+  default     = "t3a.medium"
+}
+
+# Read by the server and every worker. A change applies to NEW nodes only -
+# replace an existing one (terraform apply -replace=...) to upgrade it.
+variable "k3s_version" {
+  description = "k3s version installed on every node (see https://github.com/k3s-io/k3s/releases)"
+  type        = string
+  default     = "v1.36.4+k3s1"
+}
+
+variable "volume_size" {
+  description = "Size of the root volume in GB"
+  type        = number
+  default     = 40
+}
+
+variable "ssh_public_key" {
+  description = "Public SSH key for EC2 instance"
+  type        = string
+  default     = "ssh-rsa <PUBKEY>"
+  sensitive   = true
+}
+
+variable "domain" {
+  description = "Domain Name"
+  type        = string
+  default     = "example.test"
+}
+
+# ===== docker-compose.yml
+services:
+  db:
+    image: postgres:16
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_wal_senders=10
+    environment:
+      POSTGRES_PASSWORD: localpw
+      POSTGRES_DB: appdb
+    volumes:
+      - ./sql/tables.sql:/docker-entrypoint-initdb.d/1-tables.sql
+      - ./sql/data.sql:/docker-entrypoint-initdb.d/2-data.sql
+    networks:
+      - backend
+  backend:
+    build: ./backend
+    ports: ["4000:4000"]
+    environment:
+      - "PORT=4000"
+      - 'BACKUP_DIR=/var/backups/db'
+      - DATABASE_URL=postgresql://postgres:localpw@db:5432/appdb
+      - PROM_URL=http://prometheus:9090
+      - REDIS_HOST=cache
+      - STORE_URL=http://minio:9000
+    depends_on: [db, cache]
+    networks:
+      - backend
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml
+  cache:
+    image: redis:${REDIS_VERSION:-7.2}
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    command: ["server", "/data", "--console-address", ":9001 #not-a-comment"]
+    ports: ["9000:9000"]
+    volumes:
+      - type: volume
+        source: miniodata
+        target: /data
+networks:
+  backend:
+    driver: bridge
+volumes:
+  miniodata:
+
+# ===== expected-files.json
+{
+  "flarops.yaml": [
+    "    - 4000",
+    "    PORT: \"4000\"",
+    "    BACKUP_DIR: /var/backups/db",
+    "    DEBUG: \"\"",
+    "    LOG_LEVEL: info",
+    "cache:\n  image: \"redis:7.2\"",
+    "prometheus:\n  image: \"prom/prometheus:v2.53.0\"\n  replicas: 1\n  ports:\n    - 9090",
+    "  volumes:\n    - name: miniodata\n      path: /data",
+    "    - \":9001 #not-a-comment\"",
+    "  command:\n    - postgres\n    - -c\n    - wal_level=logical\n    - -c\n    - max_wal_senders=10",
+    "!DEBUG: \"true\"",
+    "!LOG_LEVEL: debug"
+  ],
+  "deploy/.env": [
+    "JWT_PRIVATE_KEY=\"<PEM>\""
+  ],
+  "deploy/helm/templates/database.yaml": [
+    "{{ \"1-tables.sql\" | quote }}",
+    "{{ \"2-data.sql\" | quote }}",
+    "Hello {{ .Name }}"
+  ]
+}
+
+# ===== flarops.yaml
+# repository settings
+repositorySettings:
+  registry: docker.io               # registry host; docker.io is Docker Hub
+  project: null                     # namespace inside the registry (a Harbor project, an organisation);
+                                    # null for none - on Docker Hub, your own user
+  repository: zg-composequirks      # repository the images are pushed to
+
+# sync lock
+# Files "flarops sync" must not overwrite - for a change Flarops cannot
+# express, made by hand in a chart template or a workflow. List each with
+# true; sync then leaves it as it is and says which changes did not reach it:
+#
+# syncLock:
+#   deploy/helm/templates/api.yaml: true
+#   .github/workflows/deploy.yml: true
+#
+# deploy/helm/values.yaml and werf.yaml cannot be locked.
+syncLock: {}
+
+api:
+  dockerfile: Dockerfile
+  context: backend
+  replicas: 1
+  ports:
+    - 4000
+  env:
+    LOG_LEVEL: info
+    DEBUG: ""
+    PORT: "4000"
+    BACKUP_DIR: /var/backups/db
+    PROM_URL: "http://prometheus:9090"
+    REDIS_HOST: cache
+    STORE_URL: "http://minio:9000"
+  databaseUrls:
+    - DATABASE_URL
+  secretEnvs:
+    POSTGRES_PASSWORD: POSTGRES_PASSWORD
+    JWT_PRIVATE_KEY: JWT_PRIVATE_KEY
+  healthRoute: /api/health
+  exposedRoutes:
+    - /api
+
+database:
+  image: "postgres:16"
+  replicas: 1
+  port: 5432
+  user: postgres
+  name: appdb
+  type: postgres
+  command:
+    - postgres
+    - -c
+    - wal_level=logical
+    - -c
+    - max_wal_senders=10
+  secretEnvs:
+    POSTGRES_PASSWORD: POSTGRES_PASSWORD
+
+prometheus:
+  image: "prom/prometheus:v2.53.0"
+  replicas: 1
+  ports:
+    - 9090
+
+cache:
+  image: "redis:7.2"
+  replicas: 1
+  ports:
+    - 6379
+
+minio:
+  image: "minio/minio:RELEASE.2024-06-13T22-53-53Z"
+  replicas: 1
+  ports:
+    - 9000
+    - 9001
+  command:
+    - server
+    - /data
+    - --console-address
+    - ":9001 #not-a-comment"
+  volumes:
+    - name: miniodata
+      path: /data
+
+# ============================================================================
+# This file is the source of truth for what gets deployed. Edit it, then run
+#
+#     flarops sync
+#
+# which applies every change here to deploy/helm, werf.yaml and the recorded
+# state: a changed parameter updates the existing object, a service added below
+# is created from the same templates a discovered one is built from (with
+# defaults for anything left out), and a service removed from here is removed
+# from the deployment. `flarops init` does not run twice - sync is how a
+# generated project changes from then on.
+#
+# Template for adding new services to this file.
+#
+# Each top-level key is a service name (must be unique, RFC-1123 compatible).
+# A service MUST have either `image` OR `dockerfile` + `context`, and `replicas`.
+#
+# `context` is RELATIVE TO THE PROJECT ROOT (not to the deploy directory);
+# `dockerfile` is relative to `context`, as in docker-compose and werf.
+#
+# --- Required fields --------------------------------------------------------
+#
+# my-service:
+#   # OPTION A: pre-built image (not built locally)
+#   image: "registry.example.com/org/image:tag"
+#
+#   # OPTION B: built from a Dockerfile in this repository
+#   context: "path/to"                      # Docker build context, relative to project root
+#   dockerfile: "Dockerfile"                # relative to context (path/to/Dockerfile here)
+#
+#   replicas: 1                             # number of pod replicas
+#
+# --- A task instead of a service --------------------------------------------
+#
+#   oneShot: true                           # runs to completion and stops,
+#                                           #  instead of staying up. Rendered
+#                                           #  as a Job that re-runs on every
+#                                           #  deploy, so the command must be
+#                                           #  safe to repeat. Replaces
+#                                           #  replicas; no ports, no probes,
+#                                           #  no exposedRoutes - a task has no
+#                                           #  Service to route to.
+#
+# --- Optional fields --------------------------------------------------------
+#
+#   ports:                                  # container ports to expose
+#     - 8080
+#
+#   buildArgs:                              # passed to "docker build --build-arg"
+#     - "BUILD_MODE=production"              # (spelled "args" in older files,
+#     - "API_URL=https://example.com"        #  still accepted)
+#
+#   command:                                # what the container RUNS - this
+#     - "node"                              #  becomes the pod's args:, which
+#     - "server.js"                         #  replaces the image's CMD and
+#                                           #  keeps its ENTRYPOINT, exactly as
+#                                           #  docker-compose's command: does.
+#
+#   env:                                    # plain-text environment variables
+#     DATABASE_HOST: "database"
+#     APP_ENV: "production"
+#
+#   databaseUrls:                           # env vars that get the database's
+#     - DATABASE_URL                        #  connection URL, built by the chart
+#                                           #  from its user, password and name -
+#                                           #  this service's own db: if it has
+#                                           #  one, otherwise the top-level
+#                                           #  database. No GitHub Secret needed.
+#
+#   secretEnvs:                             # env vars sourced from GitHub Secrets
+#     SECRET_KEY: SECRET_KEY                # env name: GitHub Secret name
+#     DB_PASSWORD: SHARED_DB_PASSWORD       # env name can differ from secret name
+#
+#   volumes:                                # persistent storage, one claim each
+#     - name: "data"                        # any name; the claim is <service>-<name>
+#       path: "/var/lib/service"            # where it is mounted in the container
+#       size: "20Gi"                        # optional, 5Gi by default
+#
+#   healthRoute: "/health"                  # readiness/liveness probe path
+#   healthPort: 8080                        # port for the health probe
+#
+#   exposedRoutes:                          # Ingress path prefixes routed here
+#     - "/webhooks"                          #  passed through unchanged
+#     - path: "/api"                         #  the service sees requests with
+#       stripPrefix: true                    #  "/api" removed - use this when a
+#                                            #  reverse proxy did it before
+#
+#   db:                                     # per-service database (generates its own StatefulSet)
+#     type: "postgres"                      # required: postgres | mysql | mariadb | mongodb
+#     secretEnvs:                           # required: the password, as for a service
+#       POSTGRES_PASSWORD: MY_SERVICE_DB_PASSWORD
+#     image: "postgres:18-alpine"           # optional, like the rest: the engine's
+#     port: 5432                            #  defaults fill in what is left out;
+#     user: "postgres"                      #  port moves the Service address only -
+#     name: "mydb"                          #  the server keeps its own port
+#     replicas: 1                           # 0 or 1
+#     command:                              # server settings, as in compose;
+#       - "postgres"                        #  the same field works on the
+#       - "-c"                              #  top-level database: block
+#       - "wal_level=logical"
+#
+# ============================================================================
+
+# ===== monitoring/alerts.yml
+groups:
+  - name: up
+    rules:
+      - alert: Down
+        expr: up == 0
+        annotations:
+          summary: "{{ $labels.instance }} is down"
+
+# ===== sql/data.sql
+INSERT INTO greetings (text) VALUES ('Hello {{ .Name }}');
+
+# ===== sql/tables.sql
+  CREATE TABLE greetings (id serial primary key, text varchar(80));
+
+# ===== werf-giterminism.yaml
+giterminismConfigVersion: 1
+config:
+  dockerfile:
+    allowUncommitted:
+      - .env
+      - deploy/.env
+helm:
+  allowUncommittedFiles:
+    - deploy/helm/flarops-ci-values.json
+
+# ===== werf.yaml
+project: zg-composequirks
+configVersion: 1
+deploy:
+  helmChartDir: deploy/helm
+---
+image: api
+dockerfile: "Dockerfile"
+context: "backend"
+---
+image: dashboard
+dockerfile: Dockerfile
+context: deploy/dashboard

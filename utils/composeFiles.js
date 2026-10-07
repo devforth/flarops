@@ -4,7 +4,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const CANONICAL = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yaml', 'compose.yml'];
+// In the order docker compose itself looks for them.
+const CANONICAL = ['compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml'];
 
 const VARIANT = /^(docker-)?compose[.-][A-Za-z0-9_.-]*\.ya?ml$/i;
 

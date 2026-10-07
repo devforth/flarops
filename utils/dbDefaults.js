@@ -42,10 +42,19 @@ function dbUrlScheme(dbType, recorded) {
   return DEFAULT_URL_SCHEME[type] || 'postgresql';
 }
 
+// Whether a URL scheme belongs to this engine at all (mongodb+srv is still mongodb). Unknown or
+// missing schemes count as belonging: only another engine's URL is not this database's.
+function sameEngineScheme(dbType, scheme) {
+  if (!scheme) return true;
+  const family = (s) => (/^postgres/.test(s) ? 'postgres' : /^(mysql|mariadb)/.test(s) ? 'mysql' : /^mongodb/.test(s) ? 'mongodb' : null);
+  const ofScheme = family(String(scheme).toLowerCase());
+  return !ofScheme || ofScheme === family(String(dbType || 'postgres').toLowerCase());
+}
+
 function urlSchemeOf(value) {
   const m = String(value == null ? '' : value).trim().replace(/^["']|["']$/g, '').match(/^([a-z][a-z0-9+.-]*):\/\//i);
   return m ? m[1].toLowerCase() : null;
 }
 
 module.exports = {
-  defaultImageFor, defaultUserFor, defaultPortFor, passwordKeyFor, dbUrlScheme, urlSchemeOf, ENGINES };
+  defaultImageFor, defaultUserFor, defaultPortFor, passwordKeyFor, dbUrlScheme, urlSchemeOf, sameEngineScheme, ENGINES };

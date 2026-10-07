@@ -1,0 +1,14 @@
+{
+  "flarops.yaml": [
+    "cache:\n  image: \"redis:7\"\n  replicas: 1\n  ports:\n    - 6379\n  volumes:\n    - name: cachedata\n      path: /data",
+    "    - --log-file\n    - \"-\"",
+    "    ANALYTICS_ADDR: \"user:pw@tcp(database:5432)/app\"",
+    "    CONFIG_JSON: \"{\\\"db\\\":\\\"database:5432\\\"}\"",
+    "    VAULT_ADDR: \"http://secret-svc:8200\"",
+    "secret-svc:\n  image: \"hashicorp/vault:1.17\"",
+    "  databaseUrls:\n    - DATABASE_URL\n  secretEnvs:\n    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    API_SECRET: API_SECRET"
+  ],
+  "deploy/.env": ["API_SECRET=RealPrivate123"],
+  "deploy/helm/templates/api.yaml": ["- name: DATABASE_URL"],
+  "deploy/helm/templates/support-proxy.yaml": ["bypass = true"]
+}

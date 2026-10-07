@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:16
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_wal_senders=10
+    environment:
+      POSTGRES_PASSWORD: localpw
+      POSTGRES_DB: appdb
+    volumes:
+      - ./sql/tables.sql:/docker-entrypoint-initdb.d/1-tables.sql
+      - ./sql/data.sql:/docker-entrypoint-initdb.d/2-data.sql
+    networks:
+      - backend
+  backend:
+    build: ./backend
+    ports: ["4000:4000"]
+    environment:
+      - "PORT=4000"
+      - 'BACKUP_DIR=/var/backups/db'
+      - DATABASE_URL=postgresql://postgres:localpw@db:5432/appdb
+      - PROM_URL=http://prometheus:9090
+      - REDIS_HOST=cache
+      - STORE_URL=http://minio:9000
+    depends_on: [db, cache]
+    networks:
+      - backend
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml
+  cache:
+    image: redis:${REDIS_VERSION:-7.2}
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    command: ["server", "/data", "--console-address", ":9001 #not-a-comment"]
+    ports: ["9000:9000"]
+    volumes:
+      - type: volume
+        source: miniodata
+        target: /data
+networks:
+  backend:
+    driver: bridge
+volumes:
+  miniodata:
