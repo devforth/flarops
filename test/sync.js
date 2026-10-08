@@ -419,6 +419,21 @@ pinger:
     check('back to the original after the file checks', r.status === 0, r.err || r.out);
   }
 
+  // 3f. The Flarops section of AGENTS.md is kept current; the rest of the file is left alone.
+  {
+    const agentsFile = path.join(dir, 'AGENTS.md');
+    check('init writes the Flarops section of AGENTS.md', exists(dir, 'AGENTS.md') && /<!-- flarops:begin[\s\S]*flarops\.yaml[\s\S]*<!-- flarops:end -->/.test(read(dir, 'AGENTS.md')));
+    check('CLAUDE.md imports it', exists(dir, 'CLAUDE.md') && /^@AGENTS\.md$/m.test(read(dir, 'CLAUDE.md')));
+    const original = read(dir, 'AGENTS.md');
+    fs.writeFileSync(agentsFile, '# Our notes\n\n' + original.replace('## Deployment (Flarops)', '## Deployment (edited)') + '\nMore notes.\n');
+    r = runSync(dir);
+    const after = read(dir, 'AGENTS.md');
+    check('sync restores an edited Flarops section', r.status === 0 && after.includes('## Deployment (Flarops)') && !after.includes('(edited)'), r.err || r.out);
+    check('and keeps what is outside it', after.startsWith('# Our notes\n') && after.endsWith('More notes.\n'), after.slice(0, 200));
+    r = runSync(dir);
+    check('a current section is nothing to do', /nothing to do/.test(r.out), r.out);
+  }
+
   // 3b'. Values pasted unescaped into file names and workflows must be refused.
   const hostile = [
     ['a service name outside the chart', '"../../../.github/workflows/pwn":\n  image: "busybox:1"\n', /not a valid service name/],

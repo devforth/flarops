@@ -17,6 +17,7 @@ const renderValues = require('../../templates/values.yaml.js');
 const renderWerf = require('../../templates/werf.yaml.js');
 const renderDeployWorkflow = require('../../templates/deploy.yml.js');
 const renderPrCapsuleWorkflow = require('../../templates/pr-capsule.yml.js');
+const { AGENTS_BLOCK, withBlock, hasBlock } = require('../../utils/agentsDoc.js');
 
 // Defaults a newly declared service starts from before the author's values are laid over them.
 const SERVICE_DEFAULTS = Object.freeze({
@@ -597,11 +598,20 @@ module.exports = async function sync() {
     process.exit(1);
   }
 
+  // The Flarops section of AGENTS.md follows this version of Flarops; the rest of the file is the project's.
+  const agentsDocs = [];
+  {
+    const agentsFile = path.join(currentDir, 'AGENTS.md');
+    const current = fs.existsSync(agentsFile) ? fs.readFileSync(agentsFile, 'utf8') : null;
+    if (hasBlock(current)) agentsDocs.push({ file: agentsFile, content: withBlock(current, AGENTS_BLOCK) ?? current });
+  }
+
   const outputs = [
     { file: path.join(helmDir, 'values.yaml'), content: valuesYaml },
     ...templates,
     { file: path.join(currentDir, 'werf.yaml'), content: werfYaml },
     ...workflows,
+    ...agentsDocs,
   ];
   // Line endings are not a difference: a checkout with autocrlf would otherwise be rewritten each time.
   const differs = (o) => !fs.existsSync(o.file) || fs.readFileSync(o.file, 'utf8').replace(/\r\n/g, '\n') !== o.content;

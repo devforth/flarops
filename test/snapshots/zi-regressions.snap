@@ -4,6 +4,8 @@
   .gitignore
   .keys/deploy_rsa
   .keys/deploy_rsa.pub
+  AGENTS.md
+  CLAUDE.md
   FLAROPS.md
   backend/.env
   backend/.env.production
@@ -1018,6 +1020,36 @@ override.tf.json
 *_override.tf.json
 *tfplan*
 deploy/helm/flarops-ci-values.json
+
+# ===== AGENTS.md
+# Project notes
+
+Run the tests with make test.
+
+<!-- flarops:begin - managed by flarops: "flarops sync" rewrites this block, edits inside it are lost -->
+## Deployment (Flarops)
+
+This project is deployed by Flarops, and `flarops.yaml` is the source of truth for the deployment.
+
+- To change what is deployed - services, replicas, ports, commands, env, secrets, routes, volumes,
+  databases - edit `flarops.yaml`, run `npx flarops sync`, and commit everything it changed.
+- Do not edit `deploy/helm/`, `werf.yaml` or `.github/workflows/` by hand: sync regenerates them.
+  For a change `flarops.yaml` cannot express, edit the generated file and list it under `syncLock`
+  in `flarops.yaml`; a template you add to `deploy/helm/templates/` yourself is left alone.
+- `deploy/terraform/` is generated once and never touched by sync: edit it directly.
+- Field reference: the comment block at the end of `flarops.yaml`. Sync refuses an invalid file,
+  names the field, and writes nothing - read its message and fix that field.
+- Secrets: list each under `secretEnvs` of the service that reads it (`ENV_NAME: GITHUB_SECRET_NAME`).
+  Values go into the repository's GitHub Secrets, never into the repository; the git-ignored
+  `deploy/.env` lists the secrets to create.
+- Database connection URLs: list the variable under `databaseUrls` - the chart builds the URL from
+  the database's user, password and name. Do not store such a URL as a secret.
+<!-- flarops:end -->
+
+# ===== CLAUDE.md
+<!-- flarops:begin - managed by flarops: "flarops sync" rewrites this block, edits inside it are lost -->
+@AGENTS.md
+<!-- flarops:end -->
 
 # ===== FLAROPS.md
 # Flarops Deployment Guide
@@ -2946,9 +2978,24 @@ volumes:
     "secret-svc:\n  image: \"hashicorp/vault:1.17\"",
     "  databaseUrls:\n    - DATABASE_URL\n  secretEnvs:\n    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    API_SECRET: API_SECRET"
   ],
-  "deploy/.env": ["API_SECRET=RealPrivate123"],
-  "deploy/helm/templates/api.yaml": ["- name: DATABASE_URL"],
-  "deploy/helm/templates/support-proxy.yaml": ["bypass = true"]
+  "deploy/.env": [
+    "API_SECRET=RealPrivate123"
+  ],
+  "deploy/helm/templates/api.yaml": [
+    "- name: DATABASE_URL"
+  ],
+  "deploy/helm/templates/support-proxy.yaml": [
+    "bypass = true"
+  ],
+  "AGENTS.md": [
+    "# Project notes\n\nRun the tests with make test.\n\n<!-- flarops:begin",
+    "## Deployment (Flarops)",
+    "<!-- flarops:end -->"
+  ],
+  "CLAUDE.md": [
+    "<!-- flarops:begin",
+    "\n@AGENTS.md\n"
+  ]
 }
 
 # ===== flarops.yaml

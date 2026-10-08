@@ -8,7 +8,22 @@
     "secret-svc:\n  image: \"hashicorp/vault:1.17\"",
     "  databaseUrls:\n    - DATABASE_URL\n  secretEnvs:\n    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    API_SECRET: API_SECRET"
   ],
-  "deploy/.env": ["API_SECRET=RealPrivate123"],
-  "deploy/helm/templates/api.yaml": ["- name: DATABASE_URL"],
-  "deploy/helm/templates/support-proxy.yaml": ["bypass = true"]
+  "deploy/.env": [
+    "API_SECRET=RealPrivate123"
+  ],
+  "deploy/helm/templates/api.yaml": [
+    "- name: DATABASE_URL"
+  ],
+  "deploy/helm/templates/support-proxy.yaml": [
+    "bypass = true"
+  ],
+  "AGENTS.md": [
+    "# Project notes\n\nRun the tests with make test.\n\n<!-- flarops:begin",
+    "## Deployment (Flarops)",
+    "<!-- flarops:end -->"
+  ],
+  "CLAUDE.md": [
+    "<!-- flarops:begin",
+    "\n@AGENTS.md\n"
+  ]
 }

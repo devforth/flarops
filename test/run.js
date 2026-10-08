@@ -68,7 +68,7 @@ function generatedComments(dir) {
     .map(l => l.slice(3));
   const found = [];
   for (const rel of written) {
-    if (['flarops.yaml', 'FLAROPS.md', 'deploy/.env'].includes(rel) || rel.startsWith('.keys/') || /\.(gif|png)$/.test(rel)) continue;
+    if (['flarops.yaml', 'FLAROPS.md', 'AGENTS.md', 'CLAUDE.md', 'deploy/.env'].includes(rel) || rel.startsWith('.keys/') || /\.(gif|png)$/.test(rel)) continue;
     const go = rel.endsWith('.go');
     const html = rel.endsWith('.html');
     fs.readFileSync(path.join(dir, rel), 'utf8').split('\n').forEach((line, i) => {

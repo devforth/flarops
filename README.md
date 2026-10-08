@@ -412,10 +412,14 @@ Flarops prints warnings for anything it could not resolve — unset variables, a
 │   └── pr-capsule.yml          # per-PR environment, created and removed automatically
 ├── .keys/                      # deploy SSH key (gitignored)
 ├── werf.yaml                   # image build configuration
+├── AGENTS.md                   # a Flarops section for coding agents (your own content is kept)
+├── CLAUDE.md                   # imports AGENTS.md, for Claude Code
 └── FLAROPS.md                  # first-deployment instructions
 ```
 
 Everything under `deploy/helm/` is written by Flarops. Edit `flarops.yaml` and run `sync`; hand edits there are overwritten.
+
+**Coding agents find this on their own.** `AGENTS.md` is the file Codex, Cursor, Copilot, Gemini CLI and others read by themselves, and `CLAUDE.md` imports it for Claude Code. `init` adds a section to it, between `<!-- flarops:begin -->` and `<!-- flarops:end -->`, saying that `flarops.yaml` is the file to edit, how to apply it, which files never to edit by hand, and where the field reference is. An agent working in the project follows that without being told in a prompt. Sync rewrites the section to match the installed Flarops; everything outside the markers is yours.
 
 ## The dashboard
 

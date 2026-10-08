@@ -357,7 +357,7 @@ module.exports = async function init() {
   // Every path init writes, and each directory on the way to it: a symlink among them would send the
   // deploy key and the secrets in deploy/.env wherever the repository points it.
   const WRITTEN_PATHS = [
-    '.gitignore', '.dockerignore', 'flarops.yaml', 'FLAROPS.md', 'werf.yaml', 'werf-giterminism.yaml',
+    '.gitignore', '.dockerignore', 'flarops.yaml', 'FLAROPS.md', 'AGENTS.md', 'CLAUDE.md', 'werf.yaml', 'werf-giterminism.yaml',
     '.keys/deploy_rsa', '.keys/deploy_rsa.pub', 'deploy/.env', 'deploy/.env.safety', 'deploy/.flarops-state.json',
     'deploy/terraform/main.tf', 'deploy/terraform/variables.tf', 'deploy/helm/values.yaml',
     'deploy/helm/Chart.yaml', 'deploy/helm/templates', 'deploy/dashboard',
@@ -2493,6 +2493,22 @@ appVersion: "1.0.0"
   ];
 
   otherFilesToGenerate.forEach(f => fs.writeFileSync(f.file, f.content));
+
+  // What a coding agent reads on its own: the Flarops section of AGENTS.md, imported by CLAUDE.md.
+  {
+    const { AGENTS_BLOCK, CLAUDE_BLOCK, withBlock } = require('../../utils/agentsDoc.js');
+    const readIfAny = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null);
+    const agentsFile = path.join(currentDir, 'AGENTS.md');
+    const agents = withBlock(readIfAny(agentsFile), AGENTS_BLOCK);
+    if (agents !== null) fs.writeFileSync(agentsFile, agents);
+    const claudeFile = path.join(currentDir, 'CLAUDE.md');
+    const claude = readIfAny(claudeFile);
+    if (!claude || !/^@AGENTS\.md\s*$/m.test(claude)) {
+      const updated = withBlock(claude, CLAUDE_BLOCK);
+      if (updated !== null) fs.writeFileSync(claudeFile, updated);
+    }
+    console.log('Added the Flarops section to AGENTS.md (CLAUDE.md imports it): coding agents read how to change the deployment on their own.');
+  }
 
   const dashboardSourceDir = path.join(__dirname, '../../dashboard');
   const dashboardDestDir = path.join(deployDir, 'dashboard');
