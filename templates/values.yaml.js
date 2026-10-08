@@ -36,7 +36,6 @@ ${s.command ? `    command:\n${s.command.map(a => '      - "' + yamlEscapeDouble
       user: "${yamlEscapeDoubleQuoted(s.db.user)}"
       name: "${yamlEscapeDoubleQuoted(s.db.name)}"
       replicas: ${s.db.replicas ?? 1}
-      storage: "10Gi"
 ${s.db.command ? `      command:\n${s.db.command.map(a => '        - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}` : ''}`;
     }
   }
@@ -81,7 +80,6 @@ database:
   password: null
   name: "${yamlEscapeDoubleQuoted(config.dbName)}"
   replicas: ${config.dbReplicas ?? 1}
-  storage: "${yamlEscapeDoubleQuoted(config.dbStorage || '10Gi')}"
 ${config.dbCommand ? `  command:\n${config.dbCommand.map(a => '    - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}  env:
     # KEY: "VALUE"
 ${config.hasBackend ? `api:

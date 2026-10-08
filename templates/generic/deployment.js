@@ -18,7 +18,8 @@ module.exports = (service) => {
     ...dbEnv.keys,
   ].filter(Boolean).map(k => JSON.stringify(k)).join(' ');
 
-  return `${pvcs}apiVersion: apps/v1
+  // Each claim is its own document; without the separator the Deployment would overwrite the last one.
+  return `${pvcs}${pvcs ? '---\n' : ''}apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ${service.name}

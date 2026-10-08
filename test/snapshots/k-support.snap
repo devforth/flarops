@@ -1223,6 +1223,8 @@ AWS_REGION=us-west-2
   "dbLocalDockerfile": null,
   "dbContext": null,
   "dbCommand": null,
+  "apiVolumes": [],
+  "frontendVolumes": [],
   "dbPasswordKey": "DATABASE_PASSWORD",
   "hasDbPassword": false,
   "dbUrlVars": [],
@@ -1235,6 +1237,7 @@ AWS_REGION=us-west-2
   "apiHealthRoute": null,
   "apiHealthPort": null,
   "hasCloudflare": false,
+  "dbVolumes": [],
   "apiReplicas": 1,
   "frontendReplicas": 1,
   "dbReplicas": 1
@@ -1974,7 +1977,6 @@ database:
   password: null
   name: "appdb"
   replicas: 1
-  storage: "10Gi"
   env:
     # KEY: "VALUE"
 api:
@@ -2572,10 +2574,15 @@ cache:
 #     SECRET_KEY: SECRET_KEY                # env name: GitHub Secret name
 #     DB_PASSWORD: SHARED_DB_PASSWORD       # env name can differ from secret name
 #
-#   volumes:                                # persistent storage, one claim each
-#     - name: "data"                        # any name; the claim is <service>-<name>
-#       path: "/var/lib/service"            # where it is mounted in the container
-#       size: "20Gi"                        # optional, 5Gi by default
+#   volumes:                                # persistent storage, one claim each -
+#     - name: "data"                        #  on any block: api, frontend, any
+#       path: "/var/lib/service"            #  service, database and db:
+#       size: "20Gi"                        # optional, 5Gi by default (10Gi on a
+#                                           #  database). The claim is
+#                                           #  <service>-<name>. Removing a volume
+#                                           #  keeps its claim and data; a new
+#                                           #  size reaches new claims only. PR
+#                                           #  environments get empty volumes.
 #
 #   healthRoute: "/health"                  # readiness/liveness probe path
 #   healthPort: 8080                        # port for the health probe
@@ -2595,6 +2602,10 @@ cache:
 #     user: "postgres"                      #  port moves the Service address only -
 #     name: "mydb"                          #  the server keeps its own port
 #     replicas: 1                           # 0 or 1
+#     volumes:                              # "data" is the database's own disk,
+#       - name: data                        #  always there: path and size
+#         path: "/var/lib/postgresql"       #  default to the engine's; more
+#         size: "20Gi"                      #  entries are extra disks
 #     command:                              # server settings, as in compose;
 #       - "postgres"                        #  the same field works on the
 #       - "-c"                              #  top-level database: block

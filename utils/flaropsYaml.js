@@ -67,6 +67,19 @@ function renderPorts(ports, indent) {
   return ports.map(p => `${pad}- ${p}`).join('\n');
 }
 
+// volumes: as flarops.yaml spells them, at the given indent.
+function volumesLines(volumes, indent) {
+  if (!Array.isArray(volumes) || volumes.length === 0) return [];
+  const pad = ' '.repeat(indent);
+  const out = [`${pad}volumes:`];
+  for (const v of volumes) {
+    out.push(`${pad}  - name: ${yamlScalar(v.name)}`);
+    out.push(`${pad}    path: ${yamlScalar(v.target)}`);
+    if (v.size) out.push(`${pad}    size: ${yamlScalar(v.size)}`);
+  }
+  return out;
+}
+
 function serviceBlock(name, opts) {
   const lines = [];
 
@@ -133,14 +146,7 @@ function serviceBlock(name, opts) {
     lines.push(secretStr);
   }
 
-  if (Array.isArray(opts.volumes) && opts.volumes.length > 0) {
-    lines.push('  volumes:');
-    for (const v of opts.volumes) {
-      lines.push(`    - name: ${yamlScalar(v.name)}`);
-      lines.push(`      path: ${yamlScalar(v.target)}`);
-      if (v.size) lines.push(`      size: ${yamlScalar(v.size)}`);
-    }
-  }
+  lines.push(...volumesLines(opts.volumes, 2));
 
   if (opts.healthRoute) {
     lines.push(`  healthRoute: ${yamlScalar(opts.healthRoute)}`);
@@ -167,6 +173,7 @@ function serviceBlock(name, opts) {
     lines.push(`    name: ${yamlScalar(opts.db.name)}`);
     const dbCmdStr = renderCommand(opts.db.command, 6);
     if (dbCmdStr) lines.push('    command:', dbCmdStr);
+    lines.push(...volumesLines(opts.db.volumes, 4));
     if (opts.db.passwordKey) {
       const names = databaseSecretEnvNames(opts.db.type, opts.db.user);
       if (names.length > 0) {
@@ -267,10 +274,15 @@ const TEMPLATE_COMMENT = `
 #     SECRET_KEY: SECRET_KEY                # env name: GitHub Secret name
 #     DB_PASSWORD: SHARED_DB_PASSWORD       # env name can differ from secret name
 #
-#   volumes:                                # persistent storage, one claim each
-#     - name: "data"                        # any name; the claim is <service>-<name>
-#       path: "/var/lib/service"            # where it is mounted in the container
-#       size: "20Gi"                        # optional, 5Gi by default
+#   volumes:                                # persistent storage, one claim each -
+#     - name: "data"                        #  on any block: api, frontend, any
+#       path: "/var/lib/service"            #  service, database and db:
+#       size: "20Gi"                        # optional, 5Gi by default (10Gi on a
+#                                           #  database). The claim is
+#                                           #  <service>-<name>. Removing a volume
+#                                           #  keeps its claim and data; a new
+#                                           #  size reaches new claims only. PR
+#                                           #  environments get empty volumes.
 #
 #   healthRoute: "/health"                  # readiness/liveness probe path
 #   healthPort: 8080                        # port for the health probe
@@ -290,6 +302,10 @@ const TEMPLATE_COMMENT = `
 #     user: "postgres"                      #  port moves the Service address only -
 #     name: "mydb"                          #  the server keeps its own port
 #     replicas: 1                           # 0 or 1
+#     volumes:                              # "data" is the database's own disk,
+#       - name: data                        #  always there: path and size
+#         path: "/var/lib/postgresql"       #  default to the engine's; more
+#         size: "20Gi"                      #  entries are extra disks
 #     command:                              # server settings, as in compose;
 #       - "postgres"                        #  the same field works on the
 #       - "-c"                              #  top-level database: block
@@ -349,6 +365,7 @@ function generateFlaropsYaml(config, {
       healthRoute: config.apiHealthRoute,
       healthPort: config.apiHealthPort,
       exposedRoutes: config.apiRoutes,
+      volumes: config.apiVolumes,
       dbPasswordKey: config.hasDbPassword ? config.dbPasswordKey : null,
     }));
   }
@@ -364,6 +381,7 @@ function generateFlaropsYaml(config, {
       env: frontendEnv,
       secretKeys: frontendSecretKeys,
       extraSecretEnvMappings: frontendExtraSecretEnvMappings,
+      volumes: config.frontendVolumes,
     }));
   }
 
@@ -384,6 +402,7 @@ function generateFlaropsYaml(config, {
     if (config.dbType) dbLines.push(`  type: ${yamlScalar(config.dbType)}`);
     const dbCmdStr = renderCommand(config.dbCommand, 4);
     if (dbCmdStr) dbLines.push('  command:', dbCmdStr);
+    dbLines.push(...volumesLines(config.dbVolumes, 2));
     const dbSecretNames = config.dbPasswordKey
       ? databaseSecretEnvNames(config.dbType, config.dbUser)
       : [];

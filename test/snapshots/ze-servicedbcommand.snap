@@ -1166,6 +1166,13 @@ AWS_REGION=us-west-2
         "name": "authdb",
         "passwordKey": "AUTH_SERVICE_POSTGRES_PASSWORD",
         "composeServiceName": "auth-db",
+        "volumes": [
+          {
+            "name": "data",
+            "target": "/var/lib/postgresql/data",
+            "size": "10Gi"
+          }
+        ],
         "command": [
           "postgres",
           "-c",
@@ -1218,7 +1225,14 @@ AWS_REGION=us-west-2
         "user": "postgres",
         "name": "billingdb",
         "passwordKey": "BILLING_SERVICE_POSTGRES_PASSWORD",
-        "composeServiceName": "billing-db"
+        "composeServiceName": "billing-db",
+        "volumes": [
+          {
+            "name": "data",
+            "target": "/var/lib/postgresql/data",
+            "size": "10Gi"
+          }
+        ]
       },
       "dbPasswordKey": null,
       "dbUrlVars": [
@@ -1263,6 +1277,8 @@ AWS_REGION=us-west-2
   "dbLocalDockerfile": null,
   "dbContext": null,
   "dbCommand": null,
+  "apiVolumes": [],
+  "frontendVolumes": [],
   "dbPasswordKey": "DATABASE_PASSWORD",
   "hasDbPassword": false,
   "dbUrlVars": [],
@@ -1275,6 +1291,7 @@ AWS_REGION=us-west-2
   "apiHealthRoute": null,
   "apiHealthPort": null,
   "hasCloudflare": false,
+  "dbVolumes": [],
   "apiReplicas": 1,
   "frontendReplicas": 1,
   "dbReplicas": 1
@@ -1491,7 +1508,7 @@ spec:
             failureThreshold: 6
           volumeMounts:
             - name: data
-              mountPath: /var/lib/postgresql/data
+              mountPath: {{ "/var/lib/postgresql/data" | quote }}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -1499,7 +1516,7 @@ spec:
         accessModes: [ "ReadWriteOnce" ]
         resources:
           requests:
-            storage: {{ $svcDb.storage | default "10Gi" }}
+            storage: "10Gi"
 
 # ===== deploy/helm/templates/auth-service.yaml
 apiVersion: v1
@@ -1718,7 +1735,7 @@ spec:
             failureThreshold: 6
           volumeMounts:
             - name: data
-              mountPath: /var/lib/postgresql/data
+              mountPath: {{ "/var/lib/postgresql/data" | quote }}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -1726,7 +1743,7 @@ spec:
         accessModes: [ "ReadWriteOnce" ]
         resources:
           requests:
-            storage: {{ $svcDb.storage | default "10Gi" }}
+            storage: "10Gi"
 
 # ===== deploy/helm/templates/billing-service.yaml
 apiVersion: v1
@@ -2139,7 +2156,6 @@ database:
   password: null
   name: "appdb"
   replicas: 1
-  storage: "10Gi"
   env:
     # KEY: "VALUE"
 
@@ -2168,7 +2184,6 @@ additionalServices:
       user: "postgres"
       name: "authdb"
       replicas: 1
-      storage: "10Gi"
       command:
         - "postgres"
         - "-c"
@@ -2196,7 +2211,6 @@ additionalServices:
       user: "postgres"
       name: "billingdb"
       replicas: 1
-      storage: "10Gi"
 
 apiRoutes:
   - path: "/api"
@@ -2678,6 +2692,10 @@ auth-service:
       - postgres
       - -c
       - wal_level=logical
+    volumes:
+      - name: data
+        path: /var/lib/postgresql/data
+        size: "10Gi"
     secretEnvs:
       POSTGRES_PASSWORD: AUTH_SERVICE_POSTGRES_PASSWORD
 
@@ -2699,6 +2717,10 @@ billing-service:
     port: 5432
     user: postgres
     name: billingdb
+    volumes:
+      - name: data
+        path: /var/lib/postgresql/data
+        size: "10Gi"
     secretEnvs:
       POSTGRES_PASSWORD: BILLING_SERVICE_POSTGRES_PASSWORD
 
@@ -2775,10 +2797,15 @@ billing-service:
 #     SECRET_KEY: SECRET_KEY                # env name: GitHub Secret name
 #     DB_PASSWORD: SHARED_DB_PASSWORD       # env name can differ from secret name
 #
-#   volumes:                                # persistent storage, one claim each
-#     - name: "data"                        # any name; the claim is <service>-<name>
-#       path: "/var/lib/service"            # where it is mounted in the container
-#       size: "20Gi"                        # optional, 5Gi by default
+#   volumes:                                # persistent storage, one claim each -
+#     - name: "data"                        #  on any block: api, frontend, any
+#       path: "/var/lib/service"            #  service, database and db:
+#       size: "20Gi"                        # optional, 5Gi by default (10Gi on a
+#                                           #  database). The claim is
+#                                           #  <service>-<name>. Removing a volume
+#                                           #  keeps its claim and data; a new
+#                                           #  size reaches new claims only. PR
+#                                           #  environments get empty volumes.
 #
 #   healthRoute: "/health"                  # readiness/liveness probe path
 #   healthPort: 8080                        # port for the health probe
@@ -2798,6 +2825,10 @@ billing-service:
 #     user: "postgres"                      #  port moves the Service address only -
 #     name: "mydb"                          #  the server keeps its own port
 #     replicas: 1                           # 0 or 1
+#     volumes:                              # "data" is the database's own disk,
+#       - name: data                        #  always there: path and size
+#         path: "/var/lib/postgresql"       #  default to the engine's; more
+#         size: "20Gi"                      #  entries are extra disks
 #     command:                              # server settings, as in compose;
 #       - "postgres"                        #  the same field works on the
 #       - "-c"                              #  top-level database: block

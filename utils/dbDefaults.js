@@ -23,6 +23,31 @@ function defaultImageFor(dbType) { return engineOf(dbType).image; }
 function defaultPortFor(dbType) { return engineOf(dbType).port; }
 function passwordKeyFor(dbType) { return engineOf(dbType).passwordKey; }
 
+// Where an engine's official image keeps its data. Postgres 18+ manages a per-version layout under
+// /var/lib/postgresql, so its volume goes one level up.
+function defaultDataPathFor(dbType, image) {
+  const type = String(dbType || '').toLowerCase();
+  if (type === 'postgres' || type === 'postgresql') {
+    const major = parseInt(((String(image || '').split(':')[1] || '').match(/^(\d+)/) || [])[1], 10);
+    return major >= 18 ? '/var/lib/postgresql' : '/var/lib/postgresql/data';
+  }
+  if (type === 'mysql' || type === 'mariadb') return '/var/lib/mysql';
+  if (type === 'mongodb') return '/data/db';
+  return '/var/lib/data';
+}
+
+const DEFAULT_DATA_SIZE = '10Gi';
+
+// A database's volumes: "data" (its own storage, always there) first, then any others declared.
+function databaseVolumes(declared, dbType, image) {
+  const list = Array.isArray(declared) ? declared : [];
+  const data = list.find(v => v.name === 'data') || {};
+  return [
+    { name: 'data', target: data.target || defaultDataPathFor(dbType, image), size: data.size || DEFAULT_DATA_SIZE },
+    ...list.filter(v => v.name !== 'data').map(v => ({ ...v, size: v.size || DEFAULT_DATA_SIZE })),
+  ];
+}
+
 // Keep the project's own scheme - it names the driver. SQLAlchemy 1.4+ rejects "postgres://".
 const URL_SCHEME_FAMILY = {
   postgres: /^postgres(ql)?(\+[a-z0-9_]+)?$/,
@@ -57,4 +82,4 @@ function urlSchemeOf(value) {
 }
 
 module.exports = {
-  defaultImageFor, defaultUserFor, defaultPortFor, passwordKeyFor, dbUrlScheme, urlSchemeOf, sameEngineScheme, ENGINES };
+  defaultImageFor, defaultUserFor, defaultPortFor, passwordKeyFor, dbUrlScheme, urlSchemeOf, sameEngineScheme, defaultDataPathFor, databaseVolumes, DEFAULT_DATA_SIZE, ENGINES };

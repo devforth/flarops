@@ -419,6 +419,55 @@ pinger:
     check('back to the original after the file checks', r.status === 0, r.err || r.out);
   }
 
+  // 3g. Volumes on every block: the api, the database's own disk and extra ones.
+  {
+    const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+    const withApiVolume = (size, replicas) => original
+      .replace(/^(api:\n)/m, `$1  volumes:\n    - name: uploads\n      path: /app/uploads\n      size: ${size}\n`)
+      .replace(/^(api:\n(?:  .*\n|    .*\n|      .*\n)*?)  replicas: \d+\n/m, `$1  replicas: ${replicas}\n`);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), withApiVolume('2Gi', 1));
+    r = runSync(dir);
+    const api = read(dir, 'deploy/helm/templates/api.yaml');
+    check('the api takes a volume', r.status === 0 && /claimName: api-uploads/.test(api) && /type: Recreate/.test(api), r.err || api.slice(0, 600));
+    check('its claim is kept when the volume goes', /"helm\.sh\/resource-policy": keep/.test(api));
+    if (helmRenders) {
+      const err = helmRenders(dir);
+      check('the chart renders with the api volume', !err, err);
+      const rendered = fs.readFileSync(path.join(dir, '.rendered.yaml'), 'utf8');
+      check('the claim is its own object, not swallowed by the Deployment', /kind: PersistentVolumeClaim\nmetadata:\n  name: api-uploads/.test(rendered), rendered.slice(0, 400));
+    }
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), withApiVolume('8Gi', 3));
+    r = runSync(dir);
+    check('a new size says it reaches new claims only', /volume "uploads" changed size \(2Gi -> 8Gi\)/.test(r.err), r.err);
+    check('replicas with a ReadWriteOnce volume are warned about', /3 replicas share ReadWriteOnce volumes/.test(r.err), r.err);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('removing the volume says its claim stays', /volume "uploads" is no longer declared\. Its claim api-uploads/.test(r.err), r.err);
+
+    const withDbVolumes = original.replace(/^(database:\n(?:  .*\n|    .*\n|      .*\n)*?)  volumes:\n    - name: data\n      path: (\S+)\n      size: "10Gi"\n/m,
+      '$1  volumes:\n    - name: data\n      path: $2\n      size: 20Gi\n    - name: archive\n      path: /archive\n');
+    check('init writes the database\'s data volume', withDbVolumes !== original);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), withDbVolumes);
+    r = runSync(dir);
+    const db = read(dir, 'deploy/helm/templates/database.yaml');
+    check('the database disk takes the declared size', r.status === 0 && /name: data\n      spec:\n        accessModes: \[ "ReadWriteOnce" \]\n        resources:\n          requests:\n            storage: "20Gi"/.test(db), r.err || db.slice(-700));
+    check('an extra database volume is a claim template and a mount', /name: archive\n      spec:/.test(db) && /mountPath: \{\{ "\/archive" \| quote \}\}/.test(db));
+    check('resizing a database disk explains the StatefulSet limit', /cannot change its claims/.test(r.err), r.err);
+    if (helmRenders) {
+      const err = helmRenders(dir);
+      check('the chart renders with the database volumes', !err, err);
+    }
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original.replace(/^(database:\n(?:  .*\n|    .*\n|      .*\n)*?)  volumes:\n    - name: data\n      path: \S+\n      size: "10Gi"\n/m, '$1'));
+    r = runSync(dir);
+    check('leaving the data volume out keeps the disk at its defaults', r.status === 0 && /storage: "10Gi"/.test(read(dir, 'deploy/helm/templates/database.yaml')), r.err || r.out);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('back to the original after the volume checks', r.status === 0, r.err || r.out);
+  }
+
   // 3f. The Flarops section of AGENTS.md is kept current; the rest of the file is left alone.
   {
     const agentsFile = path.join(dir, 'AGENTS.md');

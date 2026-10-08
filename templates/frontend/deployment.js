@@ -1,3 +1,5 @@
+const { renderVolumes } = require('../generic/volumes.js');
+
 module.exports = (config) => {
 const { secretRefs, urlEncodedRef, alreadyEmitted } = require('../generic/env.js');
 
@@ -9,7 +11,9 @@ const { secretRefs, urlEncodedRef, alreadyEmitted } = require('../generic/env.js
     ((config && config.frontendExtraSecretEnvMappings) || []).map(m => m.secretKey)
   );
 
-  return `
+  const { pvcs, volumeMounts, volumes } = renderVolumes({ name: 'frontend', volumes: config && config.frontendVolumes }, { mountIndent: 12, volumeIndent: 8 });
+
+  return `${pvcs}${pvcs ? '---\n' : ''}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,7 +22,9 @@ metadata:
     app: {{ .Values.projectName }}
     component: frontend
 spec:
-  replicas: {{ include "flarops.replicas" .Values.frontend.replicas }}
+  replicas: {{ include "flarops.replicas" .Values.frontend.replicas }}${volumes ? `
+  strategy:
+    type: Recreate` : ''}
   selector:
     matchLabels:
       app: {{ .Values.projectName }}
@@ -89,6 +95,8 @@ spec:
               path: /
               port: {{ index .Values.frontendPorts 0 | default 80 }}
             initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: 10${volumeMounts ? `
+          volumeMounts:${volumeMounts}` : ''}${volumes ? `
+      volumes:${volumes}` : ''}
 `.trim();
 };

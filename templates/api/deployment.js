@@ -1,3 +1,4 @@
+const { renderVolumes } = require('../generic/volumes.js');
 const { secretRefs, urlEncodedRef, alreadyEmitted } = require('../generic/env.js');
 const { dbUrlScheme } = require('../../utils/dbDefaults.js');
 module.exports = (config) => {
@@ -99,7 +100,9 @@ ${dbPasswordBlock}${dbUrlEnvBlock}${extraSecretEnvBlock}
               type: RuntimeDefault
 ${envBlock}` : '';
 
-  return `
+  const { pvcs, volumeMounts, volumes } = renderVolumes({ name: 'api', volumes: config.apiVolumes }, { mountIndent: 12, volumeIndent: 8 });
+
+  return `${pvcs}${pvcs ? '---\n' : ''}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -108,7 +111,9 @@ metadata:
     app: {{ .Values.projectName }}
     component: api
 spec:
-  replicas: {{ include "flarops.replicas" .Values.api.replicas }}
+  replicas: {{ include "flarops.replicas" .Values.api.replicas }}${volumes ? `
+  strategy:
+    type: Recreate` : ''}
   selector:
     matchLabels:
       app: {{ .Values.projectName }}
@@ -168,6 +173,8 @@ ${envBlock}
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
-{{- end }}
+{{- end }}${volumeMounts ? `
+          volumeMounts:${volumeMounts}` : ''}${volumes ? `
+      volumes:${volumes}` : ''}
 `.trim();
 };

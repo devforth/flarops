@@ -1,11 +1,6 @@
+const { renderStatefulVolumes } = require('../generic/volumes.js');
+const { databaseVolumes } = require('../../utils/dbDefaults.js');
 const { helmLiteral } = require('../generic/env.js');
-// Postgres 18+ images manage a per-version layout under /var/lib/postgresql: mount one level up.
-function getPostgresMajorVersion(image) {
-  const tag = (image || '').split(':')[1] || '';
-  const match = tag.match(/^(\d+)/);
-  return match ? parseInt(match[1], 10) : null;
-}
-
 // Readiness: Running is not accepting connections.
 function buildProbeCommand(dbType) {
   if (dbType === 'postgres' || dbType === 'postgresql') {
@@ -51,8 +46,8 @@ ${indent}  failureThreshold: 6`;
 }
 
 module.exports = (config) => {
+  const dbVolumes = renderStatefulVolumes(databaseVolumes(config.dbVolumes, config.dbType, config.images && config.images.db));
   let envBlock = '';
-  let volumeMountPath = '/var/lib/data';
 
   if (config.dbType === 'postgres' || config.dbType === 'postgresql') {
     envBlock = `
@@ -65,8 +60,6 @@ module.exports = (config) => {
                   key: ${config.dbPasswordKey}
             - name: POSTGRES_DB
               value: {{ .Values.database.name | quote }}`;
-    const pgMajorVersion = getPostgresMajorVersion(config.images && config.images.db);
-    volumeMountPath = (pgMajorVersion && pgMajorVersion >= 18) ? '/var/lib/postgresql' : '/var/lib/postgresql/data';
   } else if (config.dbType === 'mysql' || config.dbType === 'mariadb') {
     const prefix = config.dbType === 'mariadb' ? 'MARIADB' : 'MYSQL';
     envBlock = `
@@ -86,7 +79,6 @@ module.exports = (config) => {
                   name: {{ .Values.projectName }}-secrets
                   key: ${config.dbPasswordKey}
 {{- end }}`;
-    volumeMountPath = '/var/lib/mysql';
   } else if (config.dbType === 'mongodb') {
     envBlock = `
             - name: MONGO_INITDB_ROOT_USERNAME
@@ -98,7 +90,6 @@ module.exports = (config) => {
                   key: ${config.dbPasswordKey}
             - name: MONGO_INITDB_DATABASE
               value: {{ .Values.database.name | quote }}`;
-    volumeMountPath = '/data/db';
   }
 
   envBlock += `
@@ -193,9 +184,7 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           env:${envBlock}${renderProbes(config.dbType)}
-          volumeMounts:
-            - name: data
-              mountPath: ${volumeMountPath}${initFiles ? `
+          volumeMounts:${dbVolumes.mounts}${initFiles ? `
 {{- if .Values.dbCloneSource }}
             - name: db-init
               mountPath: /docker-entrypoint-initdb.d
@@ -222,14 +211,7 @@ spec:
         - name: db-init
           emptyDir: {}
 {{- end }}`}
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: [ "ReadWriteOnce" ]
-        resources:
-          requests:
-            storage: {{ .Values.database.storage | default "10Gi" }}
+  volumeClaimTemplates:${dbVolumes.claimTemplates}
 ${initConfigMap}`.trim();
 };
 

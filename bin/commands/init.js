@@ -11,7 +11,7 @@ const { generateFlaropsYaml } = require('../../utils/flaropsYaml.js');
 const { RESERVED_SERVICE_NAMES, MAX_SERVICE_NAME_WITH_DB } = require('../../utils/flaropsValidate.js');
 const writeTerraform = require('../../templates/terraform.js');
 const collectOperatorAnswers = require('./prompts.js');
-const { defaultUserFor, passwordKeyFor, defaultImageFor, urlSchemeOf, sameEngineScheme } = require('../../utils/dbDefaults.js');
+const { defaultUserFor, passwordKeyFor, defaultImageFor, urlSchemeOf, sameEngineScheme, databaseVolumes } = require('../../utils/dbDefaults.js');
 const { yamlEscapeDoubleQuoted, generateEnvString } = require('../../utils/yamlWrite.js');
 const { listComposeFiles, isVariantComposeFile, approveVariantComposeFile, composeBaseDir } = require('../../utils/composeFiles.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
@@ -785,6 +785,9 @@ module.exports = async function init() {
   let frontendEnv = {};
   let apiCommand = null;
   let apiBuildArgs = null;
+  // Named volumes compose gives the api and the frontend: their own persistence, as for any service.
+  let apiVolumes = [];
+  let frontendVolumes = [];
   let frontendBuildArgs = null;
   let frontendCommand = null;
   let sensitiveEnvContent = '';
@@ -950,11 +953,17 @@ module.exports = async function init() {
 
       // Named volumes on a built service are its own persistence; bind mounts are not carried (on an app
       // service they are usually the source tree).
-      if (matchedAdditionalServices.length > 0 && !isBackend && !isFrontend) {
+      {
         const { persistent, unparsed } = extractVolumes(block);
         for (const spec of unparsed) volumeWarnings.push(`${composeKey}: ${spec}`);
-        for (const s of matchedAdditionalServices) {
-          if (persistent.length > 0 && (!s.volumes || s.volumes.length === 0)) s.volumes = persistent.map(v => ({ ...v }));
+        if (isBackend) {
+          if (apiVolumes.length === 0) apiVolumes = persistent.map(v => ({ ...v }));
+        } else if (isFrontend) {
+          if (frontendVolumes.length === 0) frontendVolumes = persistent.map(v => ({ ...v }));
+        } else {
+          for (const s of matchedAdditionalServices) {
+            if (persistent.length > 0 && (!s.volumes || s.volumes.length === 0)) s.volumes = persistent.map(v => ({ ...v }));
+          }
         }
       }
 
@@ -1822,6 +1831,7 @@ AWS_REGION=${awsRegion}
       passwordKey,
       composeServiceName: serviceDb.composeServiceName || null
     };
+    s.db.volumes = databaseVolumes([], s.db.type, s.db.image);
     const ownDbCommand = await composeDbCommand(serviceDb.composeServiceName, `${s.name}.db`);
     if (ownDbCommand) s.db.command = ownDbCommand;
 
@@ -2337,6 +2347,8 @@ AWS_REGION=${awsRegion}
     dbLocalDockerfile: dbInfo.hasDb ? dbInfo.localDbDockerfile : null,
     dbContext: dbInfo.hasDb ? dbInfo.dbContext : null,
     dbCommand,
+    apiVolumes,
+    frontendVolumes,
     dbPasswordKey: finalDbPasswordKey,
     hasDbPassword,
     // The api's own URL variables, for its engine: a worker's MONGO_URI is not the api's database.
@@ -2348,6 +2360,9 @@ AWS_REGION=${awsRegion}
     apiHealthPort: backendInfo.healthPort || null,
     hasCloudflare: !!(cloudflareApiToken && cloudflareZoneId)
   };
+
+  // The data volume's path follows the image the chart will actually run (Postgres 18 moved it).
+  config.dbVolumes = config.hasDb ? databaseVolumes([], config.dbType, config.images.db) : [];
 
   // Recorded the way sync derives it from flarops.yaml, so the first sync changes nothing: CI passes
   // only the secrets some workload reads (the others are listed at the end, to be declared), and a

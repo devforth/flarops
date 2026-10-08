@@ -42,10 +42,10 @@ const BUILT_KEYS = ['dockerfile', 'context', 'replicas', 'oneShot', 'ports', 'bu
   'env', 'secretEnvs', 'volumes', 'healthRoute', 'healthPort', 'exposedRoutes', 'databaseUrls', 'db'];
 const KEYS = {
   api: ['dockerfile', 'context', 'replicas', 'ports', 'buildArgs', 'args', 'command', 'env', 'secretEnvs',
-    'healthRoute', 'healthPort', 'exposedRoutes', 'databaseUrls'],
-  frontend: ['dockerfile', 'context', 'replicas', 'ports', 'buildArgs', 'args', 'command', 'env', 'secretEnvs'],
-  database: ['image', 'dockerfile', 'context', 'replicas', 'port', 'user', 'name', 'type', 'command', 'secretEnvs'],
-  db: ['type', 'image', 'port', 'user', 'name', 'replicas', 'command', 'secretEnvs'],
+    'healthRoute', 'healthPort', 'exposedRoutes', 'databaseUrls', 'volumes'],
+  frontend: ['dockerfile', 'context', 'replicas', 'ports', 'buildArgs', 'args', 'command', 'env', 'secretEnvs', 'volumes'],
+  database: ['image', 'dockerfile', 'context', 'replicas', 'port', 'user', 'name', 'type', 'command', 'secretEnvs', 'volumes'],
+  db: ['type', 'image', 'port', 'user', 'name', 'replicas', 'command', 'secretEnvs', 'volumes'],
   built: BUILT_KEYS,
   support: ['image', 'replicas', 'oneShot', 'ports', 'command', 'env', 'secretEnvs', 'volumes'],
 };
@@ -154,7 +154,13 @@ function checkCommand(where, command) {
 }
 
 function checkVolumes(where, volumes) {
+  const seen = new Set();
   asList(volumes).forEach((v, i) => {
+    if (v && typeof v === 'object' && v.name !== undefined) {
+      const key = String(v.name).toLowerCase().replace(/[^a-z0-9-]/g, '-');
+      if (seen.has(key)) fail(`${where}[${i}].name`, `"${v.name}" is the same claim as another volume of this service - rename one`);
+      seen.add(key);
+    }
     if (!v || typeof v !== 'object') return; // shape errors are reported by the parser in sync
     checkKeys(`${where}[${i}]`, v, ['name', 'path', 'size']);
     // claimNameFor sanitizes the name; refuse only what would break the line.
@@ -226,6 +232,7 @@ function checkDatabase(where, db, { requireTypeAndPassword }) {
   }
   checkReplicas(`${where}.replicas`, db.replicas, 1);
   checkCommand(`${where}.command`, db.command);
+  checkVolumes(`${where}.volumes`, db.volumes);
   checkSecretEnvs(`${where}.secretEnvs`, db.secretEnvs);
   if (where === 'database') {
     checkRepoPath(`${where}.context`, db.context);

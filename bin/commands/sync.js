@@ -11,7 +11,8 @@ const { normalizeRoutes } = require('../../utils/routes.js');
 const { unmountedSecretKeys } = require('../../utils/secretWiring.js');
 const { validateDeclarations, validateRepositorySettings, validateSyncLock } = require('../../utils/flaropsValidate.js');
 const { isDockerHub } = require('../../utils/registry.js');
-const { defaultUserFor, defaultImageFor, defaultPortFor } = require('../../utils/dbDefaults.js');
+const { defaultUserFor, defaultImageFor, defaultPortFor, databaseVolumes } = require('../../utils/dbDefaults.js');
+const { claimNameFor } = require('../../templates/generic/volumes.js');
 const { renderChartTemplates, ChartConflict } = require('../../templates/chart.js');
 const renderValues = require('../../templates/values.yaml.js');
 const renderWerf = require('../../templates/werf.yaml.js');
@@ -193,6 +194,36 @@ function makeRecorder(changes) {
   };
 }
 
+// What a volume change means for data already on disk: a removed volume's claim stays (Helm keeps it,
+// as a StatefulSet does), and a new size does not reach a claim that exists - local-path cannot grow
+// one, and a StatefulSet's claim templates cannot change at all.
+function volumeNotes(label, before, after, claimOf, { statefulSet = false } = {}, notes) {
+  const prev = new Map((before || []).map(v => [v.name, v]));
+  const next = new Map((after || []).map(v => [v.name, v]));
+  for (const [name] of prev) {
+    if (!next.has(name)) {
+      notes.push(`${label}: volume "${name}" is no longer declared. Its claim ${claimOf(name)} and the data on it stay in the cluster - "kubectl delete pvc ${claimOf(name)}" once nothing needs it.`);
+    }
+  }
+  for (const [name, v] of next) {
+    const was = prev.get(name);
+    if (was && (was.size || '') !== (v.size || '')) {
+      notes.push(statefulSet
+        ? `${label}: volume "${name}" changed size (${was.size || 'default'} -> ${v.size || 'default'}). A deployed StatefulSet cannot change its claims, so the next deploy fails until you move the data: dump it, delete the StatefulSet and the claim ${claimOf(name)}, deploy, restore.`
+        : `${label}: volume "${name}" changed size (${was.size || 'default'} -> ${v.size || 'default'}). That applies to a new claim only - an existing ${claimOf(name)} keeps its size (local-path storage cannot grow one); move the data to a new claim to resize it.`);
+    }
+    if (was && was.target !== v.target) {
+      notes.push(`${label}: volume "${name}" is now mounted at ${v.target} (was ${was.target}). The data on it stays where it is on the disk; the container sees it at the new path.`);
+    }
+  }
+}
+
+function replicaNote(label, replicas, volumes, notes) {
+  if ((replicas ?? 1) > 1 && (volumes || []).length > 0) {
+    notes.push(`${label}: ${replicas} replicas share ReadWriteOnce volumes, which only pods on one node can mount - replicas the scheduler puts on another node stay Pending.`);
+  }
+}
+
 // An empty value ("KEY:") is an empty string, not the text "null".
 function envOf(decl) {
   const out = {};
@@ -200,7 +231,7 @@ function envOf(decl) {
   return out;
 }
 
-function applyPrimary(config, name, decl, set) {
+function applyPrimary(config, name, decl, set, notes) {
   const prefix = name === 'api' ? 'api' : 'frontend';
   const { secretKeys, extraSecretEnvMappings } = splitSecretEnvs(decl.secretEnvs);
   const cap = prefix[0].toUpperCase() + prefix.slice(1);
@@ -214,6 +245,10 @@ function applyPrimary(config, name, decl, set) {
   set(config, `${prefix}ExtraSecretEnvMappings`, extraSecretEnvMappings, `${name}.secretEnvs (renamed)`);
   set(config, `${prefix}Command`, decl.command ? asList(decl.command).map(String) : null, `${name}.command`);
   set(config, `${prefix}BuildArgs`, parseBuildArgs(buildArgsOf(decl)), `${name}.buildArgs`);
+  const volumes = parseVolumes(decl.volumes);
+  volumeNotes(name, config[`${prefix}Volumes`], volumes, (v) => claimNameFor(name, v), {}, notes);
+  set(config, `${prefix}Volumes`, volumes, `${name}.volumes`);
+  replicaNote(name, decl.replicas, volumes, notes);
   if (decl.dockerfile) set(config, `${prefix}Dockerfile`, String(decl.dockerfile), `${name}.dockerfile`);
   if (decl.context !== null && decl.context !== undefined) {
     set(config, prefix === 'api' ? 'backendPath' : 'frontendPath', String(decl.context), `${name}.context`);
@@ -231,7 +266,7 @@ function applyPrimary(config, name, decl, set) {
   set(config, `has${cap === 'Api' ? 'Backend' : 'Frontend'}`, true, `${name} present`);
 }
 
-function applyDatabase(config, decl, set) {
+function applyDatabase(config, decl, set, notes) {
   set(config, 'dbReplicas', decl.replicas, 'database.replicas');
   if (decl.image) set(config.images, 'db', String(decl.image), 'database.image');
   if (decl.dockerfile) {
@@ -246,6 +281,9 @@ function applyDatabase(config, decl, set) {
   if (decl.user) set(config, 'dbUser', String(decl.user), 'database.user');
   if (decl.name) set(config, 'dbName', String(decl.name), 'database.name');
   set(config, 'dbCommand', decl.command ? asList(decl.command).map(String) : null, 'database.command');
+  const volumes = databaseVolumes(parseVolumes(decl.volumes), config.dbType, config.images && config.images.db);
+  volumeNotes('database', config.dbVolumes, volumes, (v) => `${String(v).toLowerCase().replace(/[^a-z0-9-]/g, '-')}-database-0`, { statefulSet: true }, notes);
+  set(config, 'dbVolumes', volumes, 'database.volumes');
   // Every env name a database image reads its password under points at one Secret key, which is
   // all the chart needs. A second distinct key cannot be mounted; unmountedSecretKeys reports it.
   const distinctKeys = [...new Set(Object.values(decl.secretEnvs || {}).map(String))];
@@ -281,6 +319,7 @@ function ownDatabaseOf(name, declDb, previous) {
   };
   if (declDb.replicas !== null && declDb.replicas !== undefined) db.replicas = declDb.replicas;
   if (declDb.command) db.command = asList(declDb.command).map(String);
+  db.volumes = databaseVolumes(parseVolumes(declDb.volumes), type, db.image);
   if (previous && previous.composeServiceName) db.composeServiceName = previous.composeServiceName;
   return db;
 }
@@ -295,7 +334,10 @@ function applyService(service, decl, set, label, notes) {
     `${label}.secretEnvs (same name)`);
   set(service, 'extraSecretEnvMappings', extraSecretEnvMappings, `${label}.secretEnvs (renamed)`);
   set(service, 'exposedRoutes', normalizeRoutes(asList(decl.exposedRoutes)), `${label}.exposedRoutes`);
-  set(service, 'volumes', parseVolumes(decl.volumes), `${label}.volumes`);
+  const volumes = parseVolumes(decl.volumes);
+  volumeNotes(label, service.volumes, volumes, (v) => claimNameFor(label, v), {}, notes);
+  set(service, 'volumes', volumes, `${label}.volumes`);
+  replicaNote(label, decl.replicas, volumes, notes);
   set(service, 'oneShot', !!decl.oneShot, `${label}.oneShot`);
   set(service, 'healthRoute', decl.healthRoute, `${label}.healthRoute`);
   set(service, 'healthPort', decl.healthPort, `${label}.healthPort`);
@@ -309,7 +351,11 @@ function applyService(service, decl, set, label, notes) {
 
   const previousOwn = service.db && !service.db.shared ? service.db : null;
   if (decl.db) {
-    set(service, 'db', ownDatabaseOf(label, decl.db, previousOwn), `${label}.db`);
+    const own = ownDatabaseOf(label, decl.db, previousOwn);
+    if (previousOwn) {
+      volumeNotes(`${label}.db`, previousOwn.volumes, own.volumes, (v) => `${String(v).toLowerCase().replace(/[^a-z0-9-]/g, '-')}-${label}-db-0`, { statefulSet: true }, notes);
+    }
+    set(service, 'db', own, `${label}.db`);
   } else if (previousOwn) {
     set(service, 'db', null, `${label}.db removed`);
     notes.push(`${label}'s own database is removed from the chart. Its data volume (PVC data-${label}-db-0) stays in the cluster until you delete it - "kubectl delete pvc data-${label}-db-0" once nothing needs it.`);
@@ -416,7 +462,7 @@ function applyDeclarations(state, declared, repository = null) {
   if (!declared.has('frontend')) set(config, 'hasFrontend', false, 'frontend removed');
   if (declared.has('database')) {
     set(config, 'hasDb', true, 'database present');
-    applyDatabase(config, declared.get('database'), set);
+    applyDatabase(config, declared.get('database'), set, notes);
   } else {
     set(config, 'hasDb', false, 'database removed');
     set(config, 'dbType', null, 'database removed');
@@ -427,7 +473,7 @@ function applyDeclarations(state, declared, repository = null) {
 
   for (const [name, decl] of declared) {
     if (name === 'database') continue;
-    if (name === 'api' || name === 'frontend') { applyPrimary(config, name, decl, set); continue; }
+    if (name === 'api' || name === 'frontend') { applyPrimary(config, name, decl, set, notes); continue; }
 
     const isBuilt = !!decl.dockerfile;
     const list = isBuilt ? (config.additionalServices ||= []) : (config.supportServices ||= []);

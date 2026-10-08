@@ -1,5 +1,6 @@
 // One PersistentVolumeClaim per declared volume. The size is written into the claim, not values.yaml:
-// a bound PVC cannot be shrunk.
+// a bound PVC cannot be shrunk. Helm keeps the claim when the volume leaves flarops.yaml, so removing
+// a line never deletes data.
 const DEFAULT_SIZE = '5Gi';
 
 function claimNameFor(serviceName, volumeName) {
@@ -25,6 +26,8 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: ${claimName}
+  annotations:
+    "helm.sh/resource-policy": keep
   labels:
     app: {{ .Values.projectName }}
     component: ${service.name}
@@ -46,4 +49,27 @@ ${volumePad}    claimName: ${claimName}`;
   return { pvcs, volumeMounts, volumes };
 }
 
-module.exports = { renderVolumes, claimNameFor, DEFAULT_SIZE };
+// A StatefulSet's volumes: one claim template per volume (Kubernetes names the claims
+// <volume>-<statefulset>-<ordinal> and keeps them when the StatefulSet goes) and its mounts.
+function renderStatefulVolumes(volumes, { mountIndent = 12 } = {}) {
+  const pad = ' '.repeat(mountIndent);
+  let mounts = '';
+  let claimTemplates = '';
+  for (const v of volumes) {
+    const name = String(v.name).toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    mounts += `
+${pad}- name: ${name}
+${pad}  mountPath: {{ ${JSON.stringify(String(v.target))} | quote }}`;
+    claimTemplates += `
+    - metadata:
+        name: ${name}
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: "${String(v.size || DEFAULT_SIZE).replace(/"/g, '')}"`;
+  }
+  return { mounts, claimTemplates };
+}
+
+module.exports = { renderVolumes, renderStatefulVolumes, claimNameFor, DEFAULT_SIZE };

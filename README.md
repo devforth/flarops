@@ -238,7 +238,9 @@ Without `stripPrefix`, your service receives `/api/users` and answers 404.
       size: 20Gi          # optional, 5Gi by default
 ```
 
-A volume makes the service restart by stopping the old pod before starting the new one, because two pods cannot hold the same disk.
+Any block takes `volumes`: `api`, `frontend`, every service, `database` and a service's `db:`. A volume makes the service restart by stopping the old pod before starting the new one, because two pods cannot hold the same disk; for the same reason replicas on different machines cannot share it, and sync warns about `replicas` above 1 with a volume.
+
+The data outlives the lines that declare it. Removing a volume from `flarops.yaml` leaves its claim and data in the cluster — sync names the claim to delete once you are sure. A new `size` applies to a new claim only: local-path storage cannot grow a disk that exists, so moving the data to a bigger one is a manual step. A pull-request environment starts with empty volumes; only the database is copied into it.
 
 **`healthRoute`** and **`healthPort`** — the path Kubernetes calls to decide whether your service is alive. Set them if the service has a health endpoint; leave them out otherwise.
 
@@ -292,6 +294,21 @@ reporting:
 It gets its own StatefulSet and its own storage. Only `type` and `secretEnvs` are required; `image`, `port`, `user` and `name` default to the engine's (`name` to `<service>db`). Removing `db:` removes the database from the chart — its data volume stays in the cluster until you delete it, and sync says so.
 
 For any database, `replicas` is 0 or 1: more would be separate databases, each with its own data, behind one address. `port` changes the address other services use; the server keeps listening on its engine's port.
+
+A database's own disk is the volume named `data`, which `init` writes out with the engine's path and 10Gi:
+
+```yaml
+database:
+  type: postgres
+  volumes:
+    - name: data
+      path: /var/lib/postgresql   # where the image keeps its data
+      size: 20Gi
+    - name: archive               # any other entry is an extra disk
+      path: /archive
+```
+
+It is always there: left out, it comes back with the defaults, so a database never runs without a disk. Its size cannot change once the database is deployed — Kubernetes does not let a StatefulSet change its disks, and the next deploy fails until you move the data (dump, delete the StatefulSet and its claim, deploy, restore); sync says so when the size changes.
 
 ### Database server settings
 

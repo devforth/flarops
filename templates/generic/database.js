@@ -1,19 +1,15 @@
+const { renderStatefulVolumes } = require('./volumes.js');
+const { databaseVolumes } = require('../../utils/dbDefaults.js');
 const { defaultPortFor } = require('../../utils/dbDefaults.js');
-function getPostgresMajorVersion(image) {
-  const tag = (image || '').split(':')[1] || '';
-  const match = tag.match(/^(\d+)/);
-  return match ? parseInt(match[1], 10) : null;
-}
-
 // A dedicated database for one additional service; mirrors templates/database/deployment.js.
 const { renderProbes } = require('../database/deployment.js');
 
 module.exports = (service) => {
   const db = service.db;
+  const dbVolumes = renderStatefulVolumes(databaseVolumes(db.volumes, db.type, db.image));
   const resourceName = `${service.name}-db`;
 
   let envBlock = '';
-  let volumeMountPath = '/var/lib/data';
 
   if (db.type === 'postgres' || db.type === 'postgresql') {
     envBlock = `
@@ -26,8 +22,6 @@ module.exports = (service) => {
                   key: ${db.passwordKey}
             - name: POSTGRES_DB
               value: {{ $svcDb.name | quote }}`;
-    const pgMajorVersion = getPostgresMajorVersion(db.image);
-    volumeMountPath = (pgMajorVersion && pgMajorVersion >= 18) ? '/var/lib/postgresql' : '/var/lib/postgresql/data';
   } else if (db.type === 'mysql' || db.type === 'mariadb') {
     const prefix = db.type === 'mariadb' ? 'MARIADB' : 'MYSQL';
     envBlock = `
@@ -47,7 +41,6 @@ module.exports = (service) => {
                   name: {{ .Values.projectName }}-secrets
                   key: ${db.passwordKey}
 {{- end }}`;
-    volumeMountPath = '/var/lib/mysql';
   } else if (db.type === 'mongodb') {
     envBlock = `
             - name: MONGO_INITDB_ROOT_USERNAME
@@ -59,7 +52,6 @@ module.exports = (service) => {
                   key: ${db.passwordKey}
             - name: MONGO_INITDB_DATABASE
               value: {{ $svcDb.name | quote }}`;
-    volumeMountPath = '/data/db';
   }
 
   return `
@@ -131,16 +123,7 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           env:${envBlock}${renderProbes(db.type)}
-          volumeMounts:
-            - name: data
-              mountPath: ${volumeMountPath}
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: [ "ReadWriteOnce" ]
-        resources:
-          requests:
-            storage: {{ $svcDb.storage | default "10Gi" }}
+          volumeMounts:${dbVolumes.mounts}
+  volumeClaimTemplates:${dbVolumes.claimTemplates}
 `.trim();
 };
