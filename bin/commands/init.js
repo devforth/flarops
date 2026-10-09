@@ -2525,31 +2525,15 @@ appVersion: "1.0.0"
     console.log('Added the Flarops section to AGENTS.md (CLAUDE.md imports it): coding agents read how to change the deployment on their own.');
   }
 
-  const dashboardSourceDir = path.join(__dirname, '../../dashboard');
   const dashboardDestDir = path.join(deployDir, 'dashboard');
-  if (fs.existsSync(dashboardSourceDir)) {
-    // Sources only: no locally built binary, no tests, no SQLite runtime state. Comments are stripped.
-    fs.cpSync(dashboardSourceDir, dashboardDestDir, {
-      recursive: true,
-      filter: (src) => {
-        const base = path.basename(src);
-        if (base === 'dashboard' && src !== dashboardSourceDir && !fs.statSync(src).isDirectory()) return false;
-        if (base.endsWith('_test.go')) return false;
-        if (/\.db(-wal|-shm)?$/.test(base)) return false;
-        return true;
-      },
-    });
-    const { stripGoComments, stripHashComments, stripHtmlComments } = require('../../utils/stripComments.js');
-    const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true })
-      .flatMap(e => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
-    for (const file of walk(dashboardDestDir)) {
-      const strip = file.endsWith('.go') ? stripGoComments
-        : path.basename(file) === 'Dockerfile' ? stripHashComments
-          : file.endsWith('.html') ? stripHtmlComments : null;
-      if (strip) fs.writeFileSync(file, strip(fs.readFileSync(file, 'utf8')));
+  const dashboardFiles = require('../../utils/dashboardFiles.js').renderDashboardFiles(dashboardDestDir);
+  if (dashboardFiles.length > 0) {
+    for (const f of dashboardFiles) {
+      fs.mkdirSync(path.dirname(f.file), { recursive: true });
+      fs.writeFileSync(f.file, f.content);
     }
   } else {
-    console.warn("Dashboard source directory not found: " + dashboardSourceDir);
+    console.warn("Dashboard source directory not found next to Flarops - deploy/dashboard was not written.");
   }
 
   if (dashboardPassword) {

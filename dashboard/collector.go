@@ -204,21 +204,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 			}
 		}
 
-		// Ready, uncordoned and without a NoSchedule taint.
-		ready := false
-		for _, cond := range n.Status.Conditions {
-			if cond.Type == corev1.NodeReady {
-				ready = cond.Status == corev1.ConditionTrue
-				break
-			}
-		}
-		schedulable := ready && !n.Spec.Unschedulable
-		for _, taint := range n.Spec.Taints {
-			if taint.Effect == corev1.TaintEffectNoSchedule || taint.Effect == corev1.TaintEffectNoExecute {
-				schedulable = false
-				break
-			}
-		}
+		schedulable := schedulableForCapsules(n)
 
 		instanceType := defaultInstanceType
 		if t, ok := n.Labels["flarops.com/instance-type"]; ok && t != "" {
@@ -473,4 +459,31 @@ func getCapsuleDomain(ns, baseDomain string) string {
 		return baseDomain
 	}
 	return ns + "." + baseDomain
+}
+
+// CapsuleTaint keeps everything but PR capsules off worker nodes; capsule pods tolerate it.
+const CapsuleTaint = "flarops.io/capsule"
+
+// Whether a capsule can be placed on the node: Ready, uncordoned, and without a NoSchedule or
+// NoExecute taint other than the capsule taint, which capsules tolerate.
+func schedulableForCapsules(n *corev1.Node) bool {
+	ready := false
+	for _, cond := range n.Status.Conditions {
+		if cond.Type == corev1.NodeReady {
+			ready = cond.Status == corev1.ConditionTrue
+			break
+		}
+	}
+	if !ready || n.Spec.Unschedulable {
+		return false
+	}
+	for _, taint := range n.Spec.Taints {
+		if taint.Key == CapsuleTaint {
+			continue
+		}
+		if taint.Effect == corev1.TaintEffectNoSchedule || taint.Effect == corev1.TaintEffectNoExecute {
+			return false
+		}
+	}
+	return true
 }

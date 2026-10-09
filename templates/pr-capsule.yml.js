@@ -116,6 +116,9 @@ module.exports = function prCapsuleYmlTemplate(config) {
   if (config.additionalServices && config.additionalServices.length > 0) requiredMi += config.additionalServices.length * 128;
   if (requiredMi === 0) requiredMi = 256;
 
+  // A worker added for a capsule takes that capsule: asking for "any node with room" right after the
+  // join let a capsule land back on a server whose free memory happened to cross the line, leaving the
+  // new worker idle. The oracle is still asked, so the space is reserved once the worker is measured.
   // Teardown runs on pull_request_target: GitHub runs pull_request workflows only while a PR merges
   // cleanly, so a PR closed with a conflict would leave its capsule behind. It checks out the base
   // branch and runs no code from the PR.
@@ -344,19 +347,20 @@ ${ciSsh.slotLock()}
             flarops_ssh "$EC2_IP" "sudo k3s kubectl wait --for=condition=Ready node/\${NEW_NODE} --timeout=240s"
 
             TARGET_NODE=""
-            for attempt in 1 2 3 4 5 6 7 8; do
+            for attempt in $(seq 1 16); do
               sleep 15
               OUT=$(ask_capacity 2>/dev/null || true)
-              if [ "$(printf '%s' "$OUT" | head -1)" = "yes" ]; then
-                TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
+              if [ "$(printf '%s' "$OUT" | head -1)" = "yes" ] && [ "$(printf '%s' "$OUT" | sed -n 's/^node=//p')" = "$NEW_NODE" ]; then
+                TARGET_NODE="$NEW_NODE"
                 echo "$OUT"
                 break
               fi
+              echo "  waiting for the dashboard to measure $NEW_NODE ($attempt/16)"
             done
 
             if [ -z "$TARGET_NODE" ]; then
-              echo "::error::A worker was added but no node reports room for this capsule. Not deploying onto a node that cannot hold it."
-              exit 1
+              echo "::warning::The dashboard has not reported room on $NEW_NODE yet - placing the capsule there anyway: the worker was added for it and runs nothing else."
+              TARGET_NODE="$NEW_NODE"
             fi
           fi
 

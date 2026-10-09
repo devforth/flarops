@@ -468,6 +468,23 @@ pinger:
     check('back to the original after the volume checks', r.status === 0, r.err || r.out);
   }
 
+  // 3h. The dashboard is Flarops' code: sync brings it up to date and leaves local build output alone.
+  {
+    const collector = path.join(dir, 'deploy/dashboard/collector.go');
+    const current = read(dir, 'deploy/dashboard/collector.go');
+    fs.writeFileSync(collector, current.replace('schedulableForCapsules', 'oldSchedulable'));
+    fs.writeFileSync(path.join(dir, 'deploy/dashboard/obsolete.go'), 'package main\n');
+    fs.writeFileSync(path.join(dir, 'deploy/dashboard/flarops_metrics.db'), 'local');
+    r = runSync(dir);
+    check('sync brings an outdated dashboard source up to date', r.status === 0 && read(dir, 'deploy/dashboard/collector.go') === current, r.err || r.out);
+    check('and removes a source this version no longer ships', !exists(dir, 'deploy/dashboard/obsolete.go') && /obsolete\.go \(removed/.test(r.out), r.out);
+    check('but leaves a local run\'s database', exists(dir, 'deploy/dashboard/flarops_metrics.db'));
+    check('the binary loader image stays byte for byte', fs.readFileSync(path.join(dir, 'deploy/dashboard/static/loader.gif')).equals(fs.readFileSync(path.join(__dirname, '..', 'dashboard/static/loader.gif'))));
+    fs.unlinkSync(path.join(dir, 'deploy/dashboard/flarops_metrics.db'));
+    r = runSync(dir);
+    check('a current dashboard is nothing to do', /nothing to do/.test(r.out), r.out);
+  }
+
   // 3f. The Flarops section of AGENTS.md is kept current; the rest of the file is left alone.
   {
     const agentsFile = path.join(dir, 'AGENTS.md');

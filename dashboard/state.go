@@ -31,7 +31,8 @@ type CapsuleState struct {
 
 type HostState struct {
 	ID string `json:"id"`
-	// Cordoned, NotReady or NoSchedule-tainted nodes still report full capacity.
+	// Cordoned, NotReady or NoSchedule-tainted nodes still report full capacity. The capsule taint
+	// on workers does not count: capsules tolerate it.
 	Schedulable bool `json:"schedulable"`
 	// Unmeasured reads as idle.
 	MetricsKnown bool   `json:"metricsKnown"`

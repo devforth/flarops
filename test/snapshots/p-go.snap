@@ -653,19 +653,20 @@ jobs:
             flarops_ssh "$EC2_IP" "sudo k3s kubectl wait --for=condition=Ready node/${NEW_NODE} --timeout=240s"
 
             TARGET_NODE=""
-            for attempt in 1 2 3 4 5 6 7 8; do
+            for attempt in $(seq 1 16); do
               sleep 15
               OUT=$(ask_capacity 2>/dev/null || true)
-              if [ "$(printf '%s' "$OUT" | head -1)" = "yes" ]; then
-                TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
+              if [ "$(printf '%s' "$OUT" | head -1)" = "yes" ] && [ "$(printf '%s' "$OUT" | sed -n 's/^node=//p')" = "$NEW_NODE" ]; then
+                TARGET_NODE="$NEW_NODE"
                 echo "$OUT"
                 break
               fi
+              echo "  waiting for the dashboard to measure $NEW_NODE ($attempt/16)"
             done
 
             if [ -z "$TARGET_NODE" ]; then
-              echo "::error::A worker was added but no node reports room for this capsule. Not deploying onto a node that cannot hold it."
-              exit 1
+              echo "::warning::The dashboard has not reported room on $NEW_NODE yet - placing the capsule there anyway: the worker was added for it and runs nothing else."
+              TARGET_NODE="$NEW_NODE"
             fi
           fi
 

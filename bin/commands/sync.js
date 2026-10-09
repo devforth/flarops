@@ -19,6 +19,7 @@ const renderWerf = require('../../templates/werf.yaml.js');
 const renderDeployWorkflow = require('../../templates/deploy.yml.js');
 const renderPrCapsuleWorkflow = require('../../templates/pr-capsule.yml.js');
 const { AGENTS_BLOCK, withBlock, hasBlock } = require('../../utils/agentsDoc.js');
+const { renderDashboardFiles, included: includedInDashboard } = require('../../utils/dashboardFiles.js');
 
 // Defaults a newly declared service starts from before the author's values are laid over them.
 const SERVICE_DEFAULTS = Object.freeze({
@@ -644,6 +645,20 @@ module.exports = async function sync() {
     process.exit(1);
   }
 
+  const dashboardDir = path.join(currentDir, 'deploy', 'dashboard');
+  const dashboardFiles = renderDashboardFiles(dashboardDir);
+  // Files a previous version shipped and this one does not: a stale .go file would break the build.
+  const dashboardStale = [];
+  if (dashboardFiles.length > 0 && fs.existsSync(dashboardDir)) {
+    const wanted = new Set(dashboardFiles.map(f => f.file));
+    const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true })
+      .flatMap(e => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
+    // Only what could be a dashboard source: a local build's binary or SQLite file stays.
+    for (const file of walk(dashboardDir)) {
+      if (!wanted.has(file) && includedInDashboard(path.relative(dashboardDir, file))) dashboardStale.push(file);
+    }
+  }
+
   // The Flarops section of AGENTS.md follows this version of Flarops; the rest of the file is the project's.
   const agentsDocs = [];
   {
@@ -658,9 +673,15 @@ module.exports = async function sync() {
     { file: path.join(currentDir, 'werf.yaml'), content: werfYaml },
     ...workflows,
     ...agentsDocs,
+    // The dashboard is Flarops' own code: a fix in it reaches the project with the next sync.
+    ...dashboardFiles,
   ];
   // Line endings are not a difference: a checkout with autocrlf would otherwise be rewritten each time.
-  const differs = (o) => !fs.existsSync(o.file) || fs.readFileSync(o.file, 'utf8').replace(/\r\n/g, '\n') !== o.content;
+  const differs = (o) => {
+    if (!fs.existsSync(o.file)) return true;
+    if (Buffer.isBuffer(o.content)) return !fs.readFileSync(o.file).equals(o.content);
+    return fs.readFileSync(o.file, 'utf8').replace(/\r\n/g, '\n') !== o.content;
+  };
   const toWrite = outputs.filter(o => !locked.has(relative(o.file)) && differs(o));
   // A locked file is reported only when what sync renders for it changed - not merely because it was edited.
   const heldBack = outputs
@@ -668,7 +689,7 @@ module.exports = async function sync() {
     .filter(o => (previousRender && previousRender.has(o.file) ? previousRender.get(o.file) !== o.content : differs(o)))
     .map(o => relative(o.file));
 
-  if (changes.length === 0 && toWrite.length === 0 && orphans.length === 0) {
+  if (changes.length === 0 && toWrite.length === 0 && orphans.length === 0 && dashboardStale.length === 0) {
     console.log('Deployment already matches flarops.yaml - nothing to do.');
     if (heldBack.length > 0) {
       console.warn(`\x1b[33mWARNING: syncLock kept these files as they are, so what changed in them did not reach them: ${heldBack.join(', ')}.\x1b[0m`);
@@ -685,10 +706,15 @@ module.exports = async function sync() {
   } else {
     console.log('flarops.yaml is unchanged; these files are rewritten from this version of Flarops\' templates:');
     for (const o of toWrite) console.log(`  ${relative(o.file)}`);
+    for (const file of dashboardStale) console.log(`  ${relative(file)} (removed: no longer part of the dashboard)`);
   }
   console.log('');
 
-  for (const o of toWrite) fs.writeFileSync(o.file, o.content);
+  for (const o of toWrite) {
+    fs.mkdirSync(path.dirname(o.file), { recursive: true });
+    fs.writeFileSync(o.file, o.content);
+  }
+  for (const file of dashboardStale) fs.unlinkSync(file);
   writeState(currentDir, config);
 
   for (const f of orphans) fs.unlinkSync(path.join(templatesDir, f));
