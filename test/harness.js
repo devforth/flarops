@@ -24,9 +24,14 @@ const ANSWERS = {
   'want to use it': 'y',
 };
 
+// Every question asked in the last generation, in order.
+let asked = [];
+
 function installStubs(extraAnswers) {
+  asked = [];
   readline.createInterface = () => ({
     question(q, cb) {
+      asked.push(String(q).replace(/\x1b\[[0-9;]*m/g, ''));
       let answer = '';
       for (const [needle, value] of Object.entries({ ...ANSWERS, ...(extraAnswers || {}) })) {
         if (q.includes(needle)) { answer = value; break; }
@@ -94,7 +99,8 @@ async function generate(fixtureDir, extraAnswers, options = {}) {
   try {
     delete require.cache[require.resolve(path.join(REPO, 'bin/commands/init.js'))];
     const init = require(path.join(REPO, 'bin/commands/init.js'));
-    await init();
+    // Verbose by default, so the checks can read what init found; options.verbose false is the plain run.
+    await init({ verbose: options.verbose !== false });
   } catch (e) {
     ok = false;
     error = e;
@@ -105,7 +111,7 @@ async function generate(fixtureDir, extraAnswers, options = {}) {
     restoreErr();
   }
 
-  return { dir: work, parent, log: lines.join(''), ok, error };
+  return { dir: work, parent, log: lines.join(''), ok, error, questions: asked.slice() };
 }
 
 module.exports = { generate };

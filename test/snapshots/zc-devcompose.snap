@@ -30,6 +30,7 @@
   deploy/dashboard/state.go
   deploy/dashboard/static/index.html
   deploy/dashboard/static/loader.gif
+  deploy/flarops-init.log
   deploy/helm/Chart.yaml
   deploy/helm/templates/01-ingress.yaml
   deploy/helm/templates/_helpers.tpl
@@ -1031,6 +1032,7 @@ override.tf.json
 *_override.tf.json
 *tfplan*
 deploy/helm/flarops-ci-values.json
+deploy/flarops-init.log
 
 # ===== AGENTS.md
 <!-- flarops:begin - managed by flarops: "flarops sync" rewrites this block, edits inside it are lost -->

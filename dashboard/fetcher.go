@@ -94,6 +94,11 @@ func startPriceFetcher() {
 				continue
 			}
 			failures = 0
+			if n, err := repriceSamples(); err != nil {
+				log.Println("could not correct samples counted at the fallback price:", err)
+			} else if n > 0 {
+				log.Printf("corrected %d samples counted at the fallback EC2 price", n)
+			}
 			time.Sleep(30 * 24 * time.Hour) // prices move slowly; once a month is enough
 		}
 	}()

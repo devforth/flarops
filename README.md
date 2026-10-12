@@ -362,7 +362,7 @@ This is the one part you do by hand, so it is worth seeing whole.
 
    ```
    1. Create these 8 GitHub repository secrets before the first deploy
-      (Settings -> Secrets and variables -> Actions). Values are in deploy/.env, without their quotes:
+      (Settings -> Secrets and variables -> Actions); values in deploy/.env, without quotes:
         AWS_ACCESS_KEY_ID  (infrastructure)
         JWT_SECRET
         RPK_PASS  <- give it the SAME value as REDPANDA_PASSWORD
@@ -387,7 +387,7 @@ After `init`, follow **`FLAROPS.md`** — it is written for your project (its do
 
 ## What `init` asks you
 
-It first says the project name it took from the directory (it names the image repository, the namespaces and the state bucket) and checks its tools: without `docker` the registry login is not checked; without the AWS CLI it offers to install a signature-verified copy into `~/.local` (Linux x86_64 and arm64; elsewhere it says how to install it and stops). Nothing is written until the questions are answered — stopping at one leaves the repository as it was.
+It first says the project name it took from the directory (it names the image repository, the namespaces and the state bucket) and checks its tools: without `docker` the registry login is not checked; without the AWS CLI it offers to install a signature-verified copy into `~/.local` (Linux x86_64 and arm64; elsewhere it says how to install it and stops). Every question comes before the work: an unconventionally named compose file first (it decides what is analysed), then the values below, then the changes to your code — after the last answer, init runs to the end on its own. Nothing is written until the questions are answered — stopping at one leaves the repository as it was.
 
 ### Values it collects
 
@@ -438,7 +438,7 @@ Each ends with `Apply it? [Y/n]`. When a listed file has uncommitted changes, it
 - **Generates a dashboard password**, shows it once, and stores only its hash. A lost one is replaced with `npx flarops dashboard-password`.
 - **Creates `.dockerignore`** if any service builds from the repository root, to keep `deploy/`, `.env` and `.keys/` out of your images.
 
-It ends with what needs your attention — warnings for anything it could not resolve — and then a numbered list of next steps: the GitHub secrets to create, `git diff`, commit and push, DNS, and the addresses to open. Without a terminal (an agent, CI) or with `NO_COLOR` set, the output has no colour codes.
+The screen holds only the questions, what needs your attention — warnings for anything it could not resolve — and then a numbered list of next steps: the GitHub secrets to create, `git diff`, commit and push, DNS, and the addresses to open. What it found and decided along the way (services, routes, database keys, files written) goes to `deploy/flarops-init.log`, which git ignores; `npx flarops init --verbose` prints it too. Without a terminal (an agent, CI) or with `NO_COLOR` set, the output has no colour codes.
 
 ## What gets generated
 

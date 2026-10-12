@@ -267,6 +267,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 			CpuUsed:        cpuUsed,
 			Rate:           hourlyRate,
 			PriceKnown:     priceKnown,
+			EC2Rate:        ec2Rate,
 			Capsules:       []CapsuleState{},
 		}
 		hostMap[n.Name] = h
@@ -405,7 +406,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	data.Spend.Notes = []string{"An estimate from on-demand prices: EC2 instances, their gp3 disks and public IPv4 addresses. " +
 		"Traffic, snapshots, S3, the image registry and Cloudflare are not included, and minutes the dashboard was not running are not counted."}
 	for _, what := range sortedKeys(unpriced) {
-		data.Spend.Notes = append(data.Spend.Notes, fmt.Sprintf("No EC2 price for %s yet (the price feed has not loaded, or does not list it) - counted at $%.4f/h until it does.", what, fallbackEC2HourlyRate))
+		data.Spend.Notes = append(data.Spend.Notes, fmt.Sprintf("No EC2 price for %s yet (the price feed has not loaded, or does not list it) - counted at $%.4f/h until it does, then corrected.", what, fallbackEC2HourlyRate))
 	}
 	for _, region := range sortedKeys(unpricedDisk) {
 		data.Spend.Notes = append(data.Spend.Notes, fmt.Sprintf("No gp3 disk price for %s - counted at us-east-1's $0.08/GB-month.", region))
@@ -414,7 +415,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	if shouldSnapshot {
 		nowTs := time.Now()
 		for _, h := range data.Hosts {
-			recordHostSample(nowTs, h.ID, h.Rate)
+			recordHostSample(nowTs, h)
 			for _, c := range h.Capsules {
 				recordCapsuleSample(nowTs, c.ID, h.ID, c.Ram)
 			}

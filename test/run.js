@@ -437,7 +437,7 @@ async function urlBreakingPasswordSurvives() {
     const expectedLog = path.join(FIXTURES, name, 'expected-log.txt');
     if (fs.existsSync(expectedLog)) {
       for (const line of fs.readFileSync(expectedLog, 'utf8').split('\n').map(l => l.trim()).filter(Boolean)) {
-        check(`says: ${line.slice(0, 60)}`, result.log.replace(/\x1b\[[0-9;]*m/g, '').includes(line),
+        check(`says: ${line.slice(0, 60)}`, result.log.replace(/\x1b\[[0-9;]*m/g, '').replace(/\s+/g, ' ').includes(line.replace(/\s+/g, ' ')),
           result.log.split('\n').filter(l => /WARNING|INFO/.test(l)).join('\n').slice(0, 400));
       }
     }
@@ -560,9 +560,50 @@ async function urlBreakingPasswordSurvives() {
     // Files git does not ignore go in with the next "git add .": their values are as public as committed ones.
     const result = await generate(path.join(FIXTURES, 'k-support'), undefined, { commit: false });
     check('generates', result.ok, result.error && result.error.stack);
-    check('an uncommitted, unignored value is withheld like a committed one', /RABBITMQ_DEFAULT_PASS  <- needs a real value \(not the one in docker-compose\.yml: committed to git \(or not git-ignored/.test(result.log.replace(/\x1b\[[0-9;]*m/g, '')),
+    check('an uncommitted, unignored value is withheld like a committed one', /RABBITMQ_DEFAULT_PASS <- needs a real value \(not the one in docker-compose\.yml: committed to git \(or not git-ignored/.test(result.log.replace(/\x1b\[[0-9;]*m/g, '').replace(/\s+/g, ' ')),
       result.log.split('\n').filter(l => /WARNING/.test(l)).join('\n').slice(0, 600));
     fs.rmSync(result.parent, { recursive: true, force: true });
+  }
+
+  console.log('\n  init output');
+  {
+    const plain = await generate(path.join(FIXTURES, 'a-full'), {}, { verbose: false });
+    const out = plain.log.replace(/\x1b\[[0-9;]*m/g, '');
+    const logFile = path.join(plain.dir, 'deploy', 'flarops-init.log');
+    check('without --verbose, what init found stays off the screen', plain.ok && !/INFO:|Created \.gitignore|Discovered/.test(out), out.slice(0, 600));
+    check('and is written to deploy/flarops-init.log, which git ignores',
+      fs.existsSync(logFile) && /INFO:/.test(fs.readFileSync(logFile, 'utf8')) && /deploy\/flarops-init\.log/.test(fs.readFileSync(path.join(plain.dir, '.gitignore'), 'utf8')),
+      fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').slice(0, 300) : 'no log file');
+    check('the screen ends with the next steps and where the details are', /Next steps/.test(out) && /deploy\/flarops-init\.log\s*$/.test(out), out.slice(-300));
+    check('no line is longer than 100 characters', out.split('\n').every(l => l.length <= 100), out.split('\n').filter(l => l.length > 100).join('\n').slice(0, 400));
+    fs.rmSync(plain.parent, { recursive: true, force: true });
+  }
+
+  console.log('\n  question order');
+  {
+    // A project that triggers every kind of question: an unconventional compose file, a frontend
+    // calling the backend at a hardcoded address, and lowercase database variables in the backend.
+    const src = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-test-'));
+    const proj = path.join(src, 'qorder');
+    fs.mkdirSync(path.join(proj, 'backend'), { recursive: true });
+    fs.mkdirSync(path.join(proj, 'frontend', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'docker-compose.local.yml'), 'services:\n  db:\n    image: postgres:16\n    environment:\n      POSTGRES_PASSWORD: pw\n  api:\n    build: ./backend\n    ports: ["4000:4000"]\n  web:\n    build: ./frontend\n    ports: ["3000:3000"]\n');
+    fs.writeFileSync(path.join(proj, 'backend', 'Dockerfile'), 'FROM node:20\nCMD ["node", "index.js"]\n');
+    fs.writeFileSync(path.join(proj, 'backend', 'package.json'), '{"name":"api","dependencies":{"express":"4","pg":"8"}}');
+    fs.writeFileSync(path.join(proj, 'backend', 'index.js'), "const { Client } = require('pg');\nnew Client({ host: process.env.db_host, user: process.env.db_user, database: process.env.db_name, password: process.env.db_password });\nrequire('express')().listen(4000);\n");
+    fs.writeFileSync(path.join(proj, 'frontend', 'Dockerfile'), 'FROM node:20\nCMD ["npm", "start"]\n');
+    fs.writeFileSync(path.join(proj, 'frontend', 'package.json'), '{"name":"web","dependencies":{"react":"18","vite":"5"}}');
+    fs.writeFileSync(path.join(proj, 'frontend', 'src', 'api.js'), "export const load = () => fetch('http://localhost:4000/api/items');\n");
+    const r = await generate(proj, { 'Base the deployment on it': 'y', 'Apply it?': 'n', 'refactor them': 'n' });
+    const q = r.questions;
+    const at = (re) => q.findIndex(x => re.test(x));
+    const compose = at(/Base the deployment on it/), registry = at(/docker registry/), region = at(/AWS region/);
+    const code = at(/Apply it\?/), lower = at(/lowercase environment variables/);
+    check('the compose question comes first, before the operator questions', compose === 0 && registry > compose, q.join(' | '));
+    check('the code changes are asked together, after the operator questions', code > region && lower > region && Math.abs(lower - code) === 1, q.join(' | '));
+    check('and nothing is asked after them', Math.max(code, lower) === q.length - 1, q.join(' | '));
+    fs.rmSync(r.parent, { recursive: true, force: true });
+    fs.rmSync(src, { recursive: true, force: true });
   }
 
   console.log('\n  flarops.yaml reader');
@@ -598,7 +639,7 @@ async function urlBreakingPasswordSurvives() {
     }
     check('an empty or invalid domain is asked again', domainAsked === 3, `asked ${domainAsked} times`);
     check('the accepted domain is lowercased, a pasted URL trimmed to its host', answers && answers.domain === 'app.example.com', answers && answers.domain);
-    check('the addresses that follow from it are shown', said.some(l => /dashboard: https:\/\/dashboard\.example\.com/.test(l) && /app-pr-<N>\.example\.com/.test(l)), said.join(' | '));
+    check('the addresses that follow from it are shown', said.some(l => /dashboard: +https:\/\/dashboard\.example\.com/.test(l)) && said.some(l => /app-pr-<N>\.example\.com/.test(l)), said.join(' | '));
     check('the refusal says why', said.some(l => /domain is required/.test(l)) && said.some(l => /is not a domain name/.test(l)), said.join(' | '));
   }
 

@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const SKIP_DIRS = new Set(['.git', 'node_modules']);
-const OPAQUE = [/^\.keys\//, /^deploy\/dashboard\//];
+const OPAQUE = [/^\.keys\//, /^deploy\/dashboard\//, /^deploy\/flarops-init\.log$/];
 
 function walk(root, base = '') {
   let out = [];

@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"log"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -62,7 +63,24 @@ func initDB(dataSourceName string) error {
 		CREATE INDEX IF NOT EXISTS idx_capsule_samples_timestamp ON capsule_samples(timestamp);
 		CREATE INDEX IF NOT EXISTS idx_capsule_samples_capsule_id ON capsule_samples(capsule_id);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// What a sample's EC2 part was, so a minute counted at the fallback price can be corrected once
+	// the real price loads. Added to a database created before them.
+	for _, col := range []string{"ec2_rate REAL DEFAULT 0", "priced INTEGER DEFAULT 1", "instance_type TEXT DEFAULT ''", "region TEXT DEFAULT ''"} {
+		name := strings.Fields(col)[0]
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('host_samples') WHERE name = ?`, name).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec(`ALTER TABLE host_samples ADD COLUMN ` + col); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Timestamps are stored as UTC text SQLite's date functions read: a bound time.Time is written as Go's
@@ -71,9 +89,47 @@ func sqlTime(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05.000")
 }
 
-func recordHostSample(timestamp time.Time, hostID string, ratePerHour float64) error {
-	_, err := db.Exec("INSERT INTO host_samples (timestamp, host_id, rate_per_hour) VALUES (?, ?, ?)", sqlTime(timestamp), hostID, ratePerHour)
+func recordHostSample(timestamp time.Time, h HostState) error {
+	priced := 0
+	if h.PriceKnown {
+		priced = 1
+	}
+	_, err := db.Exec(`INSERT INTO host_samples (timestamp, host_id, rate_per_hour, ec2_rate, priced, instance_type, region)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, sqlTime(timestamp), h.ID, h.Rate, h.EC2Rate, priced, h.Type, h.Region)
 	return err
+}
+
+// Minutes counted at the fallback EC2 price get the real one, for every type and region the price
+// feed now knows: the month's spend is then what it would have been had the feed been there.
+func repriceSamples() (int64, error) {
+	rows, err := db.Query(`SELECT DISTINCT instance_type, region FROM host_samples WHERE priced = 0 AND instance_type != ''`)
+	if err != nil {
+		return 0, err
+	}
+	type pair struct{ typ, region string }
+	var pending []pair
+	for rows.Next() {
+		var p pair
+		if rows.Scan(&p.typ, &p.region) == nil {
+			pending = append(pending, p)
+		}
+	}
+	rows.Close()
+	var fixed int64
+	for _, p := range pending {
+		price, known := getEC2HourlyRate(p.typ, p.region)
+		if !known {
+			continue
+		}
+		res, err := db.Exec(`UPDATE host_samples SET rate_per_hour = rate_per_hour - ec2_rate + ?, ec2_rate = ?, priced = 1
+			WHERE priced = 0 AND instance_type = ? AND region = ?`, price, price, p.typ, p.region)
+		if err != nil {
+			return fixed, err
+		}
+		n, _ := res.RowsAffected()
+		fixed += n
+	}
+	return fixed, nil
 }
 
 func recordCapsuleSample(timestamp time.Time, capsuleID string, hostID string, ramMib int) error {

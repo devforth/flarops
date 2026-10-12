@@ -64,8 +64,10 @@ type HostState struct {
 	CpuUsed     int     `json:"cpuUsed"`
 	Rate        float64 `json:"rate"`
 	// False when the EC2 price is the fallback, not the feed's price for this type and region.
-	PriceKnown bool           `json:"priceKnown"`
-	Capsules   []CapsuleState `json:"capsules"`
+	PriceKnown bool `json:"priceKnown"`
+	// The EC2 part of Rate, kept with each sample so a fallback price can be corrected later.
+	EC2Rate  float64        `json:"-"`
+	Capsules []CapsuleState `json:"capsules"`
 }
 
 type FleetState struct {

@@ -21,8 +21,8 @@ module.exports = async function collectOperatorAnswers({
   let projectName = path.basename(currentDir).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
     .slice(0, 50).replace(/-+$/, '');
   if (!projectName) projectName = 'flarops-project';
-  console.log(`Project name: ${projectName} (from this directory's name). It names the image repository, the`);
-  console.log(`Kubernetes namespaces (${projectName}-production, ${projectName}-pr-<N>) and the Terraform state bucket.`);
+  console.log(`Project name: ${projectName} (from this directory's name). It names the image`);
+  console.log(`repository, the namespaces (${projectName}-production, ${projectName}-pr-<N>) and the state bucket.`);
   console.log('');
 
   // The tools come first, so a missing one stops init before any question rather than after all of them.
@@ -64,12 +64,10 @@ module.exports = async function collectOperatorAnswers({
     registryPassword = (await askPassword(`Enter password or access token for ${loginRegistry}: `)).trim();
 
     if (!canCheckLogin) break;
-    console.log();
     console.log(`Logging in to ${loginRegistry} ...`);
     try {
       execFileSync('docker', ['login', loginRegistry, '-u', registryUser, '--password-stdin'], { input: registryPassword, stdio: ['pipe', 'pipe', 'pipe'] });
       console.log('Logged in.');
-      console.log();
       break;
     } catch (err) {
       const reason = String((err.stderr && err.stderr.toString()) || err.message || '').trim().split('\n').pop();
@@ -99,15 +97,18 @@ module.exports = async function collectOperatorAnswers({
     const parts = domain.split('.');
     const parent = parts.length > 2 ? parts.slice(1).join('.') : domain;
     const prHost = parts.length > 2 ? `${parts[0]}-pr-<N>.${parent}` : `pr-<N>.${domain}`;
-    console.log(`  application: https://${domain}   dashboard: https://dashboard.${parent}   PR environments: https://${prHost}`);
+    console.log(`  application:      https://${domain}`);
+    console.log(`  dashboard:        https://dashboard.${parent}`);
+    console.log(`  PR environments:  https://${prHost}`);
     console.log('');
   }
 
   let cloudflareApiToken = '';
   let cloudflareZoneId = '';
   if (domain) {
-    console.log('With Cloudflare, the deploy creates the DNS records itself: the domain, the wildcard for the');
-    console.log('PR environments and the dashboard. Without it, you create them after the first deploy (FLAROPS.md lists them).');
+    console.log('With Cloudflare, the deploy creates the DNS records itself: the domain, the wildcard for');
+    console.log('the PR environments and the dashboard. Without it, you create them after the first');
+    console.log('deploy (FLAROPS.md lists them).');
     const useCloudflare = await askQuestion('Do you want to configure Cloudflare DNS for this domain automatically? [Y/n] ');
     if (isYes(useCloudflare)) {
       console.log('  The token needs Zone > DNS > Edit for this zone (My Profile > API Tokens > Create Token, "Edit zone DNS").');
@@ -133,11 +134,11 @@ module.exports = async function collectOperatorAnswers({
   while (true) {
     awsCredentials = { accessKey: '', secretKey: '' };
     const accessKeyInput = (await askQuestion(found
-      ? `Enter project AWS Access Key ID (press Enter to use ${found.source}): `
+      ? `Enter project AWS Access Key ID (press Enter to use ${found.source || 'the credentials on this machine'}): `
       : 'Enter project AWS Access Key ID: ')).trim();
     if (!accessKeyInput && found) {
       awsCredentials = { accessKey: found.accessKey, secretKey: found.secretKey };
-      console.log(`Using the AWS credentials from ${found.source}.`);
+      console.log(`Using the AWS credentials from ${found.source || 'this machine'}.`);
     } else if (!accessKeyInput) {
       console.log('No AWS credentials found on this machine (environment, AWS_PROFILE or ~/.aws/credentials) - enter a key.');
       continue;

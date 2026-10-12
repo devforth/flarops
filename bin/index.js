@@ -6,11 +6,13 @@ const { closest } = require('../utils/closest.js');
 const COMMANDS = {
   init: {
     summary: 'Analyze this repository and generate the deployment (run once, from the repository root)',
-    usage: 'npx flarops init',
+    usage: 'npx flarops init [--verbose]',
     details: [
       'Reads docker-compose, .env files and the source, asks a few questions (registry, domain,',
       'Cloudflare, AWS), and writes flarops.yaml, deploy/, the GitHub workflows, werf.yaml and a',
       'Flarops section in AGENTS.md. It refuses to run where flarops.yaml already exists.',
+      '',
+      '  --verbose   Also print what it found and decided (always written to deploy/flarops-init.log).',
     ],
   },
   sync: {
@@ -71,7 +73,7 @@ const wantsHelp = args.includes('--help') || args.includes('-h');
     showCommandHelp(command);
     return;
   }
-  const known = { init: [], sync: ['--check'], 'dashboard-password': [] }[command];
+  const known = { init: ['--verbose'], sync: ['--check'], 'dashboard-password': [] }[command];
   const unknown = args.filter(a => !known.includes(a));
   if (unknown.length > 0) {
     console.error(`Unknown option ${unknown.map(a => `"${a}"`).join(', ')} for "${command}".\n`);
@@ -79,7 +81,7 @@ const wantsHelp = args.includes('--help') || args.includes('-h');
     process.exit(1);
   }
 
-  if (command === 'init') await require('./commands/init.js')();
+  if (command === 'init') await require('./commands/init.js')({ verbose: args.includes('--verbose') });
   if (command === 'sync') await require('./commands/sync.js')({ check: args.includes('--check') });
   if (command === 'dashboard-password') await require('./commands/dashboardPassword.js')();
 })().catch(err => {
