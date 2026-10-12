@@ -19,10 +19,16 @@ This project is deployed by Flarops, and \`flarops.yaml\` is the source of truth
 - Field reference: the comment block at the end of \`flarops.yaml\`. Sync refuses an invalid file,
   names the field, and writes nothing - read its message and fix that field.
 - Secrets: list each under \`secretEnvs\` of the service that reads it (\`ENV_NAME: GITHUB_SECRET_NAME\`).
-  Values go into the repository's GitHub Secrets, never into the repository; the git-ignored
-  \`deploy/.env\` lists the secrets to create.
+  Values go into the repository's GitHub Secrets, never into the repository. Sync names every secret
+  a change needs - tell the user to create it before pushing (you cannot): without it the variable
+  reaches the container empty.
+- Run sync from the project root, then review \`git diff\`; \`npx flarops sync --check\` shows what it
+  would change without writing anything. A push to the deploy branch deploys.
 - Database connection URLs: list the variable under \`databaseUrls\` - the chart builds the URL from
   the database's user, password and name. Do not store such a URL as a secret.
+- Data does not follow a rename. Renaming a service with volumes, or changing a database's name,
+  user, password or major image version, leaves the existing data where it is (sync prints a NOTE
+  saying where). Tell the user before making such a change, and how to move the data.
 ${END}`;
 
 const CLAUDE_BLOCK = `${BEGIN}

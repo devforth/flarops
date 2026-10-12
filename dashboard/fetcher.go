@@ -99,14 +99,38 @@ func startPriceFetcher() {
 	}()
 }
 
-func getEC2HourlyRate(instanceType, region string) float64 {
+// The fallback until the price feed loads, or for a type or region it does not list: a t3.medium's.
+const fallbackEC2HourlyRate = 0.0432
+
+// The on-demand Linux price, and whether it came from the feed rather than the fallback.
+func getEC2HourlyRate(instanceType, region string) (float64, bool) {
 	awsPricesMutex.RLock()
 	defer awsPricesMutex.RUnlock()
 
 	if regionMap, ok := awsPrices[instanceType]; ok {
 		if price, ok := regionMap[region]; ok {
-			return price
+			return price, true
 		}
 	}
-	return 0.0432 // default fallback
+	return fallbackEC2HourlyRate, false
 }
+
+// gp3 storage, USD per GB-month, by region (AWS's published on-demand prices).
+var gp3PerGBMonth = map[string]float64{
+	"us-east-1": 0.08, "us-east-2": 0.08, "us-west-2": 0.08, "us-west-1": 0.096,
+	"ca-central-1": 0.088, "eu-west-1": 0.088, "eu-west-2": 0.0928, "eu-west-3": 0.0928,
+	"eu-central-1": 0.0952, "eu-north-1": 0.0836, "ap-south-1": 0.0912, "ap-southeast-1": 0.096,
+	"ap-southeast-2": 0.096, "ap-northeast-1": 0.096, "ap-northeast-2": 0.0912, "sa-east-1": 0.152,
+}
+
+// The gp3 price for a region, and whether the table has it (otherwise us-east-1's).
+func getGP3Rate(region string) (float64, bool) {
+	if p, ok := gp3PerGBMonth[region]; ok {
+		return p, true
+	}
+	return 0.08, false
+}
+
+// Every node has a public IPv4 address - the server's Elastic IP, a worker's launch address - and
+// AWS bills each one by the hour.
+const publicIPv4HourlyRate = 0.005

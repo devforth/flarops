@@ -22,6 +22,7 @@
       --text-3: #79818F;
       --brass: #8A6A16;
       --brass-2: #A8842A;
+      --on-brass: #FFFFFF;
       --hot: #AE2F2C;
       --hot-tint: rgba(174, 47, 44, .10);
       --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 8px 24px -12px rgba(16, 24, 40, .28);
@@ -41,6 +42,7 @@
         --text-3: #6F7787;
         --brass: #D9A94A;
         --brass-2: #C79A46;
+        --on-brass: #17130A;
         --hot: #F0685E;
         --hot-tint: rgba(240, 104, 94, .12);
         --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 28px -14px rgba(0, 0, 0, .7);
@@ -158,7 +160,7 @@
       font: inherit;
       font-weight: 600;
       font-size: 13px;
-      color: #FFF;
+      color: var(--on-brass);
       background: var(--brass);
       border: 1px solid var(--brass);
       border-radius: 8px;
@@ -194,12 +196,26 @@
       margin-top: 1px;
     }
 
+    .notice {
+      margin-bottom: 18px;
+      padding: 9px 11px;
+      font-size: 12.5px;
+      color: var(--text-2);
+      background: var(--inset);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .foot code {
+      font-family: var(--font-mono);
+    }
+
     .foot {
       margin-top: 18px;
       padding-top: 14px;
       border-top: 1px solid var(--line);
       font-size: 11.5px;
-      color: var(--text-3);
+      color: var(--text-2);
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -220,7 +236,7 @@
     </div>
 
     <h1>Sign in</h1>
-    <p class="sub">This dashboard exposes your cluster's fleet, capacity and spend.</p>
+    <p class="sub">The deployment's servers, environments, capacity and spend.</p>
 
     {{if .Error}}
     <div class="error" role="alert">
@@ -231,6 +247,9 @@
       <span>{{.Error}}</span>
     </div>
     {{end}}
+    {{if .Notice}}
+    <div class="notice" role="status">{{.Notice}}</div>
+    {{end}}
 
     <form method="POST" action="/login" autocomplete="on">
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
@@ -238,18 +257,20 @@
       <div class="field">
         <label for="username">Username</label>
         <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none"
-          autocorrect="off" spellcheck="false" required autofocus>
+          autocorrect="off" spellcheck="false" required {{if .Username}}value="{{.Username}}"{{else}}autofocus{{end}}
+          {{if .DefaultUsername}}placeholder="{{.DefaultUsername}}"{{end}}>
       </div>
 
       <div class="field">
         <label for="password">Password</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <input id="password" name="password" type="password" autocomplete="current-password" required {{if .Username}}autofocus{{end}}>
       </div>
 
       <button type="submit">Sign in</button>
     </form>
 
-    <p class="foot">Credentials were printed once by <span style="font-family:var(--font-mono)">flarops init</span>.</p>
+    <p class="foot">{{if .DefaultUsername}}The username is <code>{{.DefaultUsername}}</code>. {{end}}The password was shown once by
+      <code>npx flarops init</code>; a lost one is replaced with <code>npx flarops dashboard-password</code>.</p>
   </main>
 </body>
 

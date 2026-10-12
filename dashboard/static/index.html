@@ -4,7 +4,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Capsulator — env capsule fleet dashboard</title>
+  <title>Flarops dashboard</title>
   <link rel="icon"
     href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ctext%20y%3D%22.9em%22%20font-size%3D%2290%22%3E%F0%9F%93%A6%3C%2Ftext%3E%3C%2Fsvg%3E">
   <style>
@@ -67,7 +67,7 @@
       --line-3: rgba(20, 28, 45, .34);
       --text: #12161D;
       --text-2: #4B5464;
-      --text-3: #79818F;
+      --text-3: #5F6774;
       --brass: #8A6A16;
       --brass-2: #A8842A;
       --brass-tint: rgba(138, 106, 22, .10);
@@ -98,7 +98,7 @@
         --line-3: rgba(255, 255, 255, .28);
         --text: #E6EAF1;
         --text-2: #A2AAB9;
-        --text-3: #6F7787;
+        --text-3: #8A92A1;
         --brass: #D9A94A;
         --brass-2: #C79A46;
         --brass-tint: rgba(217, 169, 74, .13);
@@ -127,7 +127,7 @@
       --line-3: rgba(255, 255, 255, .28);
       --text: #E6EAF1;
       --text-2: #A2AAB9;
-      --text-3: #6F7787;
+      --text-3: #8A92A1;
       --brass: #D9A94A;
       --brass-2: #C79A46;
       --brass-tint: rgba(217, 169, 74, .13);
@@ -205,96 +205,6 @@
       margin: 12px 0 0
     }
 
-    /* ---------------- developer notes ---------------- */
-    .devnotes {
-      margin: 28px 0 42px;
-      border: 1px solid var(--line-2);
-      border-radius: 10px;
-      background: var(--surface);
-      box-shadow: var(--shadow-sm);
-      overflow: hidden;
-    }
-
-    .devnotes-head {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-      padding: 11px 20px;
-      background: var(--surface-2);
-      border-bottom: 1px solid var(--line-2);
-    }
-
-    .devnotes-head .t {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      letter-spacing: .16em;
-      text-transform: uppercase;
-      color: var(--text);
-      font-weight: 600;
-    }
-
-    .devnotes-head .s {
-      font-family: var(--font-mono);
-      font-size: 11.5px;
-      color: var(--text-3);
-      margin-left: auto
-    }
-
-    .devnotes ul {
-      list-style: none;
-      margin: 0;
-      padding: 6px 0
-    }
-
-    .devnotes li {
-      display: grid;
-      grid-template-columns: 92px minmax(0, 1fr);
-      gap: 18px;
-      align-items: baseline;
-      padding: 12px 20px;
-      border-bottom: 1px solid var(--line);
-    }
-
-    .devnotes li:last-child {
-      border-bottom: 0
-    }
-
-    .devnotes .k {
-      font-family: var(--font-mono);
-      font-size: 10px;
-      letter-spacing: .13em;
-      text-transform: uppercase;
-      color: var(--brass);
-    }
-
-    @media (max-width:640px) {
-      .devnotes li {
-        grid-template-columns: 1fr;
-        gap: 4px
-      }
-    }
-
-    .devnotes b {
-      font-weight: 640
-    }
-
-    .devnotes .d {
-      color: var(--text-2);
-      font-size: 13.5px;
-      display: block;
-      margin-top: 3px
-    }
-
-    .devnotes code {
-      font-family: var(--font-mono);
-      font-size: .92em;
-      background: var(--surface-2);
-      border: 1px solid var(--line);
-      border-radius: 3px;
-      padding: 1px 5px;
-      color: var(--text);
-    }
 
     /* ---------------- dashboard shell ---------------- */
     .board-cap {
@@ -342,6 +252,35 @@
       display: grid;
       gap: 18px;
       padding-bottom: 80px
+    }
+
+    .loading-text {
+      max-width: 60ch;
+      margin: 0;
+      text-align: center;
+      line-height: 1.6
+    }
+
+    .workerline {
+      padding: 12px 22px 0;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-2)
+    }
+
+    .workerline .idle {
+      color: var(--watch);
+      font-weight: 600
+    }
+
+    [data-tip] {
+      cursor: help
+    }
+
+    [data-tip]:focus-visible {
+      outline: 2px solid var(--link);
+      outline-offset: 2px;
+      border-radius: 2px
     }
 
     .loading-state {
@@ -399,25 +338,6 @@
       border-bottom-color: currentColor
     }
 
-    .cap-track {
-      display: flex;
-      gap: 4px;
-      align-items: center
-    }
-
-    .cap-track i {
-      width: 34px;
-      height: 8px;
-      border-radius: 2px;
-      background: var(--inset);
-      box-shadow: inset 0 0 0 1px var(--line)
-    }
-
-    .cap-track i.on {
-      background: var(--brass);
-      box-shadow: none
-    }
-
     .live {
       display: inline-flex;
       align-items: center;
@@ -426,6 +346,19 @@
       font-size: 11px;
       color: var(--ok);
       letter-spacing: .06em
+    }
+
+    .live.stale {
+      color: var(--watch)
+    }
+
+    .live.dead {
+      color: var(--hot)
+    }
+
+    .live.stale .dot,
+    .live.dead .dot {
+      animation: none
     }
 
     .live .dot {
@@ -542,6 +475,28 @@
       background: var(--brass-tint)
     }
 
+    .spend-notes {
+      margin: 10px 0 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 4px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--text-2);
+      max-width: 75ch
+    }
+
+    .spend-notes .assumed {
+      color: var(--watch)
+    }
+
+    .chip.warn {
+      color: var(--hot);
+      border-color: currentColor;
+      background: var(--hot-tint)
+    }
+
     .gauges {
       display: flex;
       gap: 26px;
@@ -631,6 +586,7 @@
 
     .stack {
       display: flex;
+      overflow: hidden;
       height: 46px;
       border-radius: 5px;
       background: var(--inset);
@@ -644,7 +600,8 @@
    absorb the difference. */
     .seg {
       border-radius: 3px;
-      min-width: 78px;
+      flex: 0 1 auto;
+      min-width: 0;
       display: flex;
       flex-direction: column;
       justify-content: center;
@@ -652,6 +609,10 @@
       overflow: hidden;
       background: var(--surface-2);
       box-shadow: inset 0 0 0 1px var(--line-2);
+    }
+
+    .seg:not(.sys):not(.reserved):not(.free) {
+      min-width: 66px
     }
 
     .seg>* {
@@ -711,7 +672,7 @@
     .seg.free {
       background: transparent;
       box-shadow: inset 0 0 0 1px var(--line-2);
-      min-width: 88px;
+      min-width: 0;
       background-image: repeating-linear-gradient(135deg, transparent, transparent 6px, var(--surface-2) 6px, var(--surface-2) 12px);
     }
 
@@ -896,7 +857,7 @@
       flex-grow: var(--w, 1);
       flex-shrink: 1;
       flex-basis: 0;
-      min-width: 126px;
+      min-width: 150px;
       border: 1px solid var(--line-2);
       border-radius: 3px;
       padding: 9px 12px;
@@ -934,7 +895,11 @@
       font-size: 12px;
       color: var(--text-2);
       font-variant-numeric: tabular-nums;
-      margin-top: 3px;
+      margin-top: 3px
+    }
+
+    /* Memory and CPU each stay whole; a narrow tile puts them on two lines instead of past its edge. */
+    .tile .t-v>span {
       white-space: nowrap
     }
 
@@ -1128,6 +1093,40 @@
       background: var(--link-tint)
     }
 
+    /* Failing: a crash loop, an image that cannot be pulled, a failed job. A square mark, so it
+   differs in shape from running (dot), working (spinner) and waiting (hollow dot). */
+    .st.bad {
+      color: var(--hot);
+      background: var(--hot-tint)
+    }
+
+    .st.bad .dot {
+      border-radius: 1px
+    }
+
+    .why-line {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--hot);
+      overflow-wrap: anywhere
+    }
+
+    .why-line.soft {
+      color: var(--text-2)
+    }
+
+    .env-tag {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      color: var(--text-2)
+    }
+
+    .env-tag.prod {
+      color: var(--brass)
+    }
+
     /* Waiting is neither running nor working, so it gets a third mark — a hollow dot,
    distinct in shape from the filled dot and the spinner even in monochrome. */
     .st.wait {
@@ -1269,28 +1268,6 @@
     }
 
     /* ---------------- free slot ---------------- */
-    .slot {
-      border: 1px dashed var(--line-2);
-      border-radius: 10px;
-      padding: 22px;
-      text-align: center;
-      color: var(--text-3);
-      display: grid;
-      gap: 6px;
-      justify-items: center;
-    }
-
-    .slot b {
-      color: var(--text-2);
-      font-weight: 600;
-      font-size: 14px
-    }
-
-    .slot .hint {
-      font-family: var(--font-mono);
-      font-size: 11.5px
-    }
-
     /* ---------------- spend ---------------- */
     .money {
       background: var(--surface);
@@ -1466,6 +1443,14 @@
       white-space: nowrap;
     }
 
+    #tip.text {
+      white-space: normal;
+      /* Image names and digests are one long word: break them rather than spill out of the box. */
+      overflow-wrap: anywhere;
+      max-width: min(360px, calc(100vw - 32px));
+      font-family: var(--font-ui, inherit)
+    }
+
     #tip .t-d {
       color: var(--text-3);
       letter-spacing: .08em;
@@ -1488,6 +1473,43 @@
       * {
         animation: none !important;
         transition: none !important
+      }
+    }
+
+    /* Phones: segments give up their labels (the line above the bar carries the totals), the
+       bar never outgrows its card, and the gauges sit two by two. */
+    @media (max-width:640px) {
+      .stack {
+        overflow: hidden
+      }
+
+      .seg,
+      .seg.free,
+      .seg:not(.sys):not(.reserved):not(.free) {
+        min-width: 6px;
+        padding: 0 4px;
+        flex-shrink: 1
+      }
+
+      .seg:not(.free) .sn,
+      .seg:not(.free) .sv,
+      .seg.free .sv {
+        display: none
+      }
+
+      .gauges {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px 12px;
+        margin-left: 0;
+        width: 100%
+      }
+
+      .hhead,
+      .alloc,
+      .workerline {
+        padding-left: 14px;
+        padding-right: 14px
       }
     }
   </style>
@@ -1534,11 +1556,12 @@
   <div class="wrap">
 
 
-    <div class="board-cap"><span style="flex:1">Fleet dashboard</span><span
-        id="board-host-name">status.mydomain.com</span><span style="flex:1;text-align:right"> · live · <a class="signout" href="/logout">Sign out</a></span></div>
+    <div class="board-cap"><span style="flex:1" id="board-project">Flarops dashboard</span><span
+        id="board-host-name"></span><span style="flex:1;text-align:right"><a class="signout" href="/logout">Sign out</a></span></div>
     <div class="board" data-render="board">
       <div class="loading-state">
-        <img src="loader.gif" alt="Loading..." style="width: 84px; height: 84px; border-radius: 8px;">
+        <img src="loader.gif" alt="" style="width: 84px; height: 84px; border-radius: 8px;">
+        <p class="loading-text" id="loading-text" role="status">Connecting to the cluster…</p>
       </div>
     </div>
   </div>
@@ -1551,18 +1574,25 @@
       if (el) el.innerText = window.location.hostname;
     });
 
+    /* A first frame normally arrives within a couple of seconds. Without one, say why it may not,
+       instead of spinning forever. */
+    setTimeout(() => {
+      if (FRAMES > 0) return;
+      const t = document.getElementById("loading-text");
+      if (t) t.textContent = (CONNECTED
+        ? "Connected, but no data has arrived yet. The dashboard may still be collecting its first sample, or it cannot read the cluster (check its logs: kubectl logs deploy/flarops-dashboard)."
+        : "Cannot reach the dashboard's live feed. It reconnects on its own; if this stays, the dashboard pod may be restarting.");
+    }, 10000);
+
     /* ------------------------------------------------------------------
        DATA — one fleet snapshot. Capsule RAM/CPU sums stay under the host
        totals; the remainder is system + page cache.
-       cores × threads × 100 = the CPU ceiling (see developer note 3).
+       cores × threads × 100 = the CPU ceiling.
        ------------------------------------------------------------------ */
     const byStatusTime = (a, b) => a.statusSec - b.statusSec;
-    const hostStatusTime = h => {
-      if (!h.capsules || h.capsules.length === 0) return 999999999;
-      return Math.min.apply(null, h.capsules.map(c => c.statusSec));
-    };
 
-    let FLEET = { slotsUsed: 0, slotsMax: 0, domain: "Connecting..." };
+    let FLEET = { slotsUsed: 0, domain: "", appDomain: "", project: "" };
+    let FRAMES = 0;
     let HOSTS = [];
     let QUEUE = [];
     let SPEND = {
@@ -1571,10 +1601,11 @@
       days: [], cur: [], prev: [], deltaPct: 0
     };
     let ORDERED = [];
+    let GENERATED_AT = 0;
+    let CONNECTED = false;
     let ALL_CAPS = [];
     let FLEET_RAM = 0;
     let FLEET_RAM_USED = 0;
-    let BIGGEST_CAP = 1;
 
     /* ------------------------------------------------------------------ helpers */
     const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -1585,7 +1616,7 @@
        exact MiB and the unit definition live in the hover title, because a
        dashboard is read at a glance and audited on demand. Anything under a
        gibibyte keeps MiB resolution — "84M" says more than "0.1G".        */
-    const sz = m => m >= 1024 ? (m / 1024).toFixed(1) + "G" : Math.round(m) + "M";
+    const sz = m => m >= 1024 ? (m / 1024).toFixed(1) + " GiB" : Math.round(m) + " MiB";
     const szPair = (a, b) => sz(a) + " / " + sz(b);
     const szT = m => mib(m) + " MiB";
     const szPairT = (a, b, what) => mib(a) + " MiB of " + mib(b) + " MiB " + what;
@@ -1599,12 +1630,17 @@
     const usd0 = n => "$" + Math.round(n || 0).toLocaleString("en-US");
     const pct = (a, b) => b === 0 ? 0 : Math.round((a / b) * 100);
 
+    /** How long an environment has been up: "<1m", "12m", "3h 05m", "2d 04h". */
     function age(min) {
-      const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
-      return d + "d " + String(h).padStart(2, "0") + "h " + String(m).padStart(2, "0") + "m";
+      const m = Math.max(0, Math.floor(Number(min) || 0));
+      const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), r = m % 60;
+      if (d) return d + "d " + String(h).padStart(2, "0") + "h";
+      if (h) return h + "h " + String(r).padStart(2, "0") + "m";
+      return m ? m + "m" : "<1m";
     }
     /** Time in the current status — seconds-precise while it matters, coarse once it doesn't. */
     function dur(sec) {
+      sec = Math.max(0, Math.floor(Number(sec) || 0));
       const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
         m = Math.floor(sec % 3600 / 60), s = sec % 60;
       if (d) return h ? d + "d " + h + "h" : d + "d";
@@ -1616,8 +1652,9 @@
     function tone(p) { return p >= 85 ? "hot" : p >= 70 ? "watch" : "ok"; }
     function toneVar(p) { return "var(--" + tone(p) + ")"; }
 
-    /* CPU ceiling = hyperthreads × 100 (developer note 3) */
     const cpuCap = h => h.cores * h.threads * 100;
+    /* The collector reports CPU in percent of one core; shown as vCPU. */
+    const vcpu = p => (p / 100).toFixed(p >= 1000 ? 1 : 2);
     const threadsOf = h => h.cores * h.threads;
     /* Memory the kubelet holds back and will never give to a pod:
        system-reserved + kube-reserved + the eviction threshold. It is a floor
@@ -1645,20 +1682,43 @@
     const hostCpu = h => pct(h.cpuUsed, cpuCap(h));
     const hostSwap = h => pct(h.swapUsed, h.swapTotal);
 
+    /* What the collector reports (dashboard/collector.go, podCondition): failing outranks
+       unplaceable, which outranks deploying. `word` is the tally's noun. */
     const STATUS = {
-      running: { label: "Running", cls: "running" },
-      building: { label: "Building image", cls: "work" },
-      preparing: { label: "Preparing data", cls: "work" },
-      waiting: { label: "Waiting for slot", cls: "wait" }
+      running: { label: "Running", word: "running", cls: "running" },
+      deploying: { label: "Deploying", word: "deploying", cls: "work" },
+      degraded: { label: "Failing", word: "failing", cls: "bad" },
+      waiting: { label: "Can't be placed", word: "unplaced", cls: "wait" }
     };
+    const statusOf = c => STATUS[c.status] || { label: String(c.status || "unknown"), word: String(c.status || "unknown"), cls: "wait" };
+
+    /* Namespaces are <project>-production and <project>-pr-<number> (templates/pr-capsule.yml.js). */
+    const prNumber = c => { const m = /-pr-(\d+)$/.exec(c.id); return m ? +m[1] : null; };
+    const isProduction = c => /-production$/.test(c.id);
+    function envTag(c) {
+      if (isProduction(c)) return '<span class="env-tag prod">Production</span>';
+      const n = prNumber(c);
+      return n !== null ? '<span class="env-tag">PR #' + n + "</span>" : '<span class="env-tag">' + esc(c.id) + "</span>";
+    }
+    /** Why it is not simply running, with the restart count when the reason does not carry it. */
+    function whyLine(c) {
+      if (!c.reason && !c.restarts) return "";
+      const restarts = c.restarts && !/restarts/.test(c.reason || "") ? (c.reason ? " · " : "") + c.restarts + " restarts" : "";
+      return '<div class="why-line' + (c.status === "degraded" ? "" : " soft") + '">' + esc(c.reason || "") + restarts + "</div>";
+    }
 
 
     const volTotal = c => c.vol ? c.vol.reduce((s, v) => s + v.mib, 0) : 0;
+    const plural = (n, word) => n + " " + word + (n === 1 ? "" : "s");
+    function machinesLabel() {
+      const workers = HOSTS.filter(h => h.role === "worker").length;
+      return plural(HOSTS.length - workers, "server") + (workers ? " · " + plural(workers, "PR worker") : "");
+    }
 
     function statusTally() {
       const t = {};
       ALL_CAPS.concat(QUEUE).forEach(c => { t[c.status] = (t[c.status] || 0) + 1; });
-      return Object.keys(t).map(k => t[k] + " " + STATUS[k].label.split(" ")[0].toLowerCase()).join(" · ");
+      return Object.keys(t).map(k => t[k] + " " + statusOf({ status: k }).word).join(" · ");
     }
 
     /* freeForScheduling is defined below and used here: the page must answer
@@ -1667,7 +1727,9 @@
        did not, so one host could read "1.2G free" in its bar and "3.1G free"
        two lines down. The naive figure is also the one that overfilled a node
        badly enough to take it out. */
-    const freeOf = h => freeForScheduling(h);
+    /* Less what the capacity oracle has already promised to a PR environment that has not
+       started yet - the oracle subtracts it too (reservedOn in dashboard/capacity.go). */
+    const freeOf = h => Math.max(0, freeForScheduling(h) - (h.promisedMiB || 0));
     /* Cordoned, NotReady and unmeasured nodes are excluded here for the same
        reason planPlacement excludes them (dashboard/capacity.go): a draining
        node reports almost no usage and therefore wins on free memory, while
@@ -1687,11 +1749,10 @@
        decision below is made against the size a capsule really occupies:
        what it uses, plus this margin. */
     const CAPSULE_HEADROOM = 0.15;
-    /* Never returns 0: it is a divisor, and a fleet reporting no memory at all
-       would otherwise make "fits" infinite. */
-    const effectiveSize = ram => Math.max(1, Math.ceil(ram * (1 + CAPSULE_HEADROOM)));
-
-    const placeable = req => effectiveSize(req) <= freeOf(roomiest());
+    /* The next PR environment, sized by the server the way CI sizes it (what production uses
+       now, plus headroom), so the bar, the oracle and the workflow give one answer. Never 0: it
+       is a divisor. */
+    const nextEnvSize = () => Math.max(1, FLEET.nextEnvMiB || 0);
 
     /* ------------------------------------------------------------------ fragments */
     function urlLink(c) {
@@ -1699,32 +1760,47 @@
         esc(c.host) + '<svg class="ic"><use href="#i-ext"/></svg></a>';
     }
     function ageChip(c) {
-      const old = c.upMin >= 10080; // 7 days — past this, uptime is a billing question
-      return '<span class="age' + (old ? " old" : "") + '" title="Spawned ' + age(c.upMin) +
-        ' ago — billing accrues from spawn">' +
+      // A PR environment open for a week is a billing question; production is meant to stay up.
+      const old = !isProduction(c) && c.upMin >= 10080;
+      return '<span class="age' + (old ? " old" : "") + '" title="' + (old
+        ? "Open " + Math.floor(c.upMin / 1440) + " days - still needed? Closing the PR removes it."
+        : "Up " + age(c.upMin)) + '">' +
         '<svg class="ic"><use href="#i-clock"/></svg>' + age(c.upMin) + "</span>";
     }
     function statusPill(c) {
-      const s = STATUS[c.status], working = s.cls === "work";
-      return '<span class="st ' + s.cls + '" title="' + s.label + " for " + dur(c.statusSec) + '">' +
+      const s = statusOf(c), working = s.cls === "work";
+      return '<span class="st ' + s.cls + '" title="' + esc(s.label + " for " + dur(c.statusSec) + (c.reason ? " · " + c.reason : "")) + '">' +
         (working ? '<span class="ring"></span>' : '<span class="dot"></span>') +
         '<span class="lb">' + s.label + '</span><span class="d">' + dur(c.statusSec) + "</span></span>";
     }
     function deltaChip() {
+      /* Nothing recorded for last month: there is no change to show, not a +0% rise. */
+      if (!SPEND.prevSame) return '<span class="delta">no data for ' + esc(SPEND.prevLabel) + "</span>";
       const up = SPEND.deltaPct >= 0;
       return '<span class="delta ' + (up ? "up" : "down") + '"><svg class="ic" style="' +
         (up ? "" : "transform:rotate(180deg)") + '"><use href="#i-up"/></svg>' +
         (up ? "+" : "") + SPEND.deltaPct.toFixed(1) + "% vs " + SPEND.prevLabel + "</span>";
     }
-    function arcGauge(label, p, value, sub) {
-      const r = 21, c = 2 * Math.PI * r, dash = (Math.min(p, 100) / 100) * c;
+    /* p === null: nothing to measure or no measurement - a grey ring and a dash, never a green 0. */
+    /* How full a machine is for a NEW pod: the share of memory no longer free to schedule (used,
+       reserved by the kubelet, promised). Colours the RAM ring, so a green ring never sits next to
+       "no room for another". */
+    function ramPressure(h) {
+      if (h.metricsKnown === false || !h.ramTotal) return null;
+      const pressure = 100 - pct(freeOf(h), h.ramTotal);
+      const fits = FLEET.nextEnvMiB ? freeOf(h) >= nextEnvSize() : true;
+      return fits ? pressure : Math.max(pressure, 85);
+    }
+    function arcGauge(label, p, value, sub, toneP) {
+      const known = p !== null && p !== undefined && isFinite(p);
+      const r = 21, c = 2 * Math.PI * r, dash = known ? (Math.min(p, 100) / 100) * c : 0;
       return '<div class="gauge"><svg viewBox="0 0 52 52" aria-hidden="true">' +
         '<circle cx="26" cy="26" r="' + r + '" fill="none" stroke="var(--inset)" stroke-width="5"/>' +
-        '<circle cx="26" cy="26" r="' + r + '" fill="none" stroke="' + toneVar(p) + '" stroke-width="5" ' +
+        '<circle cx="26" cy="26" r="' + r + '" fill="none" stroke="' + (known ? toneVar(toneP === undefined || toneP === null ? p : toneP) : "var(--line-2)") + '" stroke-width="5" ' +
         'stroke-linecap="round" stroke-dasharray="' + dash.toFixed(1) + " " + c.toFixed(1) +
         '" transform="rotate(-90 26 26)"/>' +
         '<text x="26" y="30" text-anchor="middle" font-size="13" font-family="var(--font-mono)" fill="var(--text)">' +
-        p + "</text></svg><div><div class=\"g-t\">" + label + '</div><div class="g-v">' + value +
+        (known ? p : "—") + "</text></svg><div><div class=\"g-t\">" + label + '</div><div class="g-v">' + value +
         '</div><div class="g-s">' + sub + "</div></div></div>";
     }
 
@@ -1736,7 +1812,8 @@
     function chart() {
       const W = 760, H = 168, padL = 4, padR = 4, padT = 18, padB = 20;
       const n = SPEND.days.length;
-      const maxV = Math.max.apply(null, SPEND.cur.concat(SPEND.prev)) * 1.16 || 1;
+      if (!n) return '<p class="note">No spend recorded yet this month.</p>';
+      const maxV = Math.max.apply(null, [0].concat(SPEND.cur, SPEND.prev)) * 1.16 || 1;
       const iw = W - padL - padR, ih = H - padT - padB;
       const bw = iw / n, bar = Math.max(6, bw * 0.56);
       const y = v => padT + ih - (v / maxV) * ih;
@@ -1758,10 +1835,10 @@
       });
 
       let d = "";
-      SPEND.prev.forEach((v, i) => { d += (i ? " L" : "M") + cx(i).toFixed(1) + " " + y(v).toFixed(1); });
+      SPEND.prev.forEach((v, i) => { d += (i ? " L" : "M") + cx(i).toFixed(1) + " " + y(v || 0).toFixed(1); });
       g += '<path d="' + d + '" fill="none" stroke="var(--prev)" stroke-width="2" stroke-dasharray="5 4" ' +
         'stroke-linecap="round" stroke-linejoin="round"/>';
-      g += '<circle cx="' + cx(n - 1).toFixed(1) + '" cy="' + y(SPEND.prev[n - 1]).toFixed(1) +
+      g += '<circle cx="' + cx(n - 1).toFixed(1) + '" cy="' + y(SPEND.prev[n - 1] || 0).toFixed(1) +
         '" r="3.2" fill="var(--prev)" stroke="var(--surface)" stroke-width="2"/>';
 
       const lastV = SPEND.cur[n - 1];
@@ -1777,12 +1854,20 @@
 
       return '<svg class="spend-chart" viewBox="0 0 ' + W + " " + H +
         '" role="img" aria-label="Daily spend for ' + SPEND.monthLabel + " compared with " + SPEND.prevLabel +
-        ". Month to date " + usd(SPEND.mtd) + ", up " + SPEND.deltaPct.toFixed(1) + ' percent.">' + g + "</svg>";
+        ". Month to date " + usd(SPEND.mtd) + ", " + (SPEND.deltaPct >= 0 ? "up " : "down ") +
+        Math.abs(SPEND.deltaPct).toFixed(1) + " percent on the same days of " + SPEND.prevLabel + '.">' + g + "</svg>";
     }
     function chartLegend() {
       return '<div class="chart-legend">' +
         '<span><i class="swatch" style="background:var(--brass)"></i>' + SPEND.monthLabel + " (daily)</span>" +
-        '<span><i class="swatch prev"></i>' + SPEND.prevLabel + "</span></div>";
+        '<span><i class="swatch prev"></i>' + SPEND.prevLabel + " (daily)</span></div>";
+    }
+    /* What the estimate leaves out or had to assume - read with the figures, not hidden in a tooltip. */
+    function spendNotes() {
+      const notes = SPEND.notes || [];
+      if (!notes.length) return "";
+      return '<ul class="spend-notes">' + notes.map((n, i) =>
+        '<li' + (i ? ' class="assumed"' : "") + ">" + esc(n) + "</li>").join("") + "</ul>";
     }
     function chartTable() {
       const rows = SPEND.days.map((d, i) =>
@@ -1807,13 +1892,12 @@
     function capsuleCard(c, h) {
       const tiles = c.ctr.map(x =>
         '<div class="tile" style="--w:' + x.ram + '" title="' + esc(x.n) + " · " + esc(x.img) + " · " + szT(x.ram) +
-        " · " + x.cpu + "% cpu — box width is proportional to memory\">" +
+        " · " + vcpu(x.cpu) + " vCPU — box width is proportional to memory\">" +
         '<div class="t-n">' + esc(x.n) + '</div><div class="t-i">' + esc(x.img) +
-        '</div><div class="t-v">' + exact(sz(x.ram), szT(x.ram)) + " · " + x.cpu + "% cpu</div></div>").join("");
+        '</div><div class="t-v"><span>' + exact(sz(x.ram), szT(x.ram)) + "</span> · <span>" + vcpu(x.cpu) + " vCPU</span></div></div>").join("");
 
       const vols = c.vol.map(v => {
         return '<div class="vol" title="' + szT(v.mib) + '">' +
-          '<span class="fill" style="width:100%"></span>' +
           '<svg class="ic"><use href="#i-vol"/></svg>' +
           '<span class="v-n">' + esc(v.n) + '</span>' +
           '<span class="v-s">' + sz(v.mib) + "</span></div>";
@@ -1825,13 +1909,13 @@
           toneVar(p) + '"></i></div>') + "</div>";
 
       return '<div class="cap' + (c.status === "running" ? "" : " transitional") + '">' +
-        '<div class="crow"><div class="who">' + urlLink(c) +
-        '<div class="idrow">' + statusPill(c) + ageChip(c) + "</div></div>" +
+        '<div class="crow"><div class="who">' + envTag(c) + urlLink(c) +
+        '<div class="idrow">' + statusPill(c) + ageChip(c) + "</div>" + whyLine(c) + "</div>" +
         '<div class="stats">' +
         st("RAM", exact(sz(c.ram), szPairT(c.ram, h.ramTotal, "on this host")),
           pct(c.ram, h.ramTotal) + "% of host", pct(c.ram, h.ramTotal)) +
-        st("CPU", c.cpu + "%",
-          Math.round(c.cpu / cpuCap(h) * 100) + "% of " + cpuCap(h) + "%", c.cpu / cpuCap(h) * 100) +
+        st("CPU", vcpu(c.cpu) + " vCPU",
+          Math.round(c.cpu / cpuCap(h) * 100) + "% of the machine", c.cpu / cpuCap(h) * 100) +
         st("Swap", c.swap ? exact(sz(c.swap), szPairT(c.swap, h.swapTotal, "of host swap")) : "0",
           c.swap ? pct(c.swap, h.swapTotal) + "% of swap" : "not swapping",
           c.swap ? pct(c.swap, h.swapTotal) : 0) +
@@ -1850,69 +1934,96 @@
         "</div></div>";
     }
 
+    /* The part of an environment's name that tells it apart: every one starts with the project. */
+    const segName = c => isProduction(c) ? "prod" : prNumber(c) !== null ? "PR #" + prNumber(c) : c.id;
+
     function allocBar(h) {
       const sys = h.ramUsed - h.capsules.reduce((s, c) => s + c.ram, 0);
       const reserved = reservedOf(h);
       /* Shown as its own segment so the gap between "3.8G total" and what can
          actually be used is visible, instead of appearing as memory that
          mysteriously refuses to be allocated. */
-      const free = freeForScheduling(h);
+      const measured = h.metricsKnown !== false, open = h.schedulable !== false;
+      const promised = measured ? Math.min(h.promisedMiB || 0, freeForScheduling(h)) : 0;
+      const free = measured ? freeOf(h) : 0;
       /* Whatever the three segments do not account for - the reserve already
          covered by real system usage. Keeps the bar summing to ramTotal. */
-      const unlabelled = Math.max(0, h.ramTotal - h.capsules.reduce((s, c) => s + c.ram, 0) - Math.max(0, sys) - reserved - free);
-      /* How many MORE capsules the size of the largest one running would fit,
-         each counted at its true footprint rather than its reported size. */
-      const slotSize = effectiveSize(BIGGEST_CAP);
-      const fits = Math.floor(free / slotSize);
+      const unlabelled = Math.max(0, h.ramTotal - h.capsules.reduce((s, c) => s + c.ram, 0) - Math.max(0, sys) - reserved - promised - free);
+      /* How many more PR environments of the planned size fit here. */
+      const slotSize = nextEnvSize();
+      const fits = FLEET.nextEnvMiB ? Math.floor(free / slotSize) : null;
+      /* A share of installed memory as flex-basis: when the minimum widths that keep labels
+         readable do not all fit, every segment gives way in proportion to its size, and the bar
+         never grows wider than its card. */
       const w = mib => (mib / h.ramTotal * 100).toFixed(2) + "%";
 
       const segs = h.capsules.map(c =>
-        '<div class="seg' + (c.status === "running" ? "" : " work") + '" style="width:' + w(c.ram) +
-        '" title="' + esc(c.id) + " · " + szT(c.ram) + " · " + STATUS[c.status].label + " " + dur(c.statusSec) + '">' +
-        '<span class="sn">' + esc(c.id) + '</span><span class="sv">' +
+        '<div class="seg' + (c.status === "running" ? "" : " work") + '" style="flex-basis:' + w(c.ram) +
+        '" title="' + esc(c.id) + " · " + szT(c.ram) + " · " + statusOf(c).label + " " + dur(c.statusSec) + '">' +
+        '<span class="sn">' + esc(segName(c)) + '</span><span class="sv">' +
         (c.status === "running" ? sz(c.ram) + " · " + pct(c.ram, h.ramTotal) + "%"
-          : STATUS[c.status].label.split(" ")[0].toLowerCase() + " · " + dur(c.statusSec)) +
+          : statusOf(c).word + " · " + dur(c.statusSec)) +
         "</span></div>").join("") +
-        '<div class="seg sys" style="width:' + w(sys) + '" title="system + page cache · ' + szT(sys) + '">' +
+        '<div class="seg sys" style="flex-basis:' + w(sys) + '" title="system + page cache · ' + szT(sys) + '">' +
         /* below ~5% there is no room for a legible label; the tooltip carries it */
         (sys / h.ramTotal >= 0.05 ? '<span class="sv">system usage</span>' : "") + "</div>" +
-        (unlabelled > 0 ? '<div class="seg sys" style="width:' + w(unlabelled) + '" title="unallocated · ' + szT(unlabelled) + '"></div>' : "") +
+        (unlabelled > 0 ? '<div class="seg sys" style="flex-basis:' + w(unlabelled) + '" title="unallocated · ' + szT(unlabelled) + '"></div>' : "") +
         (reserved > 0
-          ? '<div class="seg reserved" style="width:' + w(reserved) + '" title="reserved for the kubelet and OS · ' + szT(reserved) +
-            " · never available to a capsule" + '">' +
+          ? '<div class="seg reserved" style="flex-basis:' + w(reserved) + '" title="reserved for the kubelet and OS · ' + szT(reserved) +
+            " · never available to an environment" + '">' +
             (reserved / h.ramTotal >= 0.05 ? '<span class="sv">reserved</span>' : "") + "</div>"
           : "") +
-        '<div class="seg free" style="width:' + w(free) + '" title="' + szT(free) +
-        " schedulable · largest running capsule is " + sz(BIGGEST_CAP) + ", planned at " + sz(slotSize) +
-        " with " + Math.round(CAPSULE_HEADROOM * 100) + "% headroom" + '">' +
-        '<span class="sn">' + sz(free) + ' free</span><span class="sv">' +
-        (fits > 0 ? "fits " + fits + " more" : "no room for another") + "</span></div>";
+        (promised > 0
+          ? '<div class="seg reserved" style="flex-basis:' + w(promised) + '" title="promised to a PR environment that is being placed · ' + szT(promised) + '">' +
+            (promised / h.ramTotal >= 0.05 ? '<span class="sv">promised</span>' : "") + "</div>"
+          : "") +
+        '<div class="seg free" style="flex-basis:' + w(free) + '" title="' + szT(free) +
+        " schedulable · a new PR environment is planned at " + sz(slotSize) + ": " + esc(FLEET.nextEnvBasis || "") +
+        ", plus " + Math.round(CAPSULE_HEADROOM * 100) + "% headroom" + '">' +
+        '<span class="sn">' + (measured ? sz(free) : "—") + ' free</span><span class="sv">' +
+        (!measured ? "no measurement" : !open ? "not accepting new pods" : fits === null ? "" : fits > 0
+          ? "room for " + fits + " more PR environment" + (fits === 1 ? "" : "s") : "no room for another PR environment") +
+        "</span></div>";
 
       return '<div class="alloc"><div class="alloc-l"><span>Memory allocation · ' +
         exact(sz(h.ramTotal) + " total", szT(h.ramTotal) + " installed") + "</span><span>" +
-        hostRam(h) + "% used · " + exact(sz(free) + " free", szT(free) + " schedulable, after " + szT(reserved) + " reserved") +
+        (measured ? hostRam(h) + "% used · " + exact(sz(free) + " free", szT(free) + " schedulable, after " + szT(reserved) + " reserved")
+          : "usage not measured - metrics-server or the node agent did not answer") +
         '</span></div><div class="stack">' + segs + "</div></div>";
     }
 
-    /** Names the capsule doing the paging, so the alarm points somewhere. */
+    /* A worker exists for PR environments: say which it carries, or that an empty one is still
+       billed until the next closed PR removes it (the teardown in pr-capsule.yml reclaims idle workers). */
+    function workerLine(h) {
+      if (h.role !== "worker") return "";
+      const since = h.createdAt ? " · added " + dur(Math.max(0, Math.round(Date.now() / 1000 - h.createdAt))) + " ago" : "";
+      const prs = h.capsules.map(prNumber).filter(n => n !== null).map(n => "PR #" + n);
+      return '<div class="workerline">' + (h.capsules.length
+        ? "Runs " + (prs.length ? prs.join(", ") : plural(h.capsules.length, "environment")) + since
+        : '<span class="idle">Idle</span>' + since + " · still billed " + usd(h.rate * 24) +
+          "/day · removed when the next PR environment closes") + "</div>";
+    }
+
+    /** Names the environment doing the paging, so the alarm points somewhere. */
     function worstSwapper(h) {
       const c = h.capsules.slice().sort((a, b) => b.swap - a.swap)[0];
-      return c && c.swap ? esc(c.id) + " is paging " + sz(c.swap) : "no single capsule accounts for it";
+      return c && c.swap ? esc(c.id) + " is paging " + sz(c.swap) : "no single environment accounts for it";
     }
 
     /* A queued capsule has a spec but no measurements, so it gets its own compact row
        rather than a capsule card with empty gauges. Its domain is plain text, not a
        link — nothing is serving there yet. */
     function queueRow(c) {
-      const best = roomiest(), fits = placeable(c.reqRam);
+      const best = roomiest(), memoryFits = best.id !== "" && (c.reqRam || 0) <= freeOf(best);
       return '<div class="qrow">' +
-        '<div class="qid">' + esc(c.host) + '<span class="u">requested capsule · not yet placed</span></div>' +
+        '<div class="qid">' + esc(c.host) + '<span class="u">' + envTag(c) + " · no node can take its pods</span>" + whyLine(c) + "</div>" +
         "<div>" + statusPill(c) + "</div>" +
-        '<div class="qreq">requests <b>' + exact(sz(c.reqRam), szT(c.reqRam) + " requested") + "</b><br>" +
-        (fits
-          ? '<span style="color:var(--ok)">fits ' + esc(best.id) + " · " + sz(freeOf(best)) + " free</span>"
-          : '<span class="why"><svg class="ic"><use href="#i-warn"/></svg>largest free block is ' +
-          sz(freeOf(best)) + " on " + esc(best.id) + " — no host can take it</span>") + "</div>" +
+        '<div class="qreq">requests <b>' + exact(sz(c.reqRam || 0), szT(c.reqRam || 0) + " requested") + "</b><br>" +
+        (best.id === ""
+          ? '<span class="why"><svg class="ic"><use href="#i-warn"/></svg>no measured host is accepting pods</span>'
+          : memoryFits
+            ? '<span class="note">' + esc(best.id) + " has " + sz(freeOf(best)) + " free, so memory is not what blocks it - see the scheduler's message</span>"
+            : '<span class="why"><svg class="ic"><use href="#i-warn"/></svg>largest free block is ' + sz(freeOf(best)) + " on " + esc(best.id) + "</span>") + "</div>" +
         '<div class="qspec">' +
         c.ctr.map(x => '<span class="s">' + esc(x.n) + "</span>").join("") +
         c.vol.map(v => '<span class="s v">' + esc(v.n) + "</span>").join("") +
@@ -1921,108 +2032,183 @@
 
     function queueSection() {
       if (!QUEUE.length) return "";
-      return '<div class="queue"><div class="qhead"><h3>Waiting for a slot</h3>' +
-        '<span class="note">' + QUEUE.length + (QUEUE.length === 1 ? " capsule" : " capsules") +
-        " · holding no memory, accruing no cost</span>" +
+      return '<div class="queue"><div class="qhead"><h3>Can\'t be placed</h3>' +
+        '<span class="note">' + QUEUE.length + (QUEUE.length === 1 ? " environment" : " environments") +
+        " · the scheduler found no node for their pods</span>" +
         '<span class="sep"></span><span class="note">longest wait ' +
         dur(Math.max.apply(null, QUEUE.map(c => c.statusSec))) + "</span></div>" +
         QUEUE.slice().sort(byStatusTime).map(queueRow).join("") + "</div>";
     }
 
     function hostCard(h) {
-      const alarm = h.swapUsed / h.swapTotal >= 0.5;
-      return '<div class="host' + (alarm ? " alarm" : "") + '">' +
+      const agent = h.agentKnown !== false;
+      const alarm = agent && h.swapTotal > 0 && h.swapUsed / h.swapTotal >= 0.5;
+      const diskPct = agent && h.diskTotal ? Math.round(h.diskUsed / h.diskTotal * 100) : null;
+      /* local-path volumes and every image live on this disk; past ~90% the kubelet starts evicting. */
+      const diskAlarm = diskPct !== null && diskPct >= 90;
+      return '<div class="host' + (alarm || diskAlarm ? " alarm" : "") + '">' +
         '<div class="hhead"><div class="htop"><div class="hname"><h3>' + esc(h.id) + "</h3>" +
         '<div class="sub">' + esc(h.region) + "</div></div>" +
         '<div class="gauges">' +
         arcGauge("RAM", hostRam(h),
-          exact(szPair(h.ramUsed, h.ramTotal), szPairT(h.ramUsed, h.ramTotal, "used")), "used") +
-        arcGauge("Swap", hostSwap(h),
-          exact(szPair(h.swapUsed, h.swapTotal), szPairT(h.swapUsed, h.swapTotal, "swapped")), "swapped") +
-        arcGauge("Disk", Math.round(((h.diskUsed || 0) / (h.diskTotal || 1)) * 100),
-          exact(szPair(h.diskUsed || 0, h.diskTotal || 0), szPairT(h.diskUsed || 0, h.diskTotal || 0, "used")), "used") +
-        arcGauge("CPU", hostCpu(h), h.cpuUsed + "% / " + cpuCap(h) + "%",
-          h.cores + " cores × " + h.threads + " = " + threadsOf(h) + " threads") +
+          exact(szPair(h.ramUsed, h.ramTotal), szPairT(h.ramUsed, h.ramTotal, "used")), "used", ramPressure(h)) +
+        (!agent ? arcGauge("Swap", null, "—", "not measured")
+          : !h.swapTotal ? arcGauge("Swap", null, "none", "no swap configured")
+          : arcGauge("Swap", hostSwap(h), exact(szPair(h.swapUsed, h.swapTotal), szPairT(h.swapUsed, h.swapTotal, "swapped")), "swapped")) +
+        (diskPct === null ? arcGauge("Disk", null, "—", "node agent not answering")
+          : arcGauge("Disk", diskPct, exact(szPair(h.diskUsed, h.diskTotal), szPairT(h.diskUsed, h.diskTotal, "used")), "used")) +
+        arcGauge("CPU", hostCpu(h), vcpu(h.cpuUsed) + " / " + threadsOf(h) + " vCPU", "in use") +
         "</div></div>" +
-        '<div class="hchips"><span class="chip type">' + esc(h.type) + '</span><span class="chip">' + h.cores + " cores × " + h.threads +
-        ' threads</span><span class="chip">' + usd(h.rate) + "/h</span></div></div>" +
+        '<div class="hchips"><span class="chip">' + (h.role === "worker" ? "PR worker" : "server") + "</span>" +
+        (h.schedulable === false ? '<span class="chip warn" title="Cordoned, not ready or tainted: new pods will not land here">not schedulable</span>' : "") +
+        (h.metricsKnown === false ? '<span class="chip warn" title="metrics-server or the node agent did not answer; usage below reads as zero">no metrics</span>' : "") +
+        (h.priceKnown === false ? '<span class="chip warn" title="The price feed has no price for this type and region yet; a fallback rate is used">price estimated</span>' : "") +
+        '<span class="chip type">' + esc(h.type) + '</span><span class="chip">' + plural(threadsOf(h), "vCPU") +
+        '</span><span class="chip">' + usd(h.rate) + "/h</span></div></div>" +
         (alarm ? '<div class="alarmline"><svg class="ic"><use href="#i-warn"/></svg>Swap pressure ' +
           hostSwap(h) + "% — " + worstSwapper(h) + ". This host is over-committed, not busy.</div>" : "") +
+        (diskAlarm ? '<div class="alarmline"><svg class="ic"><use href="#i-warn"/></svg>Disk ' + diskPct +
+          "% full — images and local-path volumes live here, and past this point the kubelet evicts pods. Free space or grow the volume.</div>" : "") +
+        workerLine(h) +
         allocBar(h) +
         '<div class="caps">' + h.capsules.map(c => capsuleCard(c, h)).join("") + "</div></div>";
     }
 
-    function render(root) {
-      const tblToggle = root.querySelector('.tbl-toggle');
-      const tblOpen = tblToggle ? tblToggle.open : false;
+    /* Brings `from`'s children in line with `to`'s, touching only what differs, so a frame every
+       2s keeps keyboard focus, a text selection, an open hover title and the scroll position. A
+       <details> keeps the open state the viewer gave it. */
+    function morphChildren(from, to) {
+      const fc = Array.from(from.childNodes), tc = Array.from(to.childNodes);
+      tc.forEach((t, i) => {
+        const f = fc[i];
+        if (!f) from.appendChild(t);
+        else if (f.nodeType !== t.nodeType || f.nodeName !== t.nodeName) from.replaceChild(t, f);
+        else if (f.nodeType !== 1) { if (f.nodeValue !== t.nodeValue) f.nodeValue = t.nodeValue; }
+        else {
+          for (const a of Array.from(f.attributes)) {
+            if (!t.hasAttribute(a.name) && !(f.nodeName === "DETAILS" && a.name === "open")) f.removeAttribute(a.name);
+          }
+          for (const a of Array.from(t.attributes)) {
+            if (f.getAttribute(a.name) !== a.value) f.setAttribute(a.name, a.value);
+          }
+          morphChildren(f, t);
+        }
+      });
+      for (let i = fc.length - 1; i >= tc.length; i--) from.removeChild(fc[i]);
+    }
 
-      root.innerHTML =
-        '<div class="fleetbar"><h2>Fleet</h2>' +
-        '<span class="live"><span class="dot"></span>live</span>' +
-        '<a class="host" href="https://' + esc(FLEET.domain) + '">' + esc(FLEET.domain) + "</a>" +
+    function render(root) {
+      const tpl = document.createElement("template");
+      tpl.innerHTML =
+        '<div class="fleetbar"><h2>' + esc(FLEET.project || "Deployment") + "</h2>" +
+        freshness() +
+        (FLEET.appDomain ? '<a class="host" href="https://' + esc(FLEET.appDomain) + '" target="_blank" rel="noopener">' + esc(FLEET.appDomain) + "</a>" : "") +
         '<span class="sep"></span>' +
-        '<span class="lbl">' + FLEET.slotsUsed + " active hosts</span>" +
+        '<span class="lbl">' + machinesLabel() + "</span>" +
         '<span class="sep"></span>' +
-        '<span class="lbl">' + (ALL_CAPS.length + QUEUE.length) + " capsules · " + statusTally() + "</span>" +
+        '<span class="lbl">' + plural(ALL_CAPS.length + QUEUE.length, "environment") + " · " + statusTally() + "</span>" +
         '<span class="lbl">' +
-        exact(szPair(FLEET_RAM_USED, FLEET_RAM), szPairT(FLEET_RAM_USED, FLEET_RAM, "across the fleet")) +
+        exact(szPair(FLEET_RAM_USED, FLEET_RAM), szPairT(FLEET_RAM_USED, FLEET_RAM, "across all machines")) +
         "</span></div>" +
         '<div class="sortnote"><svg class="ic"><use href="#i-sort"/></svg>' +
-        "Sorted by time in current status — shortest first</div>" +
+        "Server first, then PR workers · production first, then by time in current status</div>" +
         queueSection() +
         ORDERED.map(hostCard).join("") +
         '<div class="money"><div class="head"><h3>Spend — ' + SPEND.monthLabel + "</h3>" + chartLegend() + "</div>" +
         '<div class="figs">' +
-        '<div class="fig"><div class="l">Month to date</div><div class="v">' + usd(SPEND.mtd) + "</div>" +
+        '<div class="fig"><div class="l">Month to date · estimate</div><div class="v">' + usd(SPEND.mtd) + "</div>" +
         deltaChip() + "</div>" +
         '<div class="fig"><div class="l">' + SPEND.prevLabel + '</div><div class="v sm">' +
         usd(SPEND.prevSame) + "</div></div>" +
         '<div class="fig"><div class="l">Run-rate</div><div class="v sm">' + usd(SPEND.runRate) + "/day</div></div>" +
         '<div class="fig"><div class="l">Projected month</div><div class="v sm">' + usd0(SPEND.projected) + "</div></div>" +
-        "</div>" + chart() + chartTable() + "</div>";
-
-      if (tblOpen) {
-        const newTblToggle = root.querySelector('.tbl-toggle');
-        if (newTblToggle) newTblToggle.open = true;
-      }
+        "</div>" + chart() + spendNotes() + chartTable() + "</div>";
+      /* title= shows only on mouse hover. Each explanation becomes data-tip on an element that
+         can take focus, shown by the tip layer on hover, focus or tap, and announced by it. */
+      tpl.content.querySelectorAll("[title]").forEach(el => {
+        el.setAttribute("data-tip", el.getAttribute("title"));
+        el.removeAttribute("title");
+        if (!el.matches("a, button, input, summary, [tabindex]")) el.setAttribute("tabindex", "0");
+      });
+      morphChildren(root, tpl.content);
     }
     function connectWS() {
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(wsProtocol + '//' + window.location.host + '/ws');
+      ws.onopen = function () { CONNECTED = true; };
       ws.onmessage = function (e) {
         const data = JSON.parse(e.data);
+        GENERATED_AT = data.generatedAt || Date.now();
         FLEET = data.FLEET;
+        FRAMES++;
+        if (FLEET.project) {
+          document.title = FLEET.project + " · Flarops dashboard";
+          const bp = document.getElementById("board-project");
+          if (bp) bp.textContent = FLEET.project;
+        }
         HOSTS = data.HOSTS;
         QUEUE = data.QUEUE;
         SPEND = data.SPEND;
 
-        ORDERED = HOSTS.map(h => Object.assign({}, h, { capsules: h.capsules.slice().sort(byStatusTime) }))
-          .sort((a, b) => hostStatusTime(a) - hostStatusTime(b));
+        /* The collector sends the server first; production leads its host. */
+        ORDERED = HOSTS.map(h => Object.assign({}, h, {
+          capsules: h.capsules.slice().sort((a, b) => (isProduction(b) - isProduction(a)) || byStatusTime(a, b))
+        }));
         ALL_CAPS = HOSTS.flatMap(h => h.capsules);
         FLEET_RAM = HOSTS.reduce((s, h) => s + h.ramTotal, 0);
         FLEET_RAM_USED = HOSTS.reduce((s, h) => s + h.ramUsed, 0);
-        BIGGEST_CAP = ALL_CAPS.length > 0 ? Math.max.apply(null, ALL_CAPS.map(c => c.ram)) : 1;
 
         render(document.querySelector('[data-render="board"]'));
       };
       ws.onclose = function () {
-        setTimeout(connectWS, 2000);
+        CONNECTED = false;
+        updateFreshness();
+        /* A closed socket is often an expired session: the upgrade then gets 401 and the page would
+           otherwise retry forever on frozen numbers. The page itself redirects to /login when signed out. */
+        fetch("/", { cache: "no-store", redirect: "manual" }).then(r => {
+          if (r.type === "opaqueredirect" || r.status === 401 || r.redirected) window.location.href = "/login";
+          else setTimeout(connectWS, 2000);
+        }).catch(() => setTimeout(connectWS, 2000));
       };
     }
     connectWS();
+
+    /* How old the numbers on screen are, ticking between frames: a frame arrives every 2s, so
+       a gap of 10s means the collector or the connection is stuck. */
+    function freshnessState() {
+      const ageSec = GENERATED_AT ? Math.max(0, Math.round((Date.now() - GENERATED_AT) / 1000)) : null;
+      if (!CONNECTED) return { cls: "dead", text: "disconnected · reconnecting" + (ageSec !== null ? " · data " + dur(ageSec) + " old" : "") };
+      if (ageSec === null) return { cls: "stale", text: "waiting for data" };
+      if (ageSec >= 60) return { cls: "dead", text: "no update for " + dur(ageSec) };
+      if (ageSec >= 10) return { cls: "stale", text: "updated " + dur(ageSec) + " ago" };
+      return { cls: "", text: "live" };
+    }
+    function freshness() {
+      const f = freshnessState();
+      return '<span class="live ' + f.cls + '" id="freshness" role="status"><span class="dot"></span>' + f.text + "</span>";
+    }
+    function updateFreshness() {
+      const el = document.getElementById("freshness");
+      if (!el) return;
+      const f = freshnessState();
+      el.className = "live " + f.cls;
+      el.lastChild.textContent = f.text;
+    }
+    setInterval(updateFreshness, 1000);
 
     /* hover layer for the spend chart */
     const tip = document.getElementById("tip");
     document.addEventListener("mouseover", e => {
       const b = e.target.closest && e.target.closest("rect.bar");
       if (!b) return;
+      tip.className = "";
       const i = +b.dataset.i, d = SPEND.days[i], c = SPEND.cur[i], p = SPEND.prev[i];
-      const diff = ((c - p) / p) * 100;
+      const diff = p > 0 ? ((c - p) / p) * 100 : null;
       tip.innerHTML = '<div class="t-d">' + monShort(SPEND.monthLabel) + " " + d + (i === SPEND.days.length - 1 ? " · today" : "") + "</div>" +
         '<div class="t-r"><i>this month</i><span>' + usd(c) + "</span></div>" +
         '<div class="t-r"><i>' + monShort(SPEND.prevLabel) + " " + d + "</i><span>" + usd(p) + "</span></div>" +
-        '<div class="t-r"><i>change</i><span style="color:var(--' + (diff >= 0 ? "hot" : "ok") + ')">' +
-        (diff >= 0 ? "+" : "") + diff.toFixed(0) + "%</span></div>";
+        '<div class="t-r"><i>change</i><span style="color:var(--' + (diff === null ? "text-3" : diff >= 0 ? "hot" : "ok") + ')">' +
+        (diff === null ? "—" : (diff >= 0 ? "+" : "") + diff.toFixed(0) + "%") + "</span></div>";
       tip.style.opacity = "1";
     });
     document.addEventListener("mousemove", e => {
@@ -2031,7 +2217,48 @@
       tip.style.top = Math.max(8, e.clientY - tip.offsetHeight - 12) + "px";
     });
     document.addEventListener("mouseout", e => {
-      if (e.target.closest && e.target.closest("rect.bar")) tip.style.opacity = "0";
+      if (e.target.closest && (e.target.closest("rect.bar") || e.target.closest("[data-tip]"))) hideTip();
+    });
+
+    /* Explanations (data-tip): hover with a mouse, focus with the keyboard, tap on a touch screen. */
+    let tipOwner = null, tipShownAt = 0;
+    function showTip(el, x, y) {
+      tipOwner = el;
+      tipShownAt = Date.now();
+      tip.className = "text";
+      tip.textContent = el.getAttribute("data-tip");
+      /* Measured at the left edge: left where it last was, near the right edge, the box would be
+         squeezed narrow and the text would spill out of it. */
+      tip.style.left = "0px";
+      tip.style.top = "0px";
+      tip.style.opacity = "1";
+      const r = el.getBoundingClientRect();
+      const left = x !== undefined ? x + 14 : r.left;
+      const top = y !== undefined ? y - tip.offsetHeight - 12 : r.top - tip.offsetHeight - 8;
+      tip.style.left = Math.max(8, Math.min(left, window.innerWidth - tip.offsetWidth - 8)) + "px";
+      tip.style.top = (top < 8 ? r.bottom + 8 : top) + "px";
+    }
+    function hideTip() {
+      tipOwner = null;
+      tip.className = "";
+      tip.style.opacity = "0";
+    }
+    document.addEventListener("mouseover", e => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (el) showTip(el, e.clientX, e.clientY);
+    });
+    document.addEventListener("focusin", e => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (el) showTip(el); else hideTip();
+    });
+    document.addEventListener("focusout", hideTip);
+    document.addEventListener("keydown", e => { if (e.key === "Escape") hideTip(); });
+    document.addEventListener("click", e => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (!el) { hideTip(); return; }
+      if (el.matches("a")) return;
+      /* A tap focuses first, then clicks: the click that follows its own focus keeps the tip open. */
+      if (tipOwner === el && Date.now() - tipShownAt > 400) hideTip(); else showTip(el);
     });
   </script>
 </body>

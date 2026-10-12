@@ -4,7 +4,7 @@ const path = require('path');
 const readText = (file) => fs.readFileSync(file, 'utf8').replace(/\r\n?/g, '\n');
 const readline = require('readline');
 const { execFileSync } = require('child_process');
-const { getDefaultAWSCredentials, ensureAwsCli, handleS3Bucket } = require('../../utils/awsHelper.js');
+const { getDefaultAWSCredentials, ensureAwsCli, handleS3Bucket, checkAwsAccess } = require('../../utils/awsHelper.js');
 const { SENSITIVE_REGEX, DB_PASSWORD_REGEX, IGNORED_DIRS, LOOPBACK_HOST_REGEX } = require('../../utils/constants.js');
 const { parseSupportService, toK8sName, extractEnv, extractBuildArgs, extractCommand, extractEnvFiles, extractVolumes, materializeBindMounts } = require('../../utils/composeSupport.js');
 const { generateFlaropsYaml } = require('../../utils/flaropsYaml.js');
@@ -16,6 +16,7 @@ const { yamlEscapeDoubleQuoted, generateEnvString } = require('../../utils/yamlW
 const { listComposeFiles, isVariantComposeFile, approveVariantComposeFile, composeBaseDir } = require('../../utils/composeFiles.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
 const { EnvFile } = require('../../utils/envFile.js');
+const { newDashboardPassword, printDashboardLogin, dashboardHost } = require('../../utils/dashboardAccess.js');
 const { SecretWiring, unmountedSecretKeys } = require('../../utils/secretWiring.js');
 const isYes = collectOperatorAnswers.isYes;
 const hclEscapeString = writeTerraform.hclEscapeString;
@@ -28,6 +29,7 @@ function isPathInside(dirPath, targetPath) {
 }
 
 function askQuestion(query) {
+  if (!process.stdout.isTTY || process.env.NO_COLOR) query = query.replace(/\x1b\[[0-9;]*m/g, '');
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -332,25 +334,33 @@ function applyEnvDecision(decision, targets) {
   }
 }
 
-module.exports = async function init() {
+async function runInit() {
   const currentDir = process.cwd();
   const gitDir = path.join(currentDir, '.git');
 
   if (!fs.existsSync(gitDir)) {
-    console.error("not a root of git repositoty");
+    console.error("\x1b[31mERROR: this is not the root of a Git repository.\x1b[0m Run init from the repository's top directory (where .git is) - or, for a new project, run \"git init\" there first.");
     process.exit(1);
   }
+
+  // The branch the repository is on deploys: main, master, or whatever this project uses. A repository
+  // with no commits yet still has a branch name (git's default for it).
+  let deployBranch = 'main';
+  try {
+    deployBranch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], { cwd: currentDir, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() || 'main';
+  } catch (e) { /* detached HEAD: keep main */ }
 
   // init is one-shot: a second run would reissue keys and overwrite the user's edits.
   const flaropsYamlFile = path.join(currentDir, 'flarops.yaml');
   if (fs.existsSync(flaropsYamlFile)) {
     console.error("\x1b[31mflarops.yaml already exists - this project is already initialized.\x1b[0m");
     console.error("");
-    console.error("  To change what is deployed, edit flarops.yaml.");
-    console.error("  To drop chart templates that no longer match any service, run: flarops sync");
-    console.error("  To generate everything again from scratch, delete flarops.yaml first.");
-    console.error("  Note that a fresh init issues a new deploy key and dashboard password,");
-    console.error("  and overwrites the generated chart, Terraform and workflows.");
+    console.error("  To change what is deployed, edit flarops.yaml and run: npx flarops sync");
+    console.error("  To replace a lost dashboard password, run: npx flarops dashboard-password");
+    console.error("  To analyse the project again from scratch, delete flarops.yaml and run init.");
+    console.error("  That rewrites flarops.yaml (your edits to it are lost), the chart and the");
+    console.error("  workflows; it keeps .keys/, deploy/.env (with the dashboard password) and");
+    console.error("  deploy/terraform/.");
     process.exit(1);
   }
 
@@ -358,7 +368,7 @@ module.exports = async function init() {
   // deploy key and the secrets in deploy/.env wherever the repository points it.
   const WRITTEN_PATHS = [
     '.gitignore', '.dockerignore', 'flarops.yaml', 'FLAROPS.md', 'AGENTS.md', 'CLAUDE.md', 'werf.yaml', 'werf-giterminism.yaml',
-    '.keys/deploy_rsa', '.keys/deploy_rsa.pub', 'deploy/.env', 'deploy/.env.safety', 'deploy/.flarops-state.json',
+    '.keys/deploy_rsa', '.keys/deploy_rsa.pub', 'deploy/.env', 'deploy/.flarops-state.json',
     'deploy/terraform/main.tf', 'deploy/terraform/variables.tf', 'deploy/helm/values.yaml',
     'deploy/helm/Chart.yaml', 'deploy/helm/templates', 'deploy/dashboard',
     '.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml',
@@ -398,28 +408,8 @@ module.exports = async function init() {
     'deploy/helm/flarops-ci-values.json'
   ];
 
-  if (!fs.existsSync(gitignoreFile)) {
-    fs.writeFileSync(gitignoreFile, '#autogenerated by flarops\n' + linesToIgnore.join('\n') + '\n');
-    console.log("Created .gitignore and added ignore rules");
-  } else {
-    const gitignoreContent = fs.readFileSync(gitignoreFile, 'utf8');
-    const existingLines = new Set(gitignoreContent.split('\n').map(line => line.trim()));
-    const linesToAdd = linesToIgnore.filter(line => !existingLines.has(line));
-
-    if (linesToAdd.length > 0) {
-      let appendStr = '#autogenerated by flarops\n' + linesToAdd.join('\n') + '\n';
-      if (gitignoreContent.length > 0 && !gitignoreContent.endsWith('\n')) {
-        appendStr = '\n' + appendStr;
-      }
-      fs.appendFileSync(gitignoreFile, appendStr);
-      console.log(`Appended ${linesToAdd.length} rules to .gitignore`);
-    } else {
-      console.log("All ignore rules are already in .gitignore");
-    }
-  }
 
   const keysDir = path.join(currentDir, '.keys');
-  ensureDir(keysDir, "Created .keys/ directory");
 
   const privateKeyPath = path.join(keysDir, 'deploy_rsa');
   const publicKeyPath = path.join(keysDir, 'deploy_rsa.pub');
@@ -477,6 +467,42 @@ module.exports = async function init() {
     process.exit(1);
   }
 
+
+  console.log('');
+
+  const answers = await collectOperatorAnswers({
+    currentDir, askQuestion, askPassword, execFileSync,
+    ensureAwsCli, handleS3Bucket, getDefaultAWSCredentials, checkAwsAccess,
+  });
+  const {
+    projectName, dockerRegistry, dockerProject, dockerRepository, registryUser, registryPassword,
+    domain, cloudflareApiToken, cloudflareZoneId,
+    awsCredentials, awsRegion, remoteStateBucket,
+  } = answers;
+  let s3BucketWarning = answers.s3BucketWarning;
+
+  // Written only now, so stopping at a question (Ctrl-C) leaves the repository as it was.
+  if (!fs.existsSync(gitignoreFile)) {
+    fs.writeFileSync(gitignoreFile, '#autogenerated by flarops\n' + linesToIgnore.join('\n') + '\n');
+    console.log("Created .gitignore and added ignore rules");
+  } else {
+    const gitignoreContent = fs.readFileSync(gitignoreFile, 'utf8');
+    const existingLines = new Set(gitignoreContent.split('\n').map(line => line.trim()));
+    const linesToAdd = linesToIgnore.filter(line => !existingLines.has(line));
+
+    if (linesToAdd.length > 0) {
+      let appendStr = '#autogenerated by flarops\n' + linesToAdd.join('\n') + '\n';
+      if (gitignoreContent.length > 0 && !gitignoreContent.endsWith('\n')) {
+        appendStr = '\n' + appendStr;
+      }
+      fs.appendFileSync(gitignoreFile, appendStr);
+      console.log(`Appended ${linesToAdd.length} rules to .gitignore`);
+    } else {
+      console.log("All ignore rules are already in .gitignore");
+    }
+  }
+
+  ensureDir(keysDir, "Created .keys/ directory");
   if (fs.existsSync(privateKeyPath)) {
     // A mismatched pair would authorize a key nobody holds.
     let pairIsConsistent = false;
@@ -505,19 +531,6 @@ module.exports = async function init() {
 
   const publicKey = fs.readFileSync(publicKeyPath, 'utf8').trim();
   const privateKey = fs.readFileSync(privateKeyPath, 'utf8').trim();
-
-  console.log("\nConfigure your state");
-
-  const answers = await collectOperatorAnswers({
-    currentDir, askQuestion, askPassword, execFileSync,
-    ensureAwsCli, handleS3Bucket, getDefaultAWSCredentials,
-  });
-  const {
-    projectName, dockerRegistry, dockerProject, dockerRepository, registryUser, registryPassword,
-    domain, cloudflareApiToken, cloudflareZoneId,
-    awsCredentials, awsRegion, remoteStateBucket,
-  } = answers;
-  let s3BucketWarning = answers.s3BucketWarning;
 
   const deployDir = path.join(currentDir, 'deploy');
   const terraformDir = path.join(deployDir, 'terraform');
@@ -602,7 +615,7 @@ module.exports = async function init() {
     knownPaths.push(path.join(currentDir, dbInfo.dbContext));
     // An image the repository builds for its database wins over one compose pins.
     if (dbInfo.pinnedImage) {
-      console.log(`\x1b[34mINFO: docker-compose pins ${dbInfo.pinnedImage} for the database, but ${path.join(dbInfo.dbContext, dbInfo.localDbDockerfile || 'Dockerfile')} builds one in this repository - building that instead. Its credentials and database name still come from the compose declaration.\x1b[0m`);
+      console.log(`\x1b[36mINFO: docker-compose pins ${dbInfo.pinnedImage} for the database, but ${path.join(dbInfo.dbContext, dbInfo.localDbDockerfile || 'Dockerfile')} builds one in this repository - building that instead. Its credentials and database name still come from the compose declaration.\x1b[0m`);
     }
   }
 
@@ -634,7 +647,7 @@ module.exports = async function init() {
       if (!inside) escaped.push(`${composeName} (context: ${path.relative(currentDir, resolved) || info.context})`);
     }
     if (escaped.length > 0) {
-      console.warn(`\x1b[33mWARNING: ${escaped.length} docker-compose service(s) build from a context OUTSIDE this repository and were skipped: ${escaped.join(', ')}. A compose file meant to sit one directory down ("context: ../api") does this to every service at once. Fix the paths so they are relative to the repository root, or declare those services in flarops.yaml and run "flarops sync".\x1b[0m`);
+      console.warn(`\x1b[33mWARNING: ${escaped.length} docker-compose service(s) build from a context OUTSIDE this repository and were skipped: ${escaped.join(', ')}. A compose file meant to sit one directory down ("context: ../api") does this to every service at once. Fix the paths so they are relative to the repository root, or declare those services in flarops.yaml and run "npx flarops sync".\x1b[0m`);
       console.log("");
     }
   } catch (e) { /* best effort */ }
@@ -658,15 +671,49 @@ module.exports = async function init() {
     usedNames.add(finalName);
   }
 
+  // A change to the project's own code is previewed first: the files it touches are listed, and it is
+  // asked about only when there is something to change. Files with uncommitted edits make Enter mean
+  // no - the rewrite would be mixed into work not yet saved in git.
+  const rel = (f) => path.relative(currentDir, f);
+  const uncommitted = (files) => {
+    if (files.length === 0) return [];
+    try {
+      return execFileSync('git', ['status', '--porcelain', '--', ...files], { cwd: currentDir, stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString().split('\n').filter(Boolean).map(l => l.slice(3));
+    } catch (e) { return []; }
+  };
+  const confirmCodeChange = async (what, files, extra) => {
+    console.log('');
+    console.log(`${what} These files would change:`);
+    for (const f of files) console.log(`  ${rel(f)}`);
+    for (const line of extra || []) console.log(`  ${line}`);
+    const dirty = uncommitted(files);
+    if (dirty.length > 0) {
+      console.log(`\x1b[33m${dirty.join(', ')} ${dirty.length === 1 ? 'has' : 'have'} uncommitted changes - commit or stash them first to review this rewrite on its own.\x1b[0m`);
+    }
+    const answer = await askQuestion(`\x1b[36m? \x1b[0mApply it? ${dirty.length > 0 ? '[y/N]' : '[Y/n]'} `);
+    return dirty.length > 0 ? /^y(es)?$/i.test(answer.trim()) : isYes(answer);
+  };
+
   let refactoredEnvKey = null;
   let refactoredRoutes = [];
   if (frontendInfo.frontendPath && backendInfo.ports && backendInfo.ports.length > 0) {
-    const doRefactor = await askQuestion('\x1b[36m? \x1b[0mDo you want to automatically refactor hardcoded frontend API URLs to environment variables? [Y/n] ');
-    if (isYes(doRefactor)) {
+    const preview = await refactorFrontendEnv(frontendInfo.frontendPath, backendInfo.ports, false);
+    const nginxPreview = await refactorNginxConf(frontendInfo.frontendPath, backendInfo.ports, false);
+    const codeFiles = [...((preview && preview.files) || []), ...nginxPreview];
+    // Nothing hardcoded: nothing to rewrite, and nothing to ask.
+    let apply = false;
+    if (codeFiles.length > 0) {
+      apply = await confirmCodeChange(
+        `The frontend calls the backend at a hardcoded address on port ${backendInfo.ports.join("/")}, which a browser cannot reach once deployed. Flarops can read it from ${preview ? preview.envVarKey : 'an environment variable'} instead${nginxPreview.length ? ', and point nginx proxy_pass at the api service' : ''}.`,
+        codeFiles,
+        preview && preview.supportFiles.length ? [`and ${preview.supportFiles.map(rel).join(', ')} (the local value, kept out of git and the image)`] : []);
+    }
+    if (apply) {
       const refactorResult = await refactorFrontendEnv(frontendInfo.frontendPath, backendInfo.ports);
-      const nginxRefactorCount = await refactorNginxConf(frontendInfo.frontendPath, backendInfo.ports);
-      if (nginxRefactorCount > 0) {
-        console.log(`\x1b[32mSuccessfully refactored ${nginxRefactorCount} Nginx config files to point to the correct Kubernetes backend service.\x1b[0m`);
+      const nginxChanged = await refactorNginxConf(frontendInfo.frontendPath, backendInfo.ports);
+      if (nginxChanged.length > 0) {
+        console.log(`\x1b[32mPointed proxy_pass at the api service in ${nginxChanged.map(rel).join(', ')}.\x1b[0m`);
       }
       if (refactorResult) {
         refactoredEnvKey = refactorResult.envVarKey;
@@ -674,7 +721,7 @@ module.exports = async function init() {
           refactoredRoutes = refactorResult.discoveredRoutes;
         }
         if (refactorResult.filesChanged > 0) {
-          console.log(`\x1b[32mSuccessfully refactored ${refactorResult.filesChanged} files to use ${refactoredEnvKey}.\x1b[0m`);
+          console.log(`\x1b[32mThe frontend now reads the backend address from ${refactoredEnvKey} in ${refactorResult.files.map(rel).join(', ')}.\x1b[0m`);
         }
       }
     }
@@ -686,11 +733,13 @@ module.exports = async function init() {
     let dbRefactorResult = await refactorBackendDbUrl(backendInfo.backendPath, false);
 
     if (dbRefactorResult && dbRefactorResult.hasHardcoded) {
-      const doDbRefactor = await askQuestion('\x1b[36m? \x1b[0mDo you want to automatically refactor hardcoded database URLs in the backend to environment variables? [Y/n] ');
-      if (isYes(doDbRefactor)) {
+      const doDbRefactor = await confirmCodeChange(
+        'The backend connects to the database at a hardcoded URL. Flarops can make it read DATABASE_URL (DB_URL for MongoDB) first and keep the URL as the fallback.',
+        dbRefactorResult.files);
+      if (doDbRefactor) {
         dbRefactorResult = await refactorBackendDbUrl(backendInfo.backendPath, true);
         if (dbRefactorResult && dbRefactorResult.filesChanged > 0) {
-          console.log(`\x1b[32mSuccessfully refactored ${dbRefactorResult.filesChanged} backend files to use ${dbRefactorResult.discoveredVars.join(', ')}.\x1b[0m`);
+          console.log(`\x1b[32mThe backend now reads ${dbRefactorResult.discoveredVars.join(', ')} in ${dbRefactorResult.files.map(rel).join(', ')}.\x1b[0m`);
         }
       }
     }
@@ -720,7 +769,7 @@ module.exports = async function init() {
       composeFilePath = path.join(currentDir, cf);
       composeDir = composeBaseDir(currentDir, cf);
       if (isVariantComposeFile(cf)) {
-        console.log(`\x1b[34mINFO: reading ${cf} as this project's docker-compose file - it is the only one here.\x1b[0m`);
+        console.log(`\x1b[36mINFO: reading ${cf} as this project's docker-compose file - it is the only one here.\x1b[0m`);
       }
       break;
     } catch (e) { /* not this name - try the next */ }
@@ -1123,10 +1172,10 @@ module.exports = async function init() {
     }
   }
   if (droppedDevCommands.length > 0) {
-    console.warn(`\x1b[33mWARNING: These docker-compose commands start a development server, so they were NOT carried into the cluster - each image's own CMD runs instead: ${droppedDevCommands.join('; ')}. If production needs a command of its own, set it under the service's command in flarops.yaml and run "flarops sync".\x1b[0m`);
+    console.warn(`\x1b[33mWARNING: These docker-compose commands start a development server, so they were NOT carried into the cluster - each image's own CMD runs instead: ${droppedDevCommands.join('; ')}. If production needs a command of its own, set it under the service's command in flarops.yaml and run "npx flarops sync".\x1b[0m`);
   }
   if (envFileWarnings.length > 0) {
-    console.warn(`\x1b[33mWARNING: These env_file entries in docker-compose could not be read, so their variables are missing from the deployment: ${envFileWarnings.join('; ')}. Add the variables to flarops.yaml (or the file to the repository) and run "flarops sync".\x1b[0m`);
+    console.warn(`\x1b[33mWARNING: These env_file entries in docker-compose could not be read, so their variables are missing from the deployment: ${envFileWarnings.join('; ')}. Add the variables to flarops.yaml (or the file to the repository) and run "npx flarops sync".\x1b[0m`);
   }
 
   // Rewriting compose hostnames waits for the database wiring, which decides what each maps to.
@@ -1272,7 +1321,7 @@ module.exports = async function init() {
       if (didUppercase) {
         const { modifiedCount } = await refactorLowercaseEnvVars(backendInfo.backendPath, keysToUppercase, true);
         if (modifiedCount > 0) {
-          console.log(`\x1b[34mINFO: Refactored lowercase environment variables to uppercase in ${modifiedCount} backend files.\x1b[0m`);
+          console.log(`\x1b[36mINFO: Refactored lowercase environment variables to uppercase in ${modifiedCount} backend files.\x1b[0m`);
         }
 
         ['hostKey', 'userKey', 'nameKey', 'passwordKey', 'portKey'].forEach(k => {
@@ -1282,20 +1331,20 @@ module.exports = async function init() {
     }
     if (inferredKeys.hostKey && !apiEnv[inferredKeys.hostKey]) {
       apiEnv[inferredKeys.hostKey] = 'database';
-      console.log(`\x1b[34mINFO: Analyzed backend code and found expected database host key: ${inferredKeys.hostKey}\x1b[0m`);
+      console.log(`\x1b[36mINFO: Analyzed backend code and found expected database host key: ${inferredKeys.hostKey}\x1b[0m`);
     }
     if (inferredKeys.userKey && !apiEnv[inferredKeys.userKey]) {
       apiEnv[inferredKeys.userKey] = dbInfo.dbUser || defaultUserFor(dbInfo.dbType);
-      console.log(`\x1b[34mINFO: Analyzed backend code and found expected database user key: ${inferredKeys.userKey}\x1b[0m`);
+      console.log(`\x1b[36mINFO: Analyzed backend code and found expected database user key: ${inferredKeys.userKey}\x1b[0m`);
     }
     if (inferredKeys.nameKey && !apiEnv[inferredKeys.nameKey]) {
       apiEnv[inferredKeys.nameKey] = dbInfo.dbName || 'appdb';
-      console.log(`\x1b[34mINFO: Analyzed backend code and found expected database name key: ${inferredKeys.nameKey}\x1b[0m`);
+      console.log(`\x1b[36mINFO: Analyzed backend code and found expected database name key: ${inferredKeys.nameKey}\x1b[0m`);
     }
     // Wire the port key the backend actually reads, and drop the generic DATABASE_PORT then.
     if (inferredKeys.portKey && !apiEnv[inferredKeys.portKey]) {
       apiEnv[inferredKeys.portKey] = String(dbInfo.port || defaultDbPortForApi);
-      console.log(`\x1b[34mINFO: Analyzed backend code and found expected database port key: ${inferredKeys.portKey}\x1b[0m`);
+      console.log(`\x1b[36mINFO: Analyzed backend code and found expected database port key: ${inferredKeys.portKey}\x1b[0m`);
     }
     if (inferredKeys.portKey && inferredKeys.portKey !== 'DATABASE_PORT') {
       delete apiEnv.DATABASE_PORT;
@@ -1321,12 +1370,12 @@ module.exports = async function init() {
   if (analyzedKey) {
     finalDbPasswordKey = analyzedKey;
     finalDbPassword = require('crypto').randomBytes(16).toString('hex');
-    console.log(`\x1b[34mINFO: Analyzed backend code and found expected database password key: ${finalDbPasswordKey}\x1b[0m`);
+    console.log(`\x1b[36mINFO: Analyzed backend code and found expected database password key: ${finalDbPasswordKey}\x1b[0m`);
 
     const envMatch = foundDbPasswords.find(p => p.key === finalDbPasswordKey);
     if (envMatch) {
       finalDbPassword = passwordValueOf(envMatch);
-      if (!envMatch.untrusted) console.log(`\x1b[34mINFO: Found matching password for ${finalDbPasswordKey} in ${envMatch.file}\x1b[0m`);
+      if (!envMatch.untrusted) console.log(`\x1b[36mINFO: Found matching password for ${finalDbPasswordKey} in ${envMatch.file}\x1b[0m`);
     } else if (foundDbPasswords.length > 0) {
       finalDbPassword = passwordValueOf(foundDbPasswords[0]);
       if (!foundDbPasswords[0].untrusted) console.warn(`\x1b[33mWARNING: Backend code expects "${finalDbPasswordKey}", but ${foundDbPasswords[0].file} stores the database password under "${foundDbPasswords[0].key}". Using that value for ${finalDbPasswordKey} - please verify this is correct.\x1b[0m`);
@@ -1344,8 +1393,13 @@ module.exports = async function init() {
     else if (dbInfo.dbType === 'mongodb') finalDbPasswordKey = 'MONGO_INITDB_ROOT_PASSWORD';
     else finalDbPasswordKey = 'DATABASE_PASSWORD';
 
-    finalDbPassword = require('crypto').randomBytes(16).toString('hex');
-    console.log(`\x1b[34mINFO: No database password found in .env files. Generated a secure random fallback password for ${finalDbPasswordKey}\x1b[0m`);
+    // A deploy/.env from an earlier init already holds one; it is kept, and nothing is generated.
+    let kept = false;
+    try { kept = new RegExp('^' + escapeRegex(finalDbPasswordKey) + '=', 'm').test(fs.readFileSync(path.join(currentDir, 'deploy', '.env'), 'utf8')); } catch (e) { /* no deploy/.env yet */ }
+    if (!kept) {
+      finalDbPassword = require('crypto').randomBytes(16).toString('hex');
+      console.log(`\x1b[36mINFO: No database password found in .env files. Generated a secure random fallback password for ${finalDbPasswordKey}\x1b[0m`);
+    }
   }
 
   // When the primary database takes its password from a shared variable, that variable's canonical
@@ -1361,7 +1415,7 @@ module.exports = async function init() {
       if (!bareVar || !sharedCredentialSecrets.has(bareVar)) continue;
       const shared = sharedCredentialSecrets.get(bareVar);
       if (shared.secretKey !== finalDbPasswordKey) {
-        console.log(`\x1b[34mINFO: the database password is the shared variable \${${bareVar}}, already wired as ${shared.secretKey} - using that key for the database too instead of a second secret named ${finalDbPasswordKey}.\x1b[0m`);
+        console.log(`\x1b[36mINFO: the database password is the shared variable \${${bareVar}}, already wired as ${shared.secretKey} - using that key for the database too instead of a second secret named ${finalDbPasswordKey}.\x1b[0m`);
         if (finalDbPasswordKey && finalDbPasswordKey !== shared.secretKey) {
           // In place: the wiring object owns this list.
           const existing = apiExtraSecretEnvMappings.findIndex(mp => mp.envName === finalDbPasswordKey);
@@ -1388,13 +1442,10 @@ module.exports = async function init() {
   {
     const alreadyProvisioned = envIO.has('DASHBOARD_PASSWORD_HASH');
     if (!alreadyProvisioned) {
-      dashboardPassword = crypto.randomBytes(18).toString('base64url');
-      const salt = crypto.randomBytes(16);
-      const iterations = 600000;
-      const derived = crypto.pbkdf2Sync(dashboardPassword, salt, iterations, 32, 'sha256');
-      const b64 = (buf) => buf.toString('base64').replace(/=+$/, '');
+      const fresh = newDashboardPassword();
+      dashboardPassword = fresh.password;
       // Single-quoted: the hash contains "$".
-      dashboardEnvContent = `DASHBOARD_PASSWORD_HASH='pbkdf2-sha256$i=${iterations}$${b64(salt)}$${b64(derived)}'\n`;
+      dashboardEnvContent = `DASHBOARD_PASSWORD_HASH='${fresh.hash}'\n`;
     }
   }
 
@@ -1408,7 +1459,8 @@ module.exports = async function init() {
   // The SSH key goes last: it is one very long value, and anything after it is easy to miss.
   let envContent = `# ============================================================================
 # Every NAME below must be created as a GitHub repository secret with the same
-# name and the value shown, or the deployment will not come up:
+# name and the value shown - paste the value WITHOUT the surrounding " or '
+# quotes - or the deployment will not come up:
 #
 #   your repository -> Settings -> Secrets and variables -> Actions
 #                   -> New repository secret
@@ -1443,7 +1495,8 @@ REGISTRY_PASSWORD="${registryPassword}"
 
   envContent += `
 # --- The deploy key Flarops generated for this repository -------------------
-# One value on one very long line. Copy it whole, including both -----markers.
+# Many lines. Copy everything from -----BEGIN to the closing -----END ... -----
+# line, line breaks included, without the surrounding quotes.
 SSH_PRIVATE_KEY="${privateKey}"
 `;
 
@@ -1452,6 +1505,31 @@ SSH_PRIVATE_KEY="${privateKey}"
     console.log("Created deploy/.env");
   } else {
     let appended = false;
+
+    // Answers given on this run replace the ones an earlier run wrote: they are the ones just typed.
+    const infrastructure = [
+      ['AWS_ACCESS_KEY_ID', awsCredentials.accessKey],
+      ['AWS_SECRET_ACCESS_KEY', awsCredentials.secretKey],
+      ['REGISTRY_PASSWORD', registryPassword],
+      ...(cloudflareApiToken && cloudflareZoneId ? [['CLOUDFLARE_API_TOKEN', cloudflareApiToken], ['CLOUDFLARE_ZONE_ID', cloudflareZoneId]] : []),
+    ];
+    const updatedKeys = [];
+    for (const [key, value] of infrastructure) {
+      const line = `${key}="${value}"`;
+      const current = envIO.read();
+      const existing = current.match(new RegExp('^' + escapeRegex(key) + '=(.*)$', 'm'));
+      if (!existing) {
+        envIO.append(`${line}\n`);
+        appended = true;
+      } else if (existing[1].replace(/^["']|["']$/g, '') !== String(value)) {
+        fs.writeFileSync(envFile, current.replace(existing[0], () => line));
+        updatedKeys.push(key);
+        appended = true;
+      }
+    }
+    if (updatedKeys.length > 0) {
+      console.log(`\x1b[33mUpdated ${updatedKeys.join(', ')} in deploy/.env with the answers just given - update the GitHub secret${updatedKeys.length === 1 ? '' : 's'} of the same name too.\x1b[0m`);
+    }
 
     if (finalDbPassword && !envIO.has(finalDbPasswordKey)) {
       envIO.append(`\n${finalDbPasswordKey}="${finalDbPassword}"\n`);
@@ -1484,19 +1562,6 @@ SSH_PRIVATE_KEY="${privateKey}"
     fs.chmodSync(envFile, 0o600);
   } catch (e) { /* best-effort - not fatal if the filesystem doesn't support it */ }
 
-  const envSafetyFile = path.join(deployDir, '.env.safety');
-  const envSafetyContent = `DATABASE_USER=
-DATABASE_TYPE=${dbInfo.hasDb ? dbInfo.dbType : ''}
-DOCKER_REGISTRY=${dockerRegistry}
-DOMAIN=${domain}
-AWS_REGION=${awsRegion}
-`;
-  if (!fs.existsSync(envSafetyFile)) {
-    fs.writeFileSync(envSafetyFile, envSafetyContent);
-    console.log("Created deploy/.env.safety");
-  } else {
-    console.log("deploy/.env.safety already exists");
-  }
   const helmDir = path.join(deployDir, 'helm');
   const helmTemplatesDir = path.join(helmDir, 'templates');
   if (!fs.existsSync(helmDir)) {
@@ -1624,7 +1689,7 @@ AWS_REGION=${awsRegion}
         suppressed.push(`${s.name} (${s.exposedRoutes.join(', ')})`);
       }
       if (suppressed.length > 0) {
-        console.log(`\x1b[34mINFO: "${gateway.label}" looks like this project's own API gateway, so these routes were left reachable only through it and NOT added directly to Ingress: ${suppressed.join('; ')}. If any of these must bypass the gateway, set additionalServices.<name>.exposeDirectly: true in deploy/helm/values.yaml.\x1b[0m`);
+        console.log(`\x1b[36mINFO: "${gateway.label}" looks like this project's own API gateway, so these routes were left reachable only through it and NOT added directly to Ingress: ${suppressed.join('; ')}. If any of these must bypass the gateway, add the route to deploy/helm/templates/01-ingress.yaml and list that file under syncLock in flarops.yaml, so sync keeps your edit.\x1b[0m`);
       }
     }
   }
@@ -1730,7 +1795,7 @@ AWS_REGION=${awsRegion}
   // A migration step runs as an initContainer before the API.
   const apiMigrationStep = backendInfo.backendPath ? await detectApiMigrationStep(backendInfo.backendPath) : null;
   if (apiMigrationStep) {
-    console.log(`\x1b[34mINFO: Detected a migration step in the backend (${apiMigrationStep.command}) - it will run as an initContainer before the API starts.\x1b[0m`);
+    console.log(`\x1b[36mINFO: Detected a migration step in the backend (${apiMigrationStep.command}) - it will run as an initContainer before the API starts.\x1b[0m`);
   }
 
   // Memory scales with the worker processes the Dockerfile starts.
@@ -1738,7 +1803,7 @@ AWS_REGION=${awsRegion}
     ? await detectApiWorkerCount(backendInfo.backendPath, backendInfo.dockerfile)
     : 1;
   if (apiWorkers > 1) {
-    console.log(`\x1b[34mINFO: Detected ${apiWorkers} worker processes in the API's Dockerfile - scaling its memory requests/limits accordingly.\x1b[0m`);
+    console.log(`\x1b[36mINFO: Detected ${apiWorkers} worker processes in the API's Dockerfile - scaling its memory requests/limits accordingly.\x1b[0m`);
   }
 
   const allEnvKeys = [];
@@ -1817,10 +1882,11 @@ AWS_REGION=${awsRegion}
 
     if (!envIO.has(passwordKey)) {
       envIO.append(`\n${passwordKey}="${password}"\n`);
-      console.log(`\x1b[34mINFO: Generated a database for additional service "${s.name}" (${serviceDb.dbType}) - password stored under ${passwordKey} in deploy/.env\x1b[0m`);
+      console.log(`\x1b[36mINFO: Generated a database for additional service "${s.name}" (${serviceDb.dbType}) - password stored under ${passwordKey} in deploy/.env\x1b[0m`);
     }
     if (!envKeysToPass.includes(passwordKey)) envKeysToPass.push(passwordKey);
-    if (!s.secretKeys.includes(passwordKey)) s.secretKeys.push(passwordKey);
+    // The service itself gets the password through databaseUrls: no code reads this invented name,
+    // and listing it under the service too left a second copy behind when db: changed key.
 
     s.db = {
       type: serviceDb.dbType,
@@ -1861,7 +1927,7 @@ AWS_REGION=${awsRegion}
       if (deadKeyIdx !== -1 && 'SPRING_DATASOURCE_PASSWORD' !== passwordKey) {
         envKeysToPass.splice(deadKeyIdx, 1);
         envIO.removeKey('SPRING_DATASOURCE_PASSWORD');
-        console.log(`\x1b[34mINFO: "SPRING_DATASOURCE_PASSWORD" was found in the project but Spring's relaxed environment-variable binding means the container never reads a secret under that exact name - it uses ${passwordKey} instead (wired automatically). Removed it from the required GitHub secrets and deploy/.env.\x1b[0m`);
+        console.log(`\x1b[36mINFO: "SPRING_DATASOURCE_PASSWORD" was found in the project but Spring's relaxed environment-variable binding means the container never reads a secret under that exact name - it uses ${passwordKey} instead (wired automatically). Removed it from the required GitHub secrets and deploy/.env.\x1b[0m`);
       }
     } else {
       const dbUrlRefactorResult = await refactorBackendDbUrl(s.path, true);
@@ -1973,7 +2039,7 @@ AWS_REGION=${awsRegion}
   }
   if (Object.keys(publicEnvAsBuildArgs).length > 0) {
     frontendBuildArgs = { ...(frontendBuildArgs || {}), ...publicEnvAsBuildArgs };
-    console.log(`\x1b[34mINFO: These frontend variables use a framework prefix that inlines them into the bundle at BUILD time, so they were also passed to the image build in deploy/werf.yaml: ${Object.keys(publicEnvAsBuildArgs).join(', ')}. Setting them in values.yaml alone would have had no effect.\x1b[0m`);
+    console.log(`\x1b[36mINFO: These frontend variables use a framework prefix that inlines them into the bundle at BUILD time, so they were also added to the frontend's buildArgs in flarops.yaml: ${Object.keys(publicEnvAsBuildArgs).join(', ')}. Setting them as env alone would have had no effect.\x1b[0m`);
   }
 
   apiBuildArgs = resolveBuildArgs(apiBuildArgs, 'api');
@@ -1982,10 +2048,10 @@ AWS_REGION=${awsRegion}
     if (s.buildArgs) s.buildArgs = resolveBuildArgs(s.buildArgs, s.name);
   }
   if (rewrittenBuildArgs.length > 0) {
-    console.log(`\x1b[34mINFO: These docker-compose build args pointed at a loopback address, which is compiled into the image and is never reachable from a pod - they were rewritten to the project's own domain: ${rewrittenBuildArgs.join(', ')}. Adjust them in deploy/werf.yaml if a different address is correct.\x1b[0m`);
+    console.log(`\x1b[36mINFO: These docker-compose build args pointed at a loopback address, which is compiled into the image and is never reachable from a pod - they were rewritten to the project's own domain: ${rewrittenBuildArgs.join(', ')}. If a different address is correct, change them under buildArgs in flarops.yaml and run "npx flarops sync".\x1b[0m`);
   }
   if (droppedBuildArgs.length > 0) {
-    console.warn(`\x1b[33mWARNING: These docker-compose build args reference a value this repository never defines, so they were left to the Dockerfile's own ARG defaults: ${droppedBuildArgs.join(', ')}. If a default is a development value, set the real one in werf.yaml.\x1b[0m`);
+    console.warn(`\x1b[33mWARNING: These docker-compose build args reference a value this repository never defines, so they were left to the Dockerfile's own ARG defaults: ${droppedBuildArgs.join(', ')}. If a default is a development value, set the real one under buildArgs in flarops.yaml and run "npx flarops sync".\x1b[0m`);
   }
 
   // Everything the hostname rewrite depends on is settled now.
@@ -2207,7 +2273,7 @@ AWS_REGION=${awsRegion}
   for (const s of additionalServices) rewriteLoopbackIn(s.env, s.name);
   for (const s of supportServices) rewriteLoopbackIn(s.env, s.name);
   if (rewrittenRuntimeEnv.length > 0) {
-    console.log(`\x1b[34mINFO: These environment variables pointed at a loopback address, which inside a pod means the pod itself - they were rewritten: ${rewrittenRuntimeEnv.join(', ')}.\x1b[0m`);
+    console.log(`\x1b[36mINFO: These environment variables pointed at a loopback address, which inside a pod means the pod itself - they were rewritten: ${rewrittenRuntimeEnv.join(', ')}.\x1b[0m`);
   }
 
   // Whatever still points at this machine is listed by name.
@@ -2234,7 +2300,7 @@ AWS_REGION=${awsRegion}
   }
 
   if (supportServices.length > 0) {
-    console.log(`\x1b[34mINFO: Generated ${supportServices.length} supporting service(s) declared in docker-compose that the application references but this repository does not build: ${supportServices.map(s => s.name).join(', ')}. Review their images and resources in deploy/helm/values.yaml.\x1b[0m`);
+    console.log(`\x1b[36mINFO: Generated ${supportServices.length} supporting service(s) declared in docker-compose that the application references but this repository does not build: ${supportServices.map(s => s.name).join(', ')}. Review their images and settings under their names in flarops.yaml, then run "npx flarops sync".\x1b[0m`);
   }
   if (skippedNodeAgents.length > 0) {
     console.warn(`\x1b[33mWARNING: Skipped ${skippedNodeAgents.join(', ')} - these mount the host's docker socket or /proc and /sys, which makes them node-level agents rather than application services. Install them as a DaemonSet (usually via the vendor's own Helm chart) if you want them in the cluster.\x1b[0m`);
@@ -2246,20 +2312,20 @@ AWS_REGION=${awsRegion}
   }
 
   if (dbInitFiles) {
-    console.log(`\x1b[34mINFO: Carried the database's docker-compose bootstrap scripts into the chart as a ConfigMap: ${Object.keys(dbInitFiles).join(', ')}. They run on the database's FIRST boot only - an existing volume is never re-initialised, so an already-deployed database needs its PVC removed (or the scripts applied by hand) before they take effect.\x1b[0m`);
+    console.log(`\x1b[36mINFO: Carried the database's docker-compose bootstrap scripts into the chart as a ConfigMap: ${Object.keys(dbInitFiles).join(', ')}. They run on the database's FIRST boot only - an existing volume is never re-initialised, so an already-deployed database needs its PVC removed (or the scripts applied by hand) before they take effect.\x1b[0m`);
   }
   if (dbCommandWarnings.length > 0) {
-    console.warn(`\x1b[33mWARNING: These database commands in docker-compose use variables that compose fills from .env, so they were not carried: ${dbCommandWarnings.join('; ')}. Write the command with the values themselves under "command:" in flarops.yaml and run "flarops sync".\x1b[0m`);
+    console.warn(`\x1b[33mWARNING: These database commands in docker-compose use variables that compose fills from .env, so they were not carried: ${dbCommandWarnings.join('; ')}. Write the command with the values themselves under "command:" in flarops.yaml and run "npx flarops sync".\x1b[0m`);
   }
   if (dbInitWarnings.length > 0) {
     console.warn(`\x1b[33mWARNING: The database mounts these files into /docker-entrypoint-initdb.d in docker-compose, but they could NOT be carried into the cluster: ${dbInitWarnings.join('; ')}. Without them the database will come up with no schema. Apply them yourself, or provide them as a ConfigMap/Secret volume.\x1b[0m`);
   }
 
   if (supportConfigMapNotes.length > 0) {
-    console.log(`\x1b[34mINFO: Carried the docker-compose bind mounts of these supporting services into the chart as ConfigMaps: ${supportConfigMapNotes.join(', ')}.\x1b[0m`);
+    console.log(`\x1b[36mINFO: Carried the docker-compose bind mounts of these supporting services into the chart as ConfigMaps: ${supportConfigMapNotes.join(', ')}.\x1b[0m`);
   }
   if (volumeWarnings.length > 0) {
-    console.warn(`\x1b[33mWARNING: These docker-compose volumes are in a form Flarops does not read, so they were not carried: ${volumeWarnings.join('; ')}. Declare what the service needs under volumes: in flarops.yaml and run "flarops sync".\x1b[0m`);
+    console.warn(`\x1b[33mWARNING: These docker-compose volumes are in a form Flarops does not read, so they were not carried: ${volumeWarnings.join('; ')}. Declare what the service needs under volumes: in flarops.yaml and run "npx flarops sync".\x1b[0m`);
   }
   if (supportBindMountWarnings.length > 0) {
     console.warn(`\x1b[33mWARNING: These docker-compose bind mounts could NOT be carried into the cluster - provide them as a ConfigMap/Secret volume yourself before deploying: ${supportBindMountWarnings.join('; ')}.\x1b[0m`);
@@ -2347,6 +2413,7 @@ AWS_REGION=${awsRegion}
     dbLocalDockerfile: dbInfo.hasDb ? dbInfo.localDbDockerfile : null,
     dbContext: dbInfo.hasDb ? dbInfo.dbContext : null,
     dbCommand,
+    deployBranch,
     apiVolumes,
     frontendVolumes,
     dbPasswordKey: finalDbPasswordKey,
@@ -2410,7 +2477,7 @@ appVersion: "1.0.0"
   const contextObj = { hasLocalhostWarnings: false };
 
   if (unresolvedPlaceholderKeys.size > 0) {
-    console.warn(`\x1b[33mWARNING: These variables still reference a value this repository never defines, so they were left as-is instead of being given an invented one: ${Array.from(unresolvedPlaceholderKeys).join(', ')}. Set their real values (in GitHub Secrets if they are secret, in deploy/helm/values.yaml otherwise) before deploying.\x1b[0m`);
+    console.warn(`\x1b[33mWARNING: These variables still reference a value this repository never defines, so they were left as-is instead of being given an invented one: ${Array.from(unresolvedPlaceholderKeys).join(', ')}. Set their real values before deploying: secrets in GitHub Secrets, other values under env in flarops.yaml (then run "npx flarops sync").\x1b[0m`);
 
     const sharedGroups = Array.from(placeholderVarToKeys.entries())
       .filter(([, keys]) => keys.size > 1)
@@ -2504,7 +2571,7 @@ appVersion: "1.0.0"
     { file: path.join(githubDir, 'pr-capsule.yml'), content: require('../../templates/pr-capsule.yml.js')(config) },
     { file: path.join(currentDir, 'werf.yaml'), content: require('../../templates/werf.yaml.js')(config) },
     { file: path.join(currentDir, 'werf-giterminism.yaml'), content: require('../../templates/werf-giterminism.yaml.js')() },
-    { file: path.join(currentDir, 'FLAROPS.md'), content: require('../../templates/FLAROPS.md.js')() }
+    { file: path.join(currentDir, 'FLAROPS.md'), content: require('../../templates/FLAROPS.md.js')(config) }
   ];
 
   otherFilesToGenerate.forEach(f => fs.writeFileSync(f.file, f.content));
@@ -2536,97 +2603,64 @@ appVersion: "1.0.0"
     console.warn("Dashboard source directory not found next to Flarops - deploy/dashboard was not written.");
   }
 
-  if (dashboardPassword) {
-    console.log("");
-    console.log("\x1b[33m┌───────────────────────────────────────────────────────────────────────────┐\x1b[0m");
-    console.log("\x1b[33m│ DASHBOARD LOGIN - this is the only time this password is ever shown.      │\x1b[0m");
-    console.log("\x1b[33m└───────────────────────────────────────────────────────────────────────────┘\x1b[0m");
-    console.log(`    username: \x1b[1madmin\x1b[0m`);
-    console.log(`    password: \x1b[1m${dashboardPassword}\x1b[0m`);
-    console.log("");
-    console.log("    Store it in your password manager now. Only its PBKDF2 hash is written to");
-    console.log("    deploy/.env (as DASHBOARD_PASSWORD_HASH), so it cannot be recovered later -");
-    console.log("    delete that line and re-run init to issue a new one.");
-    console.log("");
-  }
+  // Everything to check comes first, then the result and the password, and the steps to take last,
+  // so the steps are what is left on screen.
+  let warningCount = 0;
+  const warn = (text) => { warningCount++; console.warn(`\x1b[33mWARNING: ${text}\x1b[0m`); console.log(''); };
+  const note = (text) => { console.log(`\x1b[36mNOTE: ${text}\x1b[0m`); console.log(''); };
 
   // Report orphaned templates; removing them is sync's job.
   try {
     const { findOrphanTemplates } = require('./sync.js');
     const found = findOrphanTemplates(currentDir);
     if (found && found.orphans.length > 0) {
-      console.warn(`\x1b[33mWARNING: deploy/helm/templates still holds ${found.orphans.length} template(s) for services this project no longer has: ${found.orphans.join(', ')}. They reference values that are gone, and Helm aborts the WHOLE chart on one of them - run "flarops sync" to remove them.\x1b[0m`);
-      console.log("");
+      warn(`deploy/helm/templates still holds ${found.orphans.length} template(s) for services this project no longer has: ${found.orphans.join(', ')}. They reference values that are gone, and Helm aborts the WHOLE chart on one of them - run "npx flarops sync" to remove them.`);
     }
   } catch (e) { /* best effort - never block a successful generation */ }
 
-  // The secrets to create, printed last so they are still on screen.
-  {
-    const placeholder = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
-    const finalEnv = envIO.read();
-    const valueOf = (key) => {
-      const m = finalEnv.match(new RegExp('^' + escapeRegex(key) + '=(.*)$', 'm'));
-      return m ? m[1].replace(/^["']|["']$/g, '') : '';
-    };
-    // Infrastructure secrets are read by the workflow directly but are just as required.
-    const infrastructureKeys = [
-      'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'SSH_PRIVATE_KEY', 'REGISTRY_PASSWORD',
-      ...(cloudflareApiToken && cloudflareZoneId ? ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ZONE_ID'] : []),
-    ];
-    const needed = [...infrastructureKeys, ...envKeysToPass.filter(Boolean)]
-      .filter((key, i, all) => all.indexOf(key) === i);
-    const unmounted = unmountedAtInit;
-    // Only values still blank.
-    const stillWithheld = withheldSecretValues.filter(entry => !valueOf(entry.split(' ')[0]));
-    if (stillWithheld.length > 0) {
-      console.log("");
-      console.warn(`\x1b[33mWARNING: These secrets were found, but their values were NOT carried into deploy/.env because they cannot be real production secrets: ${stillWithheld.join(', ')}. Each is still required - give it a real value when you create the GitHub secret.\x1b[0m`);
-      // A URL that embeds the same password keeps working only while the password stays the old one.
-      const holders = [];
-      const scan = (owner, env) => {
-        for (const [name, value] of Object.entries(env || {})) {
-          for (const { key, value: literal } of withheldLiterals) {
-            if (literal.length >= 4 && name !== key && String(value).includes(literal)) holders.push(`${owner}.${name} (holds ${key})`);
-          }
+  const placeholder = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+  const finalEnv = envIO.read();
+  const valueOf = (key) => {
+    const m = finalEnv.match(new RegExp('^' + escapeRegex(key) + '=(.*)$', 'm'));
+    return m ? m[1].replace(/^["']|["']$/g, '') : '';
+  };
+  // Infrastructure secrets are read by the workflow directly but are just as required.
+  const infrastructureKeys = [
+    'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'SSH_PRIVATE_KEY', 'REGISTRY_PASSWORD',
+    ...(cloudflareApiToken && cloudflareZoneId ? ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ZONE_ID'] : []),
+  ];
+  const needed = [...infrastructureKeys, ...envKeysToPass.filter(Boolean)]
+    .filter((key, i, all) => all.indexOf(key) === i);
+  // Only values still blank; key -> where the rejected value was.
+  const withheld = new Map();
+  for (const entry of withheldSecretValues) {
+    const key = entry.split(' ')[0];
+    if (valueOf(key)) continue;
+    const where = entry.slice(entry.indexOf(' ') + 1).replace(/^\(|\)$/g, '');
+    withheld.set(key, withheld.has(key) ? `${withheld.get(key)}, nor ${where}` : where);
+  }
+  if (withheld.size > 0) {
+    // A URL that embeds the same password keeps working only while the password stays the old one.
+    const holders = [];
+    const scan = (owner, env) => {
+      for (const [name, value] of Object.entries(env || {})) {
+        for (const { key, value: literal } of withheldLiterals) {
+          if (literal.length >= 4 && name !== key && String(value).includes(literal)) holders.push(`${owner}.${name} (holds ${key})`);
         }
-      };
-      scan('api', apiEnv);
-      scan('frontend', frontendEnv);
-      for (const svc of [...additionalServices, ...supportServices]) scan(svc.name, svc.env);
-      if (holders.length > 0) {
-        console.warn(`\x1b[33mWARNING: These values spell out one of those secrets and will stop working once it gets its real value: ${holders.join(', ')}. Change them in flarops.yaml to match (for a URL, the password part).\x1b[0m`);
       }
-    }
-    if (needed.length > 0) {
-      console.log("");
-      console.log(`\x1b[36mCreate these ${needed.length} GitHub repository secrets before the first deploy\x1b[0m`);
-      console.log(`\x1b[36m(Settings -> Secrets and variables -> Actions). Values are in deploy/.env:\x1b[0m`);
-      for (const key of needed) {
-        const value = valueOf(key);
-        const sameAs = placeholder.exec(value);
-        if (sameAs) console.log(`  ${key}  \x1b[33m<- give it the SAME value as ${sameAs[1]}\x1b[0m`);
-        else if (infrastructureKeys.includes(key)) console.log(`  ${key}  \x1b[90m(infrastructure)\x1b[0m`);
-        else if (unmounted.includes(key)) console.log(`  ${key}  \x1b[33m<- no service reads this; declare it under a service's secretEnvs in flarops.yaml\x1b[0m`);
-        else if (!value) console.log(`  ${key}  \x1b[33m<- no value found; you must supply one\x1b[0m`);
-        else console.log(`  ${key}`);
-      }
-      if (lateSecretKeys.length > 0) {
-        console.log(`\x1b[36mOf those, ${lateSecretKeys.join(', ')} were added because a service in your stack reads them.\x1b[0m`);
-      }
-      console.log("");
+    };
+    scan('api', apiEnv);
+    scan('frontend', frontendEnv);
+    for (const svc of [...additionalServices, ...supportServices]) scan(svc.name, svc.env);
+    if (holders.length > 0) {
+      warn(`These values spell out a secret whose current value is not a production one, and will stop working once it gets its real value: ${holders.join(', ')}. Move each into the service's secretEnvs in flarops.yaml, create a GitHub secret holding the whole value (for a URL, with the real password in it), and run "npx flarops sync" - a password written into env: ends up committed.`);
     }
   }
 
-  console.log("");
-  console.log("#############################################################################################");
-  console.log("# Flarops has been successfully initialized!                                                #");
-  console.log("# Next, follow the instructions in FLAROPS.md to deploy the application for the first time. #");
-  console.log("#############################################################################################");
-  console.log("");
-
   if (s3BucketWarning) {
+    warningCount++;
     console.log(s3BucketWarning);
-    console.log("");
+    console.log('');
   }
 
   // No service answers "/": say so, rather than leave it to a 404 in the browser.
@@ -2634,14 +2668,69 @@ appVersion: "1.0.0"
     const rootedService = additionalServices.find(s =>
       !s.suppressDirectIngress && normalizeRoutes(s.exposedRoutes).some(r => r.path === '/'));
     if (!rootedService) {
-      console.log(`\x1b[36mNOTE: No service in this project serves "/", so ${domain ? `https://${domain}/` : 'the root path'} will return 404 from the ingress controller. Only the paths listed under each service in deploy/helm/values.yaml are routed. This is expected for a backend-only project - add a "/" entry to the intended service's exposedRoutes if something should answer there.\x1b[0m`);
-      console.log("");
+      note(`No service in this project serves "/", so ${domain ? `https://${domain}/` : 'the root path'} will return 404 from the ingress controller. Only the paths listed under each service's exposedRoutes in flarops.yaml are routed. This is expected for a backend-only project - add "/" to the intended service's exposedRoutes and run "npx flarops sync" if something should answer there.`);
     }
   }
 
   if (unresolvedLoopback.length > 0) {
-    console.warn(`\x1b[33mWARNING: these variables still point at this machine, which inside a pod is the container itself - Flarops could not tell what they should become: ${unresolvedLoopback.join(', ')}.\x1b[0m`);
-    console.warn(`\x1b[33mSet them in flarops.yaml and run "flarops sync". Use a service's name for traffic inside the cluster ("database", "api"), and your project's domain for anything a browser reaches.\x1b[0m`);
-    console.log("");
+    warn(`these variables still point at this machine, which inside a pod is the container itself - Flarops could not tell what they should become: ${unresolvedLoopback.join(', ')}.\nSet them in flarops.yaml and run "npx flarops sync". Use a service's name for traffic inside the cluster ("database", "api"), and your project's domain for anything a browser reaches.`);
+  }
+
+  console.log('#############################################################################################');
+  console.log('# Flarops has been initialized.                                                             #');
+  if (warningCount > 0) {
+    console.log(`# ${`Check the ${warningCount} warning${warningCount === 1 ? '' : 's'} above before the first deploy.`.padEnd(90)}#`);
+  }
+  console.log('#############################################################################################');
+
+  if (dashboardPassword) printDashboardLogin({ password: dashboardPassword, domain });
+
+  const cyan = (t) => `\x1b[36m${t}\x1b[0m`;
+  let step = 0;
+  console.log(cyan('Next steps (FLAROPS.md has them in full):'));
+  console.log('');
+  if (needed.length > 0) {
+    console.log(`${++step}. Create these ${needed.length} GitHub repository secrets before the first deploy`);
+    console.log('   (Settings -> Secrets and variables -> Actions). Values are in deploy/.env, without their quotes:');
+    for (const key of needed) {
+      const value = valueOf(key);
+      const sameAs = placeholder.exec(value);
+      if (sameAs) console.log(`     ${key}  \x1b[33m<- give it the SAME value as ${sameAs[1]}\x1b[0m`);
+      else if (infrastructureKeys.includes(key)) console.log(`     ${key}  \x1b[90m(infrastructure)\x1b[0m`);
+      else if (unmountedAtInit.includes(key)) console.log(`     ${key}  \x1b[33m<- no service reads this; declare it under a service's secretEnvs in flarops.yaml\x1b[0m`);
+      else if (withheld.has(key)) console.log(`     ${key}  \x1b[33m<- needs a real value (not the one in ${withheld.get(key)})\x1b[0m`);
+      else if (!value) console.log(`     ${key}  \x1b[33m<- no value found; you must supply one\x1b[0m`);
+      else console.log(`     ${key}`);
+    }
+    if (lateSecretKeys.length > 0) {
+      console.log(`   Of those, ${lateSecretKeys.join(', ')} were added because a service in your stack reads them.`);
+    }
+  }
+  if (warningCount > 0) console.log(`${++step}. Resolve the warnings above (most are a field in flarops.yaml, then "npx flarops sync").`);
+  console.log(`${++step}. Review "git diff": besides adding files, init may have changed your code. Then commit and`);
+  console.log(`   push to ${deployBranch}: the first push creates the server in AWS and deploys the application.`);
+  if (domain && !(cloudflareApiToken && cloudflareZoneId)) {
+    console.log(`${++step}. Point DNS at the server: A records for ${domain}, ${dashboardHost(domain)} and the PR`);
+    console.log('   environments, to the IP the deploy run prints in its summary (see FLAROPS.md).');
+  }
+  if (domain) console.log(`${++step}. Open https://${domain} and the dashboard at https://${dashboardHost(domain)} (user admin).`);
+  console.log('');
+}
+
+// Colour only for a person at a terminal: agents and CI read the text, not the escape codes.
+const plainOutput = () => !process.stdout.isTTY || !!process.env.NO_COLOR;
+const ANSI = /\x1b\[[0-9;]*m/g;
+
+module.exports = async function init() {
+  if (!plainOutput()) return runInit();
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  for (const name of Object.keys(original)) {
+    console[name] = (...args) => original[name](...args.map(a => (typeof a === 'string' ? a.replace(ANSI, '') : a)));
+  }
+  try {
+    return await runInit();
+  } finally {
+    Object.assign(console, original);
   }
 };
+

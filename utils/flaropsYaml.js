@@ -99,8 +99,10 @@ function serviceBlock(name, opts) {
     lines.push(`  replicas: ${opts.replicas || 1}`);
   }
 
-  const portsStr = renderPorts(opts.ports, 4);
-  if (portsStr) {
+  const portsStr = opts.oneShot ? null : renderPorts(opts.ports, 4);
+  if (opts.oneShot) {
+    // A task has no Service: no ports.
+  } else if (portsStr) {
     lines.push('  ports:');
     lines.push(portsStr);
   } else if (Array.isArray(opts.ports)) {
@@ -200,117 +202,105 @@ function databaseSecretEnvNames(dbType, dbUser) {
   return names;
 }
 
+// The top of the file: what it is, and where its reference is.
+const HEADER = [
+  '# What Flarops deploys. Edit this file, then run "npx flarops sync" from this directory and',
+  '# commit what it changed; a push to the deploy branch deploys it. Every field is described in the',
+  '# reference at the end of this file.',
+].join('\n');
+
 const TEMPLATE_COMMENT = `
 # ============================================================================
-# This file is the source of truth for what gets deployed. Edit it, then run
+# Reference
 #
-#     flarops sync
+# "npx flarops sync" applies this file: a changed field updates what is
+# deployed, a block added here becomes a new service (anything left out gets
+# a default), and a block removed is removed from the deployment.
+# "npx flarops sync --check" shows what it would change without writing.
 #
-# which applies every change here to deploy/helm, werf.yaml and the recorded
-# state: a changed parameter updates the existing object, a service added below
-# is created from the same templates a discovered one is built from (with
-# defaults for anything left out), and a service removed from here is removed
-# from the deployment. \`flarops init\` does not run twice - sync is how a
-# generated project changes from then on.
+# --- Service names -----------------------------------------------------------
 #
-# Template for adding new services to this file.
+# Each top-level key other than repositorySettings and syncLock is a service.
+# A name is lowercase letters, digits and "-", starts with a letter, ends with
+# a letter or digit, and is at most 63 characters (49 with a db: block). Not
+# allowed: secret, dashboard, registry-secret, flarops-..., and words YAML
+# reads as something else (null, true, false, yes, no, on, off, y, n).
 #
-# Each top-level key is a service name (must be unique, RFC-1123 compatible).
-# A service MUST have either \`image\` OR \`dockerfile\` + \`context\`, and \`replicas\`.
+# --- The special blocks ------------------------------------------------------
 #
-# \`context\` is RELATIVE TO THE PROJECT ROOT (not to the deploy directory);
-# \`dockerfile\` is relative to \`context\`, as in docker-compose and werf.
+# api:        the backend; the Ingress routes its exposedRoutes to it.
+# frontend:   the web frontend; it answers every path no other service owns.
+# database:   the shared database. Fields: type, image (or dockerfile and
+#             context), port, user, name, replicas (0 or 1), command,
+#             volumes, secretEnvs - as in db: below.
 #
-# --- Required fields --------------------------------------------------------
+# --- Any service ---------------------------------------------------------------
 #
 # my-service:
-#   # OPTION A: pre-built image (not built locally)
-#   image: "registry.example.com/org/image:tag"
+#   # Exactly one of:
+#   image: "registry.example.com/org/image:tag"   # a pre-built image, or
+#   context: "path/to"                      # built from this repository: the
+#   dockerfile: "Dockerfile"                #  build context, relative to the
+#                                           #  project root, and the Dockerfile,
+#                                           #  relative to context
 #
-#   # OPTION B: built from a Dockerfile in this repository
-#   context: "path/to"                      # Docker build context, relative to project root
-#   dockerfile: "Dockerfile"                # relative to context (path/to/Dockerfile here)
-#
-#   replicas: 1                             # number of pod replicas
-#
-# --- A task instead of a service --------------------------------------------
-#
-#   oneShot: true                           # runs to completion and stops,
-#                                           #  instead of staying up. Rendered
-#                                           #  as a Job that re-runs on every
-#                                           #  deploy, so the command must be
-#                                           #  safe to repeat. Replaces
-#                                           #  replicas; no ports, no probes,
-#                                           #  no exposedRoutes - a task has no
-#                                           #  Service to route to.
-#
-# --- Optional fields --------------------------------------------------------
-#
-#   ports:                                  # container ports to expose
+#   replicas: 1                             # optional, 1 by default
+#   ports:                                  # container ports
 #     - 8080
-#
-#   buildArgs:                              # passed to "docker build --build-arg"
-#     - "BUILD_MODE=production"              # (spelled "args" in older files,
-#     - "API_URL=https://example.com"        #  still accepted)
-#
-#   command:                                # what the container RUNS - this
-#     - "node"                              #  becomes the pod's args:, which
-#     - "server.js"                         #  replaces the image's CMD and
-#                                           #  keeps its ENTRYPOINT, exactly as
-#                                           #  docker-compose's command: does.
-#
-#   env:                                    # plain-text environment variables
-#     DATABASE_HOST: "database"
+#   command:                                # what the container runs: replaces
+#     - "node"                              #  the image's CMD and keeps its
+#     - "server.js"                         #  ENTRYPOINT, like compose's command:
+#   env:                                    # plain values - never a secret
 #     APP_ENV: "production"
+#   secretEnvs:                             # <variable the code reads>: <GitHub
+#     STRIPE_KEY: STRIPE_KEY                #  Secret it comes from> - the NAME of
+#     DB_PASSWORD: SHARED_DB_PASSWORD       #  a secret, never its value
+#   volumes:                                # persistent storage, one claim each
+#     - name: "data"                        #  (<service>-<name>). size is
+#       path: "/var/lib/service"            #  optional: 5Gi, 10Gi on a database.
+#       size: "20Gi"                        #  Removing a volume keeps its data; a
+#                                           #  new size reaches new claims only.
+#                                           #  PR environments start empty.
+#   oneShot: true                           # a task, not a service: runs to the
+#                                           #  end on every deploy (so it must be
+#                                           #  safe to repeat). Takes no replicas,
+#                                           #  ports, health check or routes.
 #
-#   databaseUrls:                           # env vars that get the database's
-#     - DATABASE_URL                        #  connection URL, built by the chart
-#                                           #  from its user, password and name -
-#                                           #  this service's own db: if it has
-#                                           #  one, otherwise the top-level
-#                                           #  database. No GitHub Secret needed.
+# --- Only for services built here (dockerfile:), and api ----------------------
 #
-#   secretEnvs:                             # env vars sourced from GitHub Secrets
-#     SECRET_KEY: SECRET_KEY                # env name: GitHub Secret name
-#     DB_PASSWORD: SHARED_DB_PASSWORD       # env name can differ from secret name
-#
-#   volumes:                                # persistent storage, one claim each -
-#     - name: "data"                        #  on any block: api, frontend, any
-#       path: "/var/lib/service"            #  service, database and db:
-#       size: "20Gi"                        # optional, 5Gi by default (10Gi on a
-#                                           #  database). The claim is
-#                                           #  <service>-<name>. Removing a volume
-#                                           #  keeps its claim and data; a new
-#                                           #  size reaches new claims only. PR
-#                                           #  environments get empty volumes.
-#
-#   healthRoute: "/health"                  # readiness/liveness probe path
-#   healthPort: 8080                        # port for the health probe
-#
+#   buildArgs:                              # docker build --build-arg
+#     - "API_URL=https://example.com"
+#   healthRoute: "/health"                  # readiness and liveness probe path
+#   healthPort: 8080                        #  and its port
 #   exposedRoutes:                          # Ingress path prefixes routed here
-#     - "/webhooks"                          #  passed through unchanged
-#     - path: "/api"                         #  the service sees requests with
-#       stripPrefix: true                    #  "/api" removed - use this when a
-#                                            #  reverse proxy did it before
-#
-#   db:                                     # per-service database (generates its own StatefulSet)
+#     - "/webhooks"                         #  passed through unchanged
+#     - path: "/api"                        #  the service sees "/api" removed
+#       stripPrefix: true
+#   databaseUrls:                           # variables that get the database's
+#     - DATABASE_URL                        #  connection URL, built from its user,
+#                                           #  password and name: this service's
+#                                           #  db: if it has one, otherwise the
+#                                           #  top-level database. No secret needed.
+#   db:                                     # a database of this service's own
 #     type: "postgres"                      # required: postgres | mysql | mariadb | mongodb
-#     secretEnvs:                           # required: the password, as for a service
-#       POSTGRES_PASSWORD: MY_SERVICE_DB_PASSWORD
-#     image: "postgres:18-alpine"           # optional, like the rest: the engine's
-#     port: 5432                            #  defaults fill in what is left out;
-#     user: "postgres"                      #  port moves the Service address only -
-#     name: "mydb"                          #  the server keeps its own port
+#     image: "postgres:18-alpine"           # optional, like everything below
+#     port: 5432                            #  but secretEnvs: the engine's
+#     user: "postgres"                      #  defaults fill in the rest
+#     name: "mydb"
 #     replicas: 1                           # 0 or 1
-#     volumes:                              # "data" is the database's own disk,
-#       - name: data                        #  always there: path and size
-#         path: "/var/lib/postgresql"       #  default to the engine's; more
-#         size: "20Gi"                      #  entries are extra disks
-#     command:                              # server settings, as in compose;
-#       - "postgres"                        #  the same field works on the
-#       - "-c"                              #  top-level database: block
+#     command:                              # server settings
+#       - "postgres"
+#       - "-c"
 #       - "wal_level=logical"
+#     volumes:                              # "data" is the database's own disk
+#       - name: data
+#         path: "/var/lib/postgresql"
+#         size: "20Gi"
+#     secretEnvs:                           # required: the password
+#       POSTGRES_PASSWORD: MY_SERVICE_DB_PASSWORD
 #
+# A database already created keeps the name, user and password it was created
+# with; sync says so when one of them changes.
 # ============================================================================`.trimStart();
 
 // Where the images are pushed. Not a service: the key has an uppercase letter, which no service
@@ -319,7 +309,7 @@ function repositorySettingsBlock(config) {
   const { host, project, repository } = registrySettings(config);
   const line = (text, note) => `${text.padEnd(36)}# ${note}`;
   return [
-    '# repository settings',
+    '# Where the built images are pushed.',
     'repositorySettings:',
     line(`  registry: ${yamlScalar(host)}`, 'registry host; docker.io is Docker Hub'),
     line(`  project: ${project ? yamlScalar(project) : 'null'}`, 'namespace inside the registry (a Harbor project, an organisation);'),
@@ -330,16 +320,13 @@ function repositorySettingsBlock(config) {
 
 // Files "flarops sync" leaves alone; init writes the key empty so the option is visible.
 const SYNC_LOCK_BLOCK = [
-  '# sync lock',
-  '# Files "flarops sync" must not overwrite - for a change Flarops cannot',
-  '# express, made by hand in a chart template or a workflow. List each with',
-  '# true; sync then leaves it as it is and says which changes did not reach it:',
+  '# Chart templates (deploy/helm/templates/) and workflows (.github/workflows/) you changed by',
+  '# hand, for something this file cannot express. Sync leaves a listed file as it is and says',
+  '# which changes did not reach it. deploy/helm/values.yaml and werf.yaml cannot be listed.',
   '#',
   '# syncLock:',
   '#   deploy/helm/templates/api.yaml: true',
   '#   .github/workflows/deploy.yml: true',
-  '#',
-  '# deploy/helm/values.yaml and werf.yaml cannot be locked.',
   'syncLock: {}',
 ].join('\n');
 
@@ -386,7 +373,9 @@ function generateFlaropsYaml(config, {
   }
 
   if (config.hasDb) {
+    // The order of a db: block: type, image, port, user, name, replicas, command, volumes, secretEnvs.
     const dbLines = [];
+    if (config.dbType) dbLines.push(`  type: ${yamlScalar(config.dbType)}`);
     if (config.dbHasLocalDockerfile) {
       dbLines.push(`  dockerfile: ${yamlScalar(config.dbLocalDockerfile || 'Dockerfile')}`);
       if (config.dbContext) {
@@ -395,11 +384,10 @@ function generateFlaropsYaml(config, {
     } else {
       dbLines.push(`  image: ${yamlScalar(config.images.db)}`);
     }
-    dbLines.push(`  replicas: 1`);
     if (config.dbPort) dbLines.push(`  port: ${config.dbPort}`);
     if (config.dbUser) dbLines.push(`  user: ${yamlScalar(config.dbUser)}`);
     if (config.dbName) dbLines.push(`  name: ${yamlScalar(config.dbName)}`);
-    if (config.dbType) dbLines.push(`  type: ${yamlScalar(config.dbType)}`);
+    dbLines.push(`  replicas: 1`);
     const dbCmdStr = renderCommand(config.dbCommand, 4);
     if (dbCmdStr) dbLines.push('  command:', dbCmdStr);
     dbLines.push(...volumesLines(config.dbVolumes, 2));
@@ -452,7 +440,7 @@ function generateFlaropsYaml(config, {
     }));
   }
 
-  return repositorySettingsBlock(config) + '\n\n' + SYNC_LOCK_BLOCK + '\n\n' + blocks.join('\n\n') + '\n\n' + TEMPLATE_COMMENT + '\n';
+  return HEADER + '\n\n' + repositorySettingsBlock(config) + '\n\n' + SYNC_LOCK_BLOCK + '\n\n' + blocks.join('\n\n') + '\n\n' + TEMPLATE_COMMENT + '\n';
 }
 
 module.exports = { generateFlaropsYaml };

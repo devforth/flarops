@@ -437,7 +437,7 @@ async function urlBreakingPasswordSurvives() {
     const expectedLog = path.join(FIXTURES, name, 'expected-log.txt');
     if (fs.existsSync(expectedLog)) {
       for (const line of fs.readFileSync(expectedLog, 'utf8').split('\n').map(l => l.trim()).filter(Boolean)) {
-        check(`says: ${line.slice(0, 60)}`, result.log.includes(line),
+        check(`says: ${line.slice(0, 60)}`, result.log.replace(/\x1b\[[0-9;]*m/g, '').includes(line),
           result.log.split('\n').filter(l => /WARNING|INFO/.test(l)).join('\n').slice(0, 400));
       }
     }
@@ -560,7 +560,7 @@ async function urlBreakingPasswordSurvives() {
     // Files git does not ignore go in with the next "git add .": their values are as public as committed ones.
     const result = await generate(path.join(FIXTURES, 'k-support'), undefined, { commit: false });
     check('generates', result.ok, result.error && result.error.stack);
-    check('an uncommitted, unignored value is withheld like a committed one', /RABBITMQ_DEFAULT_PASS \(docker-compose\.yml: committed to git \(or not git-ignored/.test(result.log),
+    check('an uncommitted, unignored value is withheld like a committed one', /RABBITMQ_DEFAULT_PASS  <- needs a real value \(not the one in docker-compose\.yml: committed to git \(or not git-ignored/.test(result.log.replace(/\x1b\[[0-9;]*m/g, '')),
       result.log.split('\n').filter(l => /WARNING/.test(l)).join('\n').slice(0, 600));
     fs.rmSync(result.parent, { recursive: true, force: true });
   }
@@ -572,7 +572,7 @@ async function urlBreakingPasswordSurvives() {
   {
     // Every other prompt answered by stub; the domain prompt gets a sequence.
     const collect = require('../bin/commands/prompts.js');
-    const domainAnswers = ['', 'not a domain', 'App.Example.COM'];
+    const domainAnswers = ['', 'not a domain', 'https://App.Example.COM/login'];
     let domainAsked = 0;
     const said = [];
     const realLog = console.log;
@@ -597,7 +597,8 @@ async function urlBreakingPasswordSurvives() {
       console.log = realLog;
     }
     check('an empty or invalid domain is asked again', domainAsked === 3, `asked ${domainAsked} times`);
-    check('the accepted domain is lowercased', answers && answers.domain === 'app.example.com', answers && answers.domain);
+    check('the accepted domain is lowercased, a pasted URL trimmed to its host', answers && answers.domain === 'app.example.com', answers && answers.domain);
+    check('the addresses that follow from it are shown', said.some(l => /dashboard: https:\/\/dashboard\.example\.com/.test(l) && /app-pr-<N>\.example\.com/.test(l)), said.join(' | '));
     check('the refusal says why', said.some(l => /domain is required/.test(l)) && said.some(l => /is not a domain name/.test(l)), said.join(' | '));
   }
 

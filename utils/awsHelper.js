@@ -4,41 +4,58 @@ const path = require('path');
 const os = require('os');
 const { execSync, execFileSync } = require('child_process');
 
-function getDefaultAWSCredentials() {
+// Credentials already on this machine, as the AWS CLI finds them: AWS_ACCESS_KEY_ID and
+// AWS_SECRET_ACCESS_KEY in the environment, else the AWS_PROFILE (or default) profile in
+// ~/.aws/credentials. Session credentials are skipped: they expire, and these go into GitHub Secrets.
+function getDefaultAWSCredentials(env = process.env) {
+  if (env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY && !env.AWS_SESSION_TOKEN) {
+    return { accessKey: env.AWS_ACCESS_KEY_ID, secretKey: env.AWS_SECRET_ACCESS_KEY, source: 'AWS_ACCESS_KEY_ID in the environment' };
+  }
+  const profile = env.AWS_PROFILE || 'default';
   try {
     const credPath = path.join(os.homedir(), '.aws', 'credentials');
-    if (fs.existsSync(credPath)) {
-      const content = fs.readFileSync(credPath, 'utf8');
-      
-      let inDefault = false;
-      let accessKey = '';
-      let secretKey = '';
-
-      for (const line of content.split('\n')) {
-        const trimmed = line.trim();
-        if (trimmed === '[default]') {
-          inDefault = true;
-          continue;
-        } else if (trimmed.startsWith('[')) {
-          inDefault = false;
-        }
-
-        if (inDefault) {
-          if (trimmed.startsWith('aws_access_key_id')) {
-            accessKey = trimmed.split('=')[1].trim();
-          } else if (trimmed.startsWith('aws_secret_access_key')) {
-            secretKey = trimmed.split('=')[1].trim();
-          }
-        }
+    if (!fs.existsSync(credPath)) return null;
+    let inProfile = false;
+    let accessKey = '';
+    let secretKey = '';
+    for (const line of fs.readFileSync(credPath, 'utf8').split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('[')) {
+        inProfile = trimmed === `[${profile}]`;
+        continue;
       }
-
-      if (accessKey && secretKey) {
-        return { accessKey, secretKey };
-      }
+      if (!inProfile) continue;
+      const [k, ...v] = trimmed.split('=');
+      if (k.trim() === 'aws_access_key_id') accessKey = v.join('=').trim();
+      else if (k.trim() === 'aws_secret_access_key') secretKey = v.join('=').trim();
     }
-  } catch (err) {
-  }
+    if (accessKey && secretKey) return { accessKey, secretKey, source: `the "${profile}" profile in ~/.aws/credentials` };
+  } catch (err) { /* unreadable: as if absent */ }
   return null;
+}
+
+const REGION = /^[a-z]{2}(-gov|-iso[a-z]*)?-[a-z]+-\d$/;
+
+// Asks AWS who these credentials belong to, in this region: a wrong key and a region that does not
+// exist are both found here, before any question that depends on them.
+function checkAwsAccess(awsCmd, credentials, region) {
+  if (!REGION.test(region)) return { ok: false, region: true, message: `"${region}" is not an AWS region - expected something like us-west-2 or eu-central-1` };
+  const env = { PATH: process.env.PATH, HOME: process.env.HOME, AWS_ACCESS_KEY_ID: credentials.accessKey, AWS_SECRET_ACCESS_KEY: credentials.secretKey };
+  try {
+    const out = execFileSync(awsCmd, ['sts', 'get-caller-identity', '--region', region, '--output', 'json'], { env, stdio: 'pipe' }).toString();
+    let account = '';
+    try { account = JSON.parse(out).Account || ''; } catch (e) { /* not JSON: still a success */ }
+    return { ok: true, account };
+  } catch (error) {
+    const stderr = (error.stderr ? error.stderr.toString() : String(error.message || '')).trim();
+    if (/Could not connect to the endpoint|InvalidRegion|UnrecognizedClientException.*region|Name or service not known/i.test(stderr)) {
+      return { ok: false, region: true, message: `AWS does not answer in region "${region}" - check its spelling` };
+    }
+    if (/InvalidClientTokenId|SignatureDoesNotMatch|AuthFailure|ExpiredToken|InvalidAccessKeyId/.test(stderr)) {
+      return { ok: false, message: `AWS rejected these credentials: ${stderr.split('\n').pop()}` };
+    }
+    return { ok: false, message: `could not check the credentials: ${stderr.split('\n').pop() || 'no reason given'}` };
+  }
 }
 
 // Embedded, not fetched; the fingerprint below is what decides trust.
@@ -146,7 +163,11 @@ function looksLikeAwsCli(awsPath) {
   }
 }
 
-function ensureAwsCli() {
+// The CLI downloads AWS publishes for Linux, by Node's architecture name.
+const LINUX_BUILDS = { x64: 'x86_64', arm64: 'aarch64' };
+
+// askQuestion: ask before installing anything (absent, it installs without asking).
+async function ensureAwsCli(askQuestion) {
   // Resolve `aws` once to an absolute path; a bare 'aws' would be re-resolved through PATH each call.
   try {
     const resolvedFromPath = execSync('command -v aws', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
@@ -163,7 +184,19 @@ function ensureAwsCli() {
       return fs.realpathSync(localAwsPath);
     }
 
-    console.log("AWS CLI not found (or not verified as genuine). Installing a trusted copy locally...");
+    const build = process.platform === 'linux' ? LINUX_BUILDS[process.arch] : null;
+    if (!build) {
+      console.error(`The AWS CLI is needed to create the Terraform state bucket, and Flarops can install it itself only on Linux (x86_64 or arm64). Install it (https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html - on macOS, "brew install awscli"), then run init again.`);
+      process.exit(1);
+    }
+    if (askQuestion) {
+      const answer = String(await askQuestion('The AWS CLI is needed to create the Terraform state bucket and is not installed. Install a signature-verified copy into ~/.local (about 60 MB)? [Y/n] ')).trim().toLowerCase();
+      if (answer && answer !== 'y' && answer !== 'yes') {
+        console.error('Install it yourself (https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), then run init again.');
+        process.exit(1);
+      }
+    }
+    console.log("Installing a signature-verified AWS CLI into ~/.local ...");
 
     // A random, 0700 directory: a fixed /tmp path could be pre-created by another local user.
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-aws-'));
@@ -179,8 +212,8 @@ function ensureAwsCli() {
 
     try {
       const curlFlags = ['--fail', '--location', '--proto', '=https', '--tlsv1.2', '--silent', '--show-error'];
-      execFileSync('curl', [...curlFlags, 'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip', '-o', zipPath], { stdio: 'inherit' });
-      execFileSync('curl', [...curlFlags, 'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip.sig', '-o', sigPath], { stdio: 'inherit' });
+      execFileSync('curl', [...curlFlags, `https://awscli.amazonaws.com/awscli-exe-linux-${build}.zip`, '-o', zipPath], { stdio: 'inherit' });
+      execFileSync('curl', [...curlFlags, `https://awscli.amazonaws.com/awscli-exe-linux-${build}.zip.sig`, '-o', sigPath], { stdio: 'inherit' });
       assertPlainFile(zipPath, 'downloaded archive');
       assertPlainFile(sigPath, 'downloaded signature');
 
@@ -247,6 +280,15 @@ function sanitizeBucketName(name) {
   return sanitized;
 }
 
+// A name for the state bucket; asked again while empty (an empty answer used to become "000").
+async function askBucketName(askQuestion) {
+  while (true) {
+    const answer = String(await askQuestion('Enter a new bucket name (lowercase letters, digits and "-"): ')).trim();
+    if (answer) return sanitizeBucketName(answer);
+    console.log('a bucket name is required');
+  }
+}
+
 function hardenStateBucket(awsCmd, bucket, env) {
   const steps = [
     ['versioning', ['s3api', 'put-bucket-versioning', '--bucket', bucket, '--versioning-configuration', 'Status=Enabled']],
@@ -289,15 +331,16 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
       try {
         execFileSync(awsCmd, ['s3api', 'head-bucket', '--bucket', currentBucket], { env, stdio: 'pipe' });
 
-        const answer = await askQuestion(`Bucket [${currentBucket}] is already exist, are you sure you want to use it? (If this bucket belongs to another AWS account, its owner can read your Terraform state - including the k3s cluster token - and change your infrastructure. Check in the S3 console of YOUR account that the bucket is listed there before confirming.) [y/N]: `);
+        console.log(`The S3 bucket "${currentBucket}" for the Terraform state already exists, and these credentials can reach it.`);
+        console.log('  Use it only if it is in YOUR AWS account (check the S3 console) and holds no other');
+        console.log('  project\'s state at terraform.tfstate: its owner could read this state, which includes');
+        console.log('  the cluster token, and two projects at one key overwrite each other.');
+        const answer = await askQuestion(`Use "${currentBucket}"? [y/N] `);
         if (answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes') {
-          resolve({
-            bucket: currentBucket,
-            warning: `\x1b[33mWARNING: Make sure that this bucket does not currently store the state of any other infrastructure, so as not to corrupt it. If you think it would be better to use a different bucket, create it in the AWS console and manually update the deploy/terraform/main.tf file.\x1b[0m`
-          });
+          resolve({ bucket: currentBucket, warning: null });
           return;
         } else {
-          currentBucket = sanitizeBucketName((await askQuestion('Enter new bucket name: ')).trim());
+          currentBucket = await askBucketName(askQuestion);
         }
       } catch (error) {
         const stderr = error.stderr ? error.stderr.toString() : '';
@@ -307,7 +350,7 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
           process.exit(1);
         } else if (stderr.includes('403') || stderr.includes('Forbidden')) {
           console.warn(`\x1b[33mBucket name "${currentBucket}" is already taken by another AWS account. S3 bucket names are global - choose a different one.\x1b[0m`);
-          currentBucket = sanitizeBucketName((await askQuestion('Enter new bucket name: ')).trim());
+          currentBucket = await askBucketName(askQuestion);
         } else if (stderr.includes('404') || stderr.includes('Not Found')) {
           try {
             console.log(`Creating S3 bucket: ${currentBucket} in ${region}...`);
@@ -323,11 +366,11 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
           } catch (createErr) {
             console.error(`Failed to create bucket ${currentBucket}.`);
             console.error(createErr.stderr ? createErr.stderr.toString() : createErr.message);
-            currentBucket = sanitizeBucketName((await askQuestion('Enter new bucket name: ')).trim());
+            currentBucket = await askBucketName(askQuestion);
           }
         } else {
           console.error(`Error checking bucket: ${stderr}`);
-          currentBucket = sanitizeBucketName((await askQuestion('Enter new bucket name: ')).trim());
+          currentBucket = await askBucketName(askQuestion);
         }
       }
     }
@@ -336,6 +379,7 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
 
 module.exports = {
   getDefaultAWSCredentials,
+  checkAwsAccess,
   ensureAwsCli,
   handleS3Bucket
 };

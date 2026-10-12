@@ -133,14 +133,14 @@ broken:
   // 3a'. Repository settings: where the images are pushed.
   {
     const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
-    check('flarops.yaml starts with the repository settings', /^# repository settings\nrepositorySettings:\n/.test(original), original.slice(0, 200));
+    check('flarops.yaml starts with what it is, then the repository settings', /^# What Flarops deploys[^]*?\n# Where the built images are pushed\.\nrepositorySettings:\n/.test(original), original.slice(0, 200));
     const harbor = original
       .replace(/^  registry: .*$/m, '  registry: harbor.example.com')
       .replace(/^  project: .*$/m, '  project: team')
       .replace(/^  repository: .*$/m, '  repository: shop-web');
     fs.writeFileSync(path.join(dir, 'flarops.yaml'), harbor);
     r = runSync(dir);
-    check('sync applies new repository settings', r.status === 0 && /repositorySettings\.project: none -> team/.test(r.out), r.err || r.out);
+    check('sync applies new repository settings', r.status === 0 && /repositorySettings\.project: added \(team\)/.test(r.out), r.err || r.out);
     for (const wf of ['.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml']) {
       const text = read(dir, wf);
       check(`${wf} pushes to <registry>/<project>/<repository>`, text.includes('--repo harbor.example.com/team/shop-web'), text.match(/--repo .*/) && text.match(/--repo .*/)[0]);
@@ -308,7 +308,13 @@ pinger:
     const valuesBefore = read(dir, 'deploy/helm/values.yaml');
     const append = (block) => original + block;
     const refused = [
-      ['a misspelled field', original.replace(/^(api:\n)/m, '$1  replcas: 3\n'), /api\.replcas" is not a field/],
+      ['replicas on a oneShot task', append('\nmigrate:\n  image: "busybox:1.36"\n  oneShot: true\n  replicas: 2\n'), /"migrate\.replicas" does not apply to a oneShot task/],
+      ['ports on a oneShot task', append('\nmigrate:\n  image: "busybox:1.36"\n  oneShot: true\n  ports: [80]\n'), /"migrate\.ports" does not apply to a oneShot task/],
+      ['a misspelled field', original.replace(/^(api:\n)/m, '$1  replcas: 3\n'), /line \d+: "api\.replcas" is not a field - did you mean replicas\?/],
+      ['a field of another kind of block', append('\ncache:\n  image: "redis:7"\n  exposedRoutes:\n    - /cache\n'), /line \d+: "cache\.exposedRoutes" is not a field of a service run from a pre-built image/],
+      ['both image and dockerfile', append('\ncache:\n  image: "redis:7"\n  dockerfile: Dockerfile\n  context: cache\n'), /"cache" has both image and dockerfile/],
+      ['a duplicate key', original.replace(/^(api:\n)/m, '$1  replicas: 2\n  replicas: 3\n').replace(/^  replicas: 1\n(?=  ports:\n    - 4000)/m, ''), /duplicate key "replicas" - it is already on line \d+/],
+      ['a line indented off the grid', original.replace(/^(api:\n)/m, '$1    replicas: 2\n  ports: [4000]\n'), /indented 2 spaces, which lines up with no key above it/],
       ['an unknown key in db:', append('\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  db:\n    type: postgres\n    secretEnvs:\n      POSTGRES_PASSWORD: W_PW\n    passwordKey: "W_PW"\n'), /worker\.db\.passwordKey" is not a field/],
       ['a db: without its password', append('\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  db:\n    type: postgres\n'), /worker\.db\.secretEnvs" is required/],
       ['redis as a database', append('\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  db:\n    type: redis\n    secretEnvs:\n      REDIS_PASSWORD: W_PW\n'), /worker\.db\.type" must be one of/],
@@ -330,7 +336,7 @@ pinger:
     for (const [label, text, message] of refused) {
       fs.writeFileSync(path.join(dir, 'flarops.yaml'), text);
       r = runSync(dir);
-      check(`refuses ${label}`, r.status === 1 && message.test(r.err), r.err || r.out);
+      check(`refuses ${label}`, r.status === 1 && message.test(r.err) && /Nothing was written/.test(r.err), r.err || r.out);
     }
     check('nothing was written on those refusals', read(dir, 'deploy/helm/values.yaml') === valuesBefore);
     fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
@@ -402,7 +408,7 @@ pinger:
     const apiFile = path.join(dir, 'deploy/helm/templates/api.yaml');
     fs.writeFileSync(apiFile, read(dir, 'deploy/helm/templates/api.yaml') + '# drifted\n');
     r = runSync(dir);
-    check('a generated file that drifted is rewritten even with flarops.yaml unchanged', r.status === 0 && /rewritten from this version/.test(r.out) && !/# drifted/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.out);
+    check('a generated file that drifted is rewritten even with flarops.yaml unchanged', r.status === 0 && /flarops\.yaml is unchanged/.test(r.out) && /deploy\/helm\/templates\/api\.yaml\s+\(had hand edits - overwritten/.test(r.out) && !/# drifted/.test(read(dir, 'deploy/helm/templates/api.yaml')), r.out);
 
     fs.writeFileSync(path.join(dir, 'flarops.yaml'), original
       .replace(/^(api:\n)/m, '$1  command: ["node", "server.js", "--greeting={{ hello }}"]\n')
@@ -483,6 +489,62 @@ pinger:
     fs.unlinkSync(path.join(dir, 'deploy/dashboard/flarops_metrics.db'));
     r = runSync(dir);
     check('a current dashboard is nothing to do', /nothing to do/.test(r.out), r.out);
+  }
+
+  // 3i. What sync tells the user, and the command line around it.
+  {
+    const cli = (...args) => spawnSync('node', [CLI, ...args], { cwd: dir, encoding: 'utf8' });
+    const original = fs.readFileSync(path.join(dir, 'flarops.yaml'), 'utf8');
+    const valuesBefore = read(dir, 'deploy/helm/values.yaml');
+
+    let c = cli('sync', '--help');
+    check('"sync --help" shows help and writes nothing', c.status === 0 && /Usage: npx flarops sync/.test(c.stdout) && read(dir, 'deploy/helm/values.yaml') === valuesBefore, c.stdout + c.stderr);
+    {
+      const sub = spawnSync('node', [CLI, 'sync', '--check'], { cwd: path.join(dir, 'deploy'), encoding: 'utf8' });
+      check('sync from a subdirectory works on the project root', sub.status === 0 && /Using \.\.\/flarops\.yaml/.test(sub.stdout), sub.stdout + sub.stderr);
+    }
+    {
+      fs.writeFileSync(path.join(dir, 'flarops.yaml'), original.replace('    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n', '    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    STRIPE_KEY: sk_live_abc123\n'));
+      const w = cli('sync', '--check');
+      check('a secret value in place of its name is warned about', /secretEnvs look like a secret's value, not its name: api\.secretEnvs\.STRIPE_KEY: sk_live_abc123/.test(w.stderr), w.stderr);
+      fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    }
+    c = cli('--version');
+    check('--version prints the version', c.status === 0 && /^\d+\.\d+\.\d+\s*$/.test(c.stdout), c.stdout);
+    c = cli('syncc');
+    check('an unknown command fails and suggests the right one', c.status === 1 && /Did you mean "sync"\?/.test(c.stderr), c.stderr);
+    c = cli('sync', '--dry');
+    check('an unknown option fails', c.status === 1 && /Unknown option "--dry"/.test(c.stderr), c.stderr);
+
+    c = cli('sync', '--check');
+    check('sync --check on a current project exits 0', c.status === 0 && /nothing to do/.test(c.stdout), c.stdout + c.stderr);
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original
+      .replace('    DB_HOST: database\n', '    DB_HOST: database\n    LOG_LEVEL: debug\n')
+      .replace('    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n', '    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    STRIPE_KEY: STRIPE_SECRET_KEY\n'));
+    c = cli('sync', '--check');
+    check('sync --check lists the change, writes nothing and exits 1', c.status === 1 && /api\.env\.LOG_LEVEL: added \(debug\)/.test(c.stdout) && read(dir, 'deploy/helm/values.yaml') === valuesBefore, c.stdout + c.stderr);
+
+    r = runSync(dir);
+    check('a change is shown field by field, not as JSON', /api\.env\.LOG_LEVEL: added \(debug\)/.test(r.out) && /api\.secretEnvs\.STRIPE_KEY: added \(from GitHub Secret STRIPE_SECRET_KEY\)/.test(r.out) && !/\{"/.test(r.out), r.out);
+    check('the files written are listed', /Files written:\n(?:  .*\n)*  deploy\/helm\/values\.yaml/.test(r.out), r.out);
+    check('a new secret ends with what to create before pushing', /Before you push, create these GitHub repository secrets[\s\S]*STRIPE_SECRET_KEY\s+read by api as STRIPE_KEY/.test(r.out), r.out);
+    check('and with the next step', /Next: review "git diff", then commit and push - a push to main deploys it/.test(r.out), r.out);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original.replace(/^(database:\n(?:  .*\n|    .*\n|      .*\n)*?)  name: (\S+)\n/m, '$1  name: renameddb\n'));
+    r = runSync(dir);
+    check('renaming the database warns that existing data keeps the old name', /database\.name changed \(\S+ -> renameddb\): a database already created keeps/.test(r.err), r.err);
+    check('and the secret no longer used is named', /No longer used - you can delete these GitHub secrets: STRIPE_SECRET_KEY/.test(r.out), r.out);
+
+    fs.writeFileSync(path.join(dir, 'flarops.yaml'), original);
+    r = runSync(dir);
+    check('back to the original after the output checks', r.status === 0, r.err || r.out);
+
+    const envFile = path.join(dir, 'deploy/.env');
+    const envBefore = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
+    c = cli('dashboard-password');
+    const envAfter = fs.readFileSync(envFile, 'utf8');
+    check('dashboard-password shows a new password once, with the address', c.status === 0 && /password: \S+/.test(c.stdout) && /address:\s+\S*https:\/\/dashboard\./.test(c.stdout), c.stdout + c.stderr);
+    check('and replaces the hash in deploy/.env', /^DASHBOARD_PASSWORD_HASH='pbkdf2-sha256\$i=600000\$/m.test(envAfter) && envAfter !== envBefore && (envAfter.match(/^DASHBOARD_PASSWORD_HASH=/gm) || []).length === 1, envAfter.slice(0, 300));
   }
 
   // 3f. The Flarops section of AGENTS.md is kept current; the rest of the file is left alone.

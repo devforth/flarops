@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -160,6 +161,26 @@ func planPlacement(d *DashboardData, requestMiB int, callerKey string) placement
 	return best
 }
 
+// The size CI plans a new PR environment at (templates/pr-capsule.yml.js): what production uses right
+// now, as a PR environment runs the same stack; under 64 MiB production is not measured yet, and CI
+// falls back to the generated estimate (FLAROPS_PR_ESTIMATE_MIB). Before headroom.
+func nextEnvironmentMiB(d *DashboardData) (int, string) {
+	for _, h := range d.Hosts {
+		for _, c := range h.Capsules {
+			if strings.HasSuffix(c.ID, "-production") && c.Ram >= 64 {
+				return c.Ram, "what production uses now"
+			}
+		}
+	}
+	if est, err := strconv.Atoi(os.Getenv("FLAROPS_PR_ESTIMATE_MIB")); err == nil && est > 0 {
+		return est, "the estimate for this stack (production is not measured yet)"
+	}
+	if largest := largestCapsuleMiB(d); largest > 0 {
+		return largest, "the largest running environment (production is not measured yet)"
+	}
+	return 0, "nothing is running yet"
+}
+
 func largestCapsuleMiB(d *DashboardData) int {
 	largest := 0
 	for _, h := range d.Hosts {
@@ -201,7 +222,7 @@ func handleCapacity(w http.ResponseWriter, r *http.Request) {
 		}
 		requested = parsed
 	} else {
-		requested = largestCapsuleMiB(d)
+		requested = d.Fleet.NextEnvRequestMiB
 	}
 
 	callerKey := r.URL.Query().Get("for")

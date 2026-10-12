@@ -17,7 +17,7 @@ module.exports = function renderValues(config, context) {
       additionalServicesYaml += `  - name: ${s.name}
     image: ${s.name}:latest
     env:
-${generateEnvString(s.env, context, '      ')}
+${generateEnvString(s.env, context, '      ', s.name)}
     secretKeys:
 ${s.secretKeys.map(k => '      - ' + k).join('\n')}
     ports:${s.ports.length === 0 ? ' []' : '\n' + s.ports.map(p => '      - ' + p).join('\n')}
@@ -50,7 +50,7 @@ ${s.db.command ? `      command:\n${s.db.command.map(a => '        - "' + yamlEs
     image: "${yamlEscapeDoubleQuoted(s.image)}"
     replicas: ${s.replicas ?? 1}
     env:
-${generateEnvString(s.env, context, '      ')}
+${generateEnvString(s.env, context, '      ', s.name)}
     secretKeys:
 ${(s.secretKeys || []).map(k => '      - ' + k).join('\n')}
     ports:
@@ -89,7 +89,7 @@ ${config.hasBackend ? `api:
   secretKeys:
 ${config.apiSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
-${generateEnvString(config.apiEnv || {}, context)}
+${generateEnvString(config.apiEnv || {}, context, '    ', 'api')}
 ${config.apiCommand ? `  command:\n${config.apiCommand.map(a => '    - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}apiPorts:
 ${config.apiPorts.map(p => '  - ' + p).join('\n')}` : ''}
 ${config.hasFrontend ? `frontend:
@@ -97,7 +97,7 @@ ${config.hasFrontend ? `frontend:
   secretKeys:
 ${config.frontendSecretKeys.map(k => '    - ' + k).join('\n')}
   env:
-${generateEnvString(config.frontendEnv || {}, context)}
+${generateEnvString(config.frontendEnv || {}, context, '    ', 'frontend')}
 ${config.frontendCommand ? `  command:\n${config.frontendCommand.map(a => '    - "' + yamlEscapeDoubleQuoted(a) + '"').join('\n')}\n` : ''}frontendPorts:
 ${config.frontendPorts.map(p => '  - ' + p).join('\n')}` : ''}
 ${additionalServicesYaml}${supportServicesYaml}

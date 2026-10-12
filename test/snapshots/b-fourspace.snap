@@ -11,7 +11,6 @@
   backend/index.js
   backend/package.json
   deploy/.env
-  deploy/.env.safety
   deploy/.flarops-state.json
   deploy/dashboard/Dockerfile
   deploy/dashboard/auth.go
@@ -198,6 +197,18 @@ jobs:
           CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
           echo "Preserving existing worker slots: $CURRENT_SLOTS"
           terraform apply -var="worker_slots=$CURRENT_SLOTS" -auto-approve -lock-timeout=5m
+
+      - name: Deployment summary
+        working-directory: deploy/terraform
+        run: |
+          IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          {
+            echo "### Deployed"
+            echo ""
+            echo "- Application: https://${{ env.BASE_DOMAIN }}"
+            echo "- Dashboard: https://dashboard.example.test"
+            echo "- Server IP: ${IP:-unknown} - point the DNS records listed in FLAROPS.md at it"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fetch Kubeconfig from EC2
         working-directory: deploy/terraform
@@ -996,10 +1007,16 @@ This project is deployed by Flarops, and `flarops.yaml` is the source of truth f
 - Field reference: the comment block at the end of `flarops.yaml`. Sync refuses an invalid file,
   names the field, and writes nothing - read its message and fix that field.
 - Secrets: list each under `secretEnvs` of the service that reads it (`ENV_NAME: GITHUB_SECRET_NAME`).
-  Values go into the repository's GitHub Secrets, never into the repository; the git-ignored
-  `deploy/.env` lists the secrets to create.
+  Values go into the repository's GitHub Secrets, never into the repository. Sync names every secret
+  a change needs - tell the user to create it before pushing (you cannot): without it the variable
+  reaches the container empty.
+- Run sync from the project root, then review `git diff`; `npx flarops sync --check` shows what it
+  would change without writing anything. A push to the deploy branch deploys.
 - Database connection URLs: list the variable under `databaseUrls` - the chart builds the URL from
   the database's user, password and name. Do not store such a URL as a secret.
+- Data does not follow a rename. Renaming a service with volumes, or changing a database's name,
+  user, password or major image version, leaves the existing data where it is (sync prints a NOTE
+  saying where). Tell the user before making such a change, and how to move the data.
 <!-- flarops:end -->
 
 # ===== CLAUDE.md
@@ -1008,32 +1025,57 @@ This project is deployed by Flarops, and `flarops.yaml` is the source of truth f
 <!-- flarops:end -->
 
 # ===== FLAROPS.md
-# Flarops Deployment Guide
+# Deploying b-fourspace with Flarops
 
-Flarops has successfully generated the infrastructure and CI/CD configuration for your project!
+Flarops has generated the infrastructure and CI/CD for this project. These are the steps to the first deploy.
 
-## Next Manual Steps
-
-To complete the setup and perform your first deployment, please follow these instructions:
-
-### 1. Add GitHub Secrets
-You must manually add the generated secrets to your GitHub repository. 
-1. Go to your GitHub repository.
-2. Navigate to **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**.
-3. Open the generated `deploy/.env` file in your project.
-4. For each variable in that file, create a new Repository Secret with the exact same name (e.g., `AWS_ACCESS_KEY_ID`) and its corresponding value.
-*(Note: Be sure to copy multiline secrets like `SSH_PRIVATE_KEY` exactly as they are, including line breaks, without any surrounding quotation marks).*
-
-### 2. Push to your Branch
-Commit the newly generated files to your repository. Flarops has automatically updated your `.gitignore` to exclude sensitive files like `.env` and your local `.keys/` directory.
+## 1. Review what init changed
 
 ```bash
-git add .
-git commit -m "chore: setup Flarops CI/CD and infrastructure"
+git status
+git diff
+```
+
+Besides the new files, init may have edited your source - its output lists every "refactored" file. Check those changes before you commit.
+
+## 2. Create the GitHub Secrets
+
+Open `deploy/.env` (it is git-ignored and never read at deploy time - it is a checklist). In your repository, go to **Settings -> Secrets and variables -> Actions -> New repository secret**, and create one secret per line, with the same name.
+
+Paste each value **without the surrounding quotes**. For `SSH_PRIVATE_KEY`, copy everything from `-----BEGIN` to the closing `-----END ... -----` line, line breaks included.
+
+## 3. Commit and push to `main`
+
+```bash
+git add -A
+git commit -m "Deploy with Flarops"
 git push origin main
 ```
 
-Once you push to the `main` branch (or trigger it manually), the GitHub Actions workflow (`deploy.yml`) will automatically start provisioning your infrastructure and deploying your application.
+A push to `main` runs the "Flarops CI/CD Pipeline" workflow (repository -> Actions). The first run takes about 10-15 minutes. It creates, in your AWS account and billed to it: a VPC, one EC2 instance (`t3a.medium`, 40 GB disk) with an Elastic IP in `us-west-2`, and installs k3s, then builds and deploys the application.
+
+## 4. DNS
+
+Cloudflare was not configured, so create the DNS records yourself once the first deploy has run. The server's IP is in the summary of the "Flarops CI/CD Pipeline" run (repository -> Actions), and in `terraform -chdir=deploy/terraform output public_ip`. Create A records pointing at it for:
+
+- `example.test`
+- `dashboard.example.test`
+- `*.example.test` (pull request environments)
+
+HTTPS comes from a proxy in front of the server (Cloudflare's proxy, for example): the server itself serves plain HTTP on port 80.
+
+## 5. Open it
+
+- Application: https://example.test
+- Dashboard: https://dashboard.example.test - user `admin`, with the password init showed once. Lost it? `npx flarops dashboard-password` issues a new one.
+
+## Pull requests
+
+Every pull request gets its own environment at `https://pr-<number>.example.test`, with a copy of the production database. Closing the pull request removes it, and any worker machine it no longer needs.
+
+## Changing the deployment later
+
+Edit `flarops.yaml` and run `npx flarops sync`, then commit and push. Do not edit `deploy/helm/`, `werf.yaml` or `.github/workflows/` by hand - sync regenerates them. The field reference is the comment block at the end of `flarops.yaml`; `AGENTS.md` tells coding agents the same.
 
 # ===== backend/Dockerfile
 FROM node:20
@@ -1050,7 +1092,8 @@ app.listen(4400);
 # ===== deploy/.env
 # ============================================================================
 # Every NAME below must be created as a GitHub repository secret with the same
-# name and the value shown, or the deployment will not come up:
+# name and the value shown - paste the value WITHOUT the surrounding " or '
+# quotes - or the deployment will not come up:
 #
 #   your repository -> Settings -> Secrets and variables -> Actions
 #                   -> New repository secret
@@ -1063,7 +1106,7 @@ app.listen(4400);
 # --- Created by Flarops for the infrastructure it provisions -----------------
 AWS_ACCESS_KEY_ID="AKIATEST"
 AWS_SECRET_ACCESS_KEY="secrettest"
-REGISTRY_PASSWORD="testpass"
+REGISTRY_PASSWORD=""
 
 # --- Found in your project's own .env files ---------------------------------
 SECRET_TOKEN=
@@ -1072,15 +1115,7 @@ SECRET_TOKEN=
 DASHBOARD_PASSWORD_HASH='pbkdf2-sha256$i=600000$<PBKDF2>'
 
 # --- The deploy key Flarops generated for this repository -------------------
-# One value on one very long line. Copy it whole, including both -----markers.
-SSH_PRIVATE_KEY="<PEM>"
-
-# ===== deploy/.env.safety
-DATABASE_USER=
-DATABASE_TYPE=
-DOCKER_REGISTRY=
-DOMAIN=example.test
-AWS_REGION=us-west-2
+# Many lines. Copy everything from <PEM>"
 
 # ===== deploy/.flarops-state.json
 {
@@ -1144,6 +1179,7 @@ AWS_REGION=us-west-2
   "dbLocalDockerfile": null,
   "dbContext": null,
   "dbCommand": null,
+  "deployBranch": "main",
   "apiVolumes": [],
   "frontendVolumes": [],
   "dbPasswordKey": "DATABASE_PASSWORD",
@@ -1579,6 +1615,10 @@ spec:
           value: {{ .Values.aws.instanceType | default "" | quote }}
         - name: FLAROPS_EBS_GB
           value: {{ .Values.aws.volumeSize | default "" | quote }}
+        - name: FLAROPS_PROJECT
+          value: {{ .Values.projectName | quote }}
+        - name: FLAROPS_PR_ESTIMATE_MIB
+          value: "256"
         ports:
         - containerPort: 8080
         resources:
@@ -2108,23 +2148,24 @@ services:
             APP_MODE: production
 
 # ===== flarops.yaml
-# repository settings
+# What Flarops deploys. Edit this file, then run "npx flarops sync" from this directory and
+# commit what it changed; a push to the deploy branch deploys it. Every field is described in the
+# reference at the end of this file.
+
+# Where the built images are pushed.
 repositorySettings:
   registry: docker.io               # registry host; docker.io is Docker Hub
   project: null                     # namespace inside the registry (a Harbor project, an organisation);
                                     # null for none - on Docker Hub, your own user
   repository: b-fourspace           # repository the images are pushed to
 
-# sync lock
-# Files "flarops sync" must not overwrite - for a change Flarops cannot
-# express, made by hand in a chart template or a workflow. List each with
-# true; sync then leaves it as it is and says which changes did not reach it:
+# Chart templates (deploy/helm/templates/) and workflows (.github/workflows/) you changed by
+# hand, for something this file cannot express. Sync leaves a listed file as it is and says
+# which changes did not reach it. deploy/helm/values.yaml and werf.yaml cannot be listed.
 #
 # syncLock:
 #   deploy/helm/templates/api.yaml: true
 #   .github/workflows/deploy.yml: true
-#
-# deploy/helm/values.yaml and werf.yaml cannot be locked.
 syncLock: {}
 
 api:
@@ -2141,115 +2182,96 @@ api:
     - /api
 
 # ============================================================================
-# This file is the source of truth for what gets deployed. Edit it, then run
+# Reference
 #
-#     flarops sync
+# "npx flarops sync" applies this file: a changed field updates what is
+# deployed, a block added here becomes a new service (anything left out gets
+# a default), and a block removed is removed from the deployment.
+# "npx flarops sync --check" shows what it would change without writing.
 #
-# which applies every change here to deploy/helm, werf.yaml and the recorded
-# state: a changed parameter updates the existing object, a service added below
-# is created from the same templates a discovered one is built from (with
-# defaults for anything left out), and a service removed from here is removed
-# from the deployment. `flarops init` does not run twice - sync is how a
-# generated project changes from then on.
+# --- Service names -----------------------------------------------------------
 #
-# Template for adding new services to this file.
+# Each top-level key other than repositorySettings and syncLock is a service.
+# A name is lowercase letters, digits and "-", starts with a letter, ends with
+# a letter or digit, and is at most 63 characters (49 with a db: block). Not
+# allowed: secret, dashboard, registry-secret, flarops-..., and words YAML
+# reads as something else (null, true, false, yes, no, on, off, y, n).
 #
-# Each top-level key is a service name (must be unique, RFC-1123 compatible).
-# A service MUST have either `image` OR `dockerfile` + `context`, and `replicas`.
+# --- The special blocks ------------------------------------------------------
 #
-# `context` is RELATIVE TO THE PROJECT ROOT (not to the deploy directory);
-# `dockerfile` is relative to `context`, as in docker-compose and werf.
+# api:        the backend; the Ingress routes its exposedRoutes to it.
+# frontend:   the web frontend; it answers every path no other service owns.
+# database:   the shared database. Fields: type, image (or dockerfile and
+#             context), port, user, name, replicas (0 or 1), command,
+#             volumes, secretEnvs - as in db: below.
 #
-# --- Required fields --------------------------------------------------------
+# --- Any service ---------------------------------------------------------------
 #
 # my-service:
-#   # OPTION A: pre-built image (not built locally)
-#   image: "registry.example.com/org/image:tag"
+#   # Exactly one of:
+#   image: "registry.example.com/org/image:tag"   # a pre-built image, or
+#   context: "path/to"                      # built from this repository: the
+#   dockerfile: "Dockerfile"                #  build context, relative to the
+#                                           #  project root, and the Dockerfile,
+#                                           #  relative to context
 #
-#   # OPTION B: built from a Dockerfile in this repository
-#   context: "path/to"                      # Docker build context, relative to project root
-#   dockerfile: "Dockerfile"                # relative to context (path/to/Dockerfile here)
-#
-#   replicas: 1                             # number of pod replicas
-#
-# --- A task instead of a service --------------------------------------------
-#
-#   oneShot: true                           # runs to completion and stops,
-#                                           #  instead of staying up. Rendered
-#                                           #  as a Job that re-runs on every
-#                                           #  deploy, so the command must be
-#                                           #  safe to repeat. Replaces
-#                                           #  replicas; no ports, no probes,
-#                                           #  no exposedRoutes - a task has no
-#                                           #  Service to route to.
-#
-# --- Optional fields --------------------------------------------------------
-#
-#   ports:                                  # container ports to expose
+#   replicas: 1                             # optional, 1 by default
+#   ports:                                  # container ports
 #     - 8080
-#
-#   buildArgs:                              # passed to "docker build --build-arg"
-#     - "BUILD_MODE=production"              # (spelled "args" in older files,
-#     - "API_URL=https://example.com"        #  still accepted)
-#
-#   command:                                # what the container RUNS - this
-#     - "node"                              #  becomes the pod's args:, which
-#     - "server.js"                         #  replaces the image's CMD and
-#                                           #  keeps its ENTRYPOINT, exactly as
-#                                           #  docker-compose's command: does.
-#
-#   env:                                    # plain-text environment variables
-#     DATABASE_HOST: "database"
+#   command:                                # what the container runs: replaces
+#     - "node"                              #  the image's CMD and keeps its
+#     - "server.js"                         #  ENTRYPOINT, like compose's command:
+#   env:                                    # plain values - never a secret
 #     APP_ENV: "production"
+#   secretEnvs:                             # <variable the code reads>: <GitHub
+#     STRIPE_KEY: STRIPE_KEY                #  Secret it comes from> - the NAME of
+#     DB_PASSWORD: SHARED_DB_PASSWORD       #  a secret, never its value
+#   volumes:                                # persistent storage, one claim each
+#     - name: "data"                        #  (<service>-<name>). size is
+#       path: "/var/lib/service"            #  optional: 5Gi, 10Gi on a database.
+#       size: "20Gi"                        #  Removing a volume keeps its data; a
+#                                           #  new size reaches new claims only.
+#                                           #  PR environments start empty.
+#   oneShot: true                           # a task, not a service: runs to the
+#                                           #  end on every deploy (so it must be
+#                                           #  safe to repeat). Takes no replicas,
+#                                           #  ports, health check or routes.
 #
-#   databaseUrls:                           # env vars that get the database's
-#     - DATABASE_URL                        #  connection URL, built by the chart
-#                                           #  from its user, password and name -
-#                                           #  this service's own db: if it has
-#                                           #  one, otherwise the top-level
-#                                           #  database. No GitHub Secret needed.
+# --- Only for services built here (dockerfile:), and api ----------------------
 #
-#   secretEnvs:                             # env vars sourced from GitHub Secrets
-#     SECRET_KEY: SECRET_KEY                # env name: GitHub Secret name
-#     DB_PASSWORD: SHARED_DB_PASSWORD       # env name can differ from secret name
-#
-#   volumes:                                # persistent storage, one claim each -
-#     - name: "data"                        #  on any block: api, frontend, any
-#       path: "/var/lib/service"            #  service, database and db:
-#       size: "20Gi"                        # optional, 5Gi by default (10Gi on a
-#                                           #  database). The claim is
-#                                           #  <service>-<name>. Removing a volume
-#                                           #  keeps its claim and data; a new
-#                                           #  size reaches new claims only. PR
-#                                           #  environments get empty volumes.
-#
-#   healthRoute: "/health"                  # readiness/liveness probe path
-#   healthPort: 8080                        # port for the health probe
-#
+#   buildArgs:                              # docker build --build-arg
+#     - "API_URL=https://example.com"
+#   healthRoute: "/health"                  # readiness and liveness probe path
+#   healthPort: 8080                        #  and its port
 #   exposedRoutes:                          # Ingress path prefixes routed here
-#     - "/webhooks"                          #  passed through unchanged
-#     - path: "/api"                         #  the service sees requests with
-#       stripPrefix: true                    #  "/api" removed - use this when a
-#                                            #  reverse proxy did it before
-#
-#   db:                                     # per-service database (generates its own StatefulSet)
+#     - "/webhooks"                         #  passed through unchanged
+#     - path: "/api"                        #  the service sees "/api" removed
+#       stripPrefix: true
+#   databaseUrls:                           # variables that get the database's
+#     - DATABASE_URL                        #  connection URL, built from its user,
+#                                           #  password and name: this service's
+#                                           #  db: if it has one, otherwise the
+#                                           #  top-level database. No secret needed.
+#   db:                                     # a database of this service's own
 #     type: "postgres"                      # required: postgres | mysql | mariadb | mongodb
-#     secretEnvs:                           # required: the password, as for a service
-#       POSTGRES_PASSWORD: MY_SERVICE_DB_PASSWORD
-#     image: "postgres:18-alpine"           # optional, like the rest: the engine's
-#     port: 5432                            #  defaults fill in what is left out;
-#     user: "postgres"                      #  port moves the Service address only -
-#     name: "mydb"                          #  the server keeps its own port
+#     image: "postgres:18-alpine"           # optional, like everything below
+#     port: 5432                            #  but secretEnvs: the engine's
+#     user: "postgres"                      #  defaults fill in the rest
+#     name: "mydb"
 #     replicas: 1                           # 0 or 1
-#     volumes:                              # "data" is the database's own disk,
-#       - name: data                        #  always there: path and size
-#         path: "/var/lib/postgresql"       #  default to the engine's; more
-#         size: "20Gi"                      #  entries are extra disks
-#     command:                              # server settings, as in compose;
-#       - "postgres"                        #  the same field works on the
-#       - "-c"                              #  top-level database: block
+#     command:                              # server settings
+#       - "postgres"
+#       - "-c"
 #       - "wal_level=logical"
+#     volumes:                              # "data" is the database's own disk
+#       - name: data
+#         path: "/var/lib/postgresql"
+#         size: "20Gi"
+#     secretEnvs:                           # required: the password
+#       POSTGRES_PASSWORD: MY_SERVICE_DB_PASSWORD
 #
+# A database already created keeps the name, user and password it was created
+# with; sync says so when one of them changes.
 # ============================================================================
 
 # ===== werf-giterminism.yaml

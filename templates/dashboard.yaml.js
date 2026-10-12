@@ -1,3 +1,5 @@
+const { prEstimateMiB } = require('../utils/prEstimate.js');
+
 module.exports = function dashboardYamlTemplate(config) {
   const domainParts = config.domain.split('.');
   const baseDomain = domainParts.length > 2 ? domainParts.slice(1).join('.') : config.domain;
@@ -190,6 +192,10 @@ spec:
           value: {{ .Values.aws.instanceType | default "" | quote }}
         - name: FLAROPS_EBS_GB
           value: {{ .Values.aws.volumeSize | default "" | quote }}
+        - name: FLAROPS_PROJECT
+          value: {{ .Values.projectName | quote }}
+        - name: FLAROPS_PR_ESTIMATE_MIB
+          value: "${prEstimateMiB(config)}"
         ports:
         - containerPort: 8080
         resources:

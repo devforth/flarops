@@ -475,7 +475,17 @@ type loginPageData struct {
 	Nonce     string
 	CSRFToken string
 	Error     string
+	// A notice that is not a failure: "You have been signed out."
+	Notice string
+	// Kept across a failed attempt, so only the password is typed again.
+	Username string
+	// The username to suggest - only the default one, which the docs already name.
+	DefaultUsername string
 }
+
+// The double-submit CSRF cookie only pairs a form with its post; a short life just turned a login form
+// left open into "Session expired".
+const loginFormTTL = 12 * time.Hour
 
 // URL-safe alphabet: html/template would escape "+" in the nonce attribute.
 func newNonce() string {
@@ -519,16 +529,20 @@ func cookieValue(r *http.Request, name string) string {
 }
 
 func renderLogin(w http.ResponseWriter, status int, errMsg string, csrfToken string) {
+	renderLoginPage(w, status, loginPageData{Error: errMsg, CSRFToken: csrfToken})
+}
+
+func renderLoginPage(w http.ResponseWriter, status int, data loginPageData) {
 	nonce := newNonce()
+	data.Nonce = nonce
+	if auth != nil && auth.username == "admin" {
+		data.DefaultUsername = "admin"
+	}
 	w.Header().Set("Content-Security-Policy", strictPageCSP(nonce))
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	if err := authTemplates.ExecuteTemplate(w, "login.html", loginPageData{
-		Nonce:     nonce,
-		CSRFToken: csrfToken,
-		Error:     errMsg,
-	}); err != nil {
+	if err := authTemplates.ExecuteTemplate(w, "login.html", data); err != nil {
 		log.Println("auth: could not render login page:", err)
 	}
 }
@@ -545,8 +559,12 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		auth.setCookie(w, auth.csrfCookieName(), token, int((30 * time.Minute).Seconds()))
-		renderLogin(w, http.StatusOK, "", token)
+		auth.setCookie(w, auth.csrfCookieName(), token, int(loginFormTTL.Seconds()))
+		data := loginPageData{CSRFToken: token}
+		if r.URL.Query().Get("signed-out") == "1" {
+			data.Notice = "You have been signed out."
+		}
+		renderLoginPage(w, http.StatusOK, data)
 
 	case http.MethodPost:
 		handleLoginPost(w, r)
@@ -562,7 +580,7 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 
 	// Rate limit before the expensive verification.
 	if wait := perIPLimiter.retryAfter(ip); wait > 0 {
-		tooManyAttempts(w, wait)
+		tooManyAttempts(w, r, wait, "Too many sign-in attempts from this address.")
 		return
 	}
 	// The global limiter only logs; gating on it would let distributed noise lock the operator out.
@@ -585,8 +603,12 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		auth.setCookie(w, auth.csrfCookieName(), fresh, int((30 * time.Minute).Seconds()))
-		renderLogin(w, http.StatusBadRequest, "Session expired. Please try again.", fresh)
+		auth.setCookie(w, auth.csrfCookieName(), fresh, int(loginFormTTL.Seconds()))
+		renderLoginPage(w, http.StatusBadRequest, loginPageData{
+			Error:     "This sign-in form had expired. Enter the password again.",
+			CSRFToken: fresh,
+			Username:  r.PostFormValue("username"),
+		})
 		return
 	}
 
@@ -599,7 +621,7 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(verifyErr, errVerifierBusy) {
 		// Charged to the source address, or the queue could be kept full for free.
 		perIPLimiter.recordFailure(ip)
-		tooManyAttempts(w, 5*time.Second)
+		tooManyAttempts(w, r, 5*time.Second, "The server is busy checking other sign-ins.")
 		return
 	}
 
@@ -613,8 +635,12 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		auth.setCookie(w, auth.csrfCookieName(), fresh, int((30 * time.Minute).Seconds()))
-		renderLogin(w, http.StatusUnauthorized, "Incorrect username or password.", fresh)
+		auth.setCookie(w, auth.csrfCookieName(), fresh, int(loginFormTTL.Seconds()))
+		renderLoginPage(w, http.StatusUnauthorized, loginPageData{
+			Error:     "Incorrect username or password.",
+			CSRFToken: fresh,
+			Username:  username,
+		})
 		return
 	}
 
@@ -633,11 +659,29 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func tooManyAttempts(w http.ResponseWriter, wait time.Duration) {
+// The sign-in page again, saying how long to wait - not a bare text response.
+func tooManyAttempts(w http.ResponseWriter, r *http.Request, wait time.Duration, why string) {
 	seconds := int(wait.Seconds()) + 1
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
-	w.Header().Set("Cache-Control", "no-store, max-age=0")
-	http.Error(w, "Too many login attempts. Try again later.", http.StatusTooManyRequests)
+	fresh, err := randomToken()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	auth.setCookie(w, auth.csrfCookieName(), fresh, int(loginFormTTL.Seconds()))
+	_ = r.ParseForm()
+	renderLoginPage(w, http.StatusTooManyRequests, loginPageData{
+		Error:     fmt.Sprintf("%s Try again in %s.", why, waitText(seconds)),
+		CSRFToken: fresh,
+		Username:  r.PostFormValue("username"),
+	})
+}
+
+func waitText(seconds int) string {
+	if seconds < 90 {
+		return fmt.Sprintf("%d seconds", seconds)
+	}
+	return fmt.Sprintf("%d minutes", (seconds+59)/60)
 }
 
 type logoutPageData struct {
@@ -672,13 +716,19 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if !sessionIsValid(sessionToken) || !csrfTokenMatches(sessionCSRFToken(sessionToken), r.PostFormValue("csrf_token")) {
+		// A session that already ended is the outcome asked for, not an error.
+		if !sessionIsValid(sessionToken) {
+			auth.clearCookie(w, auth.sessionCookieName())
+			http.Redirect(w, r, "/login?signed-out=1", http.StatusSeeOther)
+			return
+		}
+		if !csrfTokenMatches(sessionCSRFToken(sessionToken), r.PostFormValue("csrf_token")) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		destroySession(sessionToken)
 		auth.clearCookie(w, auth.sessionCookieName())
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		http.Redirect(w, r, "/login?signed-out=1", http.StatusSeeOther)
 
 	default:
 		w.Header().Set("Allow", "GET, POST")

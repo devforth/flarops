@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,7 +122,9 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 
 	data := DashboardData{
 		Fleet: FleetState{
-			Domain: dashboardDomain,
+			Domain:    dashboardDomain,
+			AppDomain: baseDomain,
+			Project:   os.Getenv("FLAROPS_PROJECT"),
 		},
 		Hosts: []HostState{},
 		Queue: []CapsuleState{},
@@ -151,24 +154,14 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	nodeMetrics, _ := k8s.GetNodeMetrics()
 	podMetrics, _ := k8s.GetPodMetrics()
 
-	podMetricsMap := make(map[string]map[string]struct {
-		Cpu int
-		Ram int
-	})
+	// Per container of each pod: replicas and DaemonSet pods share container names.
+	type usage struct{ Cpu, Ram int }
+	podMetricsMap := make(map[string]usage)
 	for _, pm := range podMetrics {
-		if _, ok := podMetricsMap[pm.Namespace]; !ok {
-			podMetricsMap[pm.Namespace] = make(map[string]struct {
-				Cpu int
-				Ram int
-			})
-		}
 		for _, cm := range pm.Containers {
-			podMetricsMap[pm.Namespace][cm.Name] = struct {
-				Cpu int
-				Ram int
-			}{
-				Cpu: int(cm.Usage.Cpu().MilliValue() / 10),          // approximate percentage of a core * 10? wait. 1 core = 1000m. CPU is in %. 1 core = 100%. So millicores / 10 = %.
-				Ram: int(cm.Usage.Memory().Value() / (1024 * 1024)), // MiB
+			podMetricsMap[pm.Namespace+"/"+pm.Name+"/"+cm.Name] = usage{
+				Cpu: int(cm.Usage.Cpu().MilliValue() / 10), // percent of one core
+				Ram: int(cm.Usage.Memory().Value() / (1024 * 1024)),
 			}
 		}
 	}
@@ -176,6 +169,10 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	nsPods := make(map[string][]*corev1.Pod)
 	for _, p := range pods {
 		if p.Namespace == "kube-system" || p.Namespace == "default" || p.Namespace == "kube-public" || p.Namespace == "kube-node-lease" {
+			continue
+		}
+		// Flarops' own dashboard and node agents are not part of the application they watch.
+		if app := p.Labels["app"]; app == "flarops-dashboard" || app == "flarops-node-agent" {
 			continue
 		}
 		nsPods[p.Namespace] = append(nsPods[p.Namespace], p)
@@ -188,6 +185,10 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	}
 
 	hostMap := make(map[string]*HostState)
+	unpriced := map[string]bool{}
+	unpricedDisk := map[string]bool{}
+	ec2CostPerType := map[string]float64{}
+	ebsRunRate := 0.0
 	for _, n := range nodes {
 		ramTotal := int(n.Status.Capacity.Memory().Value() / (1024 * 1024))
 		ramAllocatable := int(n.Status.Allocatable.Memory().Value() / (1024 * 1024))
@@ -216,25 +217,38 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		if r, ok := n.Labels["topology.kubernetes.io/region"]; ok {
 			region = r
 		}
-		ec2Rate := getEC2HourlyRate(instanceType, region)
-		ebsRate := (ebsGB * 0.08) / 730.0
-		eipRate := 0.005 / float64(len(nodes))
-		hourlyRate := ec2Rate + ebsRate + eipRate
+		ec2Rate, priceKnown := getEC2HourlyRate(instanceType, region)
+		if !priceKnown {
+			unpriced[instanceType+" in "+region] = true
+		}
+		gp3, gp3Known := getGP3Rate(region)
+		if !gp3Known {
+			unpricedDisk[region] = true
+		}
+		ebsRate := (ebsGB * gp3) / 730.0
+		hourlyRate := ec2Rate + ebsRate + publicIPv4HourlyRate
+		ec2CostPerType["AWS EC2 Instances ("+instanceType+")"] += ec2Rate * 24.0
+		ebsRunRate += ebsRate * 24.0
 
-		// Disk comes from the node agent; a node without one reports zero.
-		diskTotal := 0
-		diskUsed := 0
+		// Disk and swap come from the node agent; without an answer they are unknown, not zero.
+		diskTotal, diskUsed, swapTotal, swapUsed := 0, 0, 0, 0
+		agentKnown := false
 		if ip, ok := nodeAgentIPs[n.Name]; ok {
 			if disk, err := fetchNodeDisk(ip); err != nil {
 				log.Printf("collector: node agent on %s did not answer: %v", n.Name, err)
 			} else {
+				agentKnown = true
 				diskTotal = int(disk.TotalBytes / (1024 * 1024))
 				diskUsed = int(disk.UsedBytes / (1024 * 1024))
+				swapTotal = int(disk.SwapTotalBytes / (1024 * 1024))
+				swapUsed = int(disk.SwapUsedBytes / (1024 * 1024))
 			}
 		}
 
 		h := &HostState{
 			ID:             n.Name,
+			Role:           nodeRole(n.Name),
+			CreatedAt:      n.CreationTimestamp.Unix(),
 			Schedulable:    schedulable,
 			MetricsKnown:   metricsKnown,
 			Region:         region,
@@ -244,12 +258,15 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 			RamTotal:       ramTotal,
 			RamAllocatable: ramAllocatable,
 			RamUsed:        ramUsed,
-			SwapTotal:      0,
-			SwapUsed:       0,
+			SwapTotal:      swapTotal,
+			SwapUsed:       swapUsed,
+			AgentKnown:     agentKnown,
+			PromisedMiB:    reservedOn(n.Name, ""),
 			DiskTotal:      diskTotal,
 			DiskUsed:       diskUsed,
 			CpuUsed:        cpuUsed,
 			Rate:           hourlyRate,
+			PriceKnown:     priceKnown,
 			Capsules:       []CapsuleState{},
 		}
 		hostMap[n.Name] = h
@@ -257,16 +274,11 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 
 	for ns, pList := range nsPods {
 		cap := CapsuleState{
-			ID:        ns,
-			Host:      getCapsuleDomain(ns, baseDomain),
-			Status:    "running",
-			StatusSec: 0,
-			RateH:     0.0,
-			CostLife:  0.0,
-			State:     "ok",
-			Ctr:       []ContainerState{},
-			Vol:       []VolumeState{},
-			ReqRam:    0,
+			ID:    ns,
+			Host:  getCapsuleDomain(ns, baseDomain),
+			State: "ok",
+			Ctr:   []ContainerState{},
+			Vol:   []VolumeState{},
 		}
 
 		if pvcList, ok := nsPVCs[ns]; ok {
@@ -277,125 +289,101 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 				} else if qty, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
 					mib = int(qty.Value() / (1024 * 1024))
 				}
-				cap.Vol = append(cap.Vol, VolumeState{
-					Name: pvc.Name,
-					Mib:  mib,
-				})
+				cap.Vol = append(cap.Vol, VolumeState{Name: pvc.Name, Mib: mib})
 			}
 		}
 
-		isPending := false
-		nodeName := ""
-
 		var oldest time.Time
+		nodeVotes := map[string]int{}
+		kinds := map[string]string{} // kind -> first reason seen
+		live := 0
 		for _, p := range pList {
+			kind, reason, restarts := podCondition(p)
+			cap.Restarts += restarts
+			if kind == "done" {
+				continue
+			}
+			live++
+			if _, seen := kinds[kind]; !seen || kinds[kind] == "" {
+				kinds[kind] = reason
+			}
 			if oldest.IsZero() || p.CreationTimestamp.Time.Before(oldest) {
 				oldest = p.CreationTimestamp.Time
 			}
-			if p.Status.Phase == corev1.PodPending {
-				isPending = true
-				cap.Status = "waiting"
-			}
 			if p.Spec.NodeName != "" {
-				nodeName = p.Spec.NodeName
+				nodeVotes[p.Spec.NodeName]++
 			}
-
 			for _, c := range p.Spec.Containers {
-				ram := 0
-				cpu := 0
-				if nsMap, ok := podMetricsMap[p.Namespace]; ok {
-					if cm, ok := nsMap[c.Name]; ok {
-						ram = cm.Ram
-						cpu = cm.Cpu
-					}
-				}
-
+				u := podMetricsMap[p.Namespace+"/"+p.Name+"/"+c.Name]
 				reqMib := int(c.Resources.Requests.Memory().Value() / (1024 * 1024))
 				if reqMib == 0 {
 					reqMib = 256
 				}
 				cap.ReqRam += reqMib
-
 				cap.Ctr = append(cap.Ctr, ContainerState{
 					Name: c.Name,
 					Img:  strings.Split(c.Image, "@")[0],
-					Ram:  ram,
-					Cpu:  cpu,
+					Ram:  u.Ram,
+					Cpu:  u.Cpu,
 				})
 			}
 		}
-
-		cap.Ram = 0
-		cap.Cpu = 0
+		if live == 0 {
+			continue // only finished jobs left
+		}
 		for _, c := range cap.Ctr {
 			cap.Ram += c.Ram
 			cap.Cpu += c.Cpu
 		}
-
 		if !oldest.IsZero() {
 			cap.UpMin = int(time.Since(oldest).Minutes())
 			cap.StatusSec = int(time.Since(oldest).Seconds())
 		}
 
-		if isPending || nodeName == "" {
-			data.Queue = append(data.Queue, cap)
-		} else {
-			if h, ok := hostMap[nodeName]; ok {
-				h.Capsules = append(h.Capsules, cap)
+		// Worst first: a failing container outranks a pod still starting.
+		switch {
+		case hasKey(kinds, "degraded"):
+			cap.Status, cap.Reason = "degraded", kinds["degraded"]
+		case hasKey(kinds, "unschedulable"):
+			cap.Status, cap.Reason = "waiting", kinds["unschedulable"]
+		case hasKey(kinds, "deploying"):
+			cap.Status, cap.Reason = "deploying", kinds["deploying"]
+		default:
+			cap.Status = "running"
+		}
+
+		// The node most of its pods run on; none at all means the scheduler could not place it.
+		nodeName, best := "", 0
+		for n, v := range nodeVotes {
+			if v > best || (v == best && n < nodeName) {
+				nodeName, best = n, v
 			}
 		}
-	}
-
-	cms, err := k8s.GetConfigMaps("default")
-	if err == nil {
-		for _, cm := range cms {
-			if strings.HasPrefix(cm.Name, "queue-") {
-				ns := strings.TrimPrefix(cm.Name, "queue-")
-				alreadyInQueue := false
-				for _, q := range data.Queue {
-					if q.ID == ns {
-						alreadyInQueue = true
-						break
-					}
-				}
-				if !alreadyInQueue {
-					data.Queue = append(data.Queue, CapsuleState{
-						ID:        ns,
-						Host:      getCapsuleDomain(ns, baseDomain),
-						Status:    "waiting",
-						StatusSec: 0, // Could parse creation timestamp of ConfigMap
-						State:     "ok",
-						ReqRam:    655, // 655360Ki = ~655Mi
-						Ctr:       []ContainerState{},
-						Vol:       []VolumeState{},
-					})
-				}
-			}
+		if nodeName == "" {
+			data.Queue = append(data.Queue, cap)
+		} else if h, ok := hostMap[nodeName]; ok {
+			h.Capsules = append(h.Capsules, cap)
 		}
 	}
 
 	runRate := 0.0
-	ec2CostPerType := make(map[string]float64)
-	ec2CountPerType := make(map[string]int)
 	for _, h := range hostMap {
 		data.Hosts = append(data.Hosts, *h)
 		runRate += h.Rate
-		ec2CostPerType["AWS EC2 Instances ("+h.Type+")"] += h.Rate * 24.0
-		ec2CountPerType["AWS EC2 Instances ("+h.Type+")"]++
 	}
 
+	// The server, which runs production, first; then the PR workers.
 	sort.Slice(data.Hosts, func(i, j int) bool {
+		if data.Hosts[i].Role != data.Hosts[j].Role {
+			return data.Hosts[i].Role == "server"
+		}
 		return data.Hosts[i].ID < data.Hosts[j].ID
 	})
 
+	data.Fleet.NextEnvRequestMiB, data.Fleet.NextEnvBasis = nextEnvironmentMiB(&data)
+	data.Fleet.NextEnvMiB = EffectiveMiB(data.Fleet.NextEnvRequestMiB)
+
 	data.Fleet.SlotsUsed = len(data.Hosts)
-	data.Fleet.SlotsMax = len(data.Hosts) + 1
-
-	eipCostPerHour := 0.005 // 1 EIP attached to server
-	ebsCostPerHour := float64(len(data.Hosts)) * (ebsGB * 0.08) / 730.0
-
-	eipRunRate := eipCostPerHour * 24.0
-	ebsRunRate := ebsCostPerHour * 24.0
 
 	spendStats, err := getSpendStats(runRate, len(data.Hosts))
 	if err != nil {
@@ -407,16 +395,20 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	data.Spend.RunRate = runRate * 24.0
 
 	data.Spend.Breakdown = map[string]float64{
-		"AWS Elastic IP":  eipRunRate,
-		"AWS EBS Volumes": ebsRunRate,
+		"AWS public IPv4 addresses": publicIPv4HourlyRate * 24.0 * float64(len(data.Hosts)),
+		"AWS EBS volumes (gp3)":     ebsRunRate,
+	}
+	for k, v := range ec2CostPerType {
+		data.Spend.Breakdown[k] = v
 	}
 
-	instancesEipRunRate := (eipRunRate / float64(len(data.Hosts)))
-	instancesEbsRunRate := (ebsRunRate / float64(len(data.Hosts)))
-
-	for k, v := range ec2CostPerType {
-		count := float64(ec2CountPerType[k])
-		data.Spend.Breakdown[k] = v - count*(instancesEipRunRate+instancesEbsRunRate)
+	data.Spend.Notes = []string{"An estimate from on-demand prices: EC2 instances, their gp3 disks and public IPv4 addresses. " +
+		"Traffic, snapshots, S3, the image registry and Cloudflare are not included, and minutes the dashboard was not running are not counted."}
+	for _, what := range sortedKeys(unpriced) {
+		data.Spend.Notes = append(data.Spend.Notes, fmt.Sprintf("No EC2 price for %s yet (the price feed has not loaded, or does not list it) - counted at $%.4f/h until it does.", what, fallbackEC2HourlyRate))
+	}
+	for _, region := range sortedKeys(unpricedDisk) {
+		data.Spend.Notes = append(data.Spend.Notes, fmt.Sprintf("No gp3 disk price for %s - counted at us-east-1's $0.08/GB-month.", region))
 	}
 
 	if shouldSnapshot {
@@ -429,16 +421,28 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		}
 	}
 
-	capsulesCostLife := getCapsulesCostLife(runRate)
+	// An environment's cost is its share of its node, minute by minute, since its namespace was created -
+	// not the rate of the whole fleet, and not what an earlier environment of the same name ran up.
+	nsCreated, _ := k8s.GetNamespaceCreation()
+	since := map[string]time.Time{}
+	for _, h := range data.Hosts {
+		for _, c := range h.Capsules {
+			if t, ok := nsCreated[c.ID]; ok {
+				since[c.ID] = t
+			} else {
+				since[c.ID] = time.Now().Add(-time.Duration(c.UpMin) * time.Minute)
+			}
+		}
+	}
+	capsulesCostLife := getCapsulesCostLife(since)
 	for i, h := range data.Hosts {
 		for j, c := range h.Capsules {
-			if cl, ok := capsulesCostLife[c.ID]; ok {
-				data.Hosts[i].Capsules[j].CostLife = cl
-			}
+			data.Hosts[i].Capsules[j].CostLife = capsulesCostLife[c.ID]
 			data.Hosts[i].Capsules[j].RateH = h.Rate / float64(len(h.Capsules))
 		}
 	}
 
+	data.GeneratedAt = time.Now().UnixMilli()
 	return data, nil
 }
 
@@ -486,4 +490,98 @@ func schedulableForCapsules(n *corev1.Node) bool {
 		}
 	}
 	return true
+}
+
+// "worker" for a machine added for PR environments (<instance>-worker-<slot>), otherwise "server".
+func nodeRole(name string) string {
+	if workerNodeName.MatchString(name) {
+		return "worker"
+	}
+	return "server"
+}
+
+var workerNodeName = regexp.MustCompile(`-worker-\d+$`)
+
+func hasKey(m map[string]string, k string) bool {
+	_, ok := m[k]
+	return ok
+}
+
+// Container waiting reasons that mean the pod will not come up without a change.
+var stuckReasons = map[string]bool{
+	"CrashLoopBackOff": true, "ImagePullBackOff": true, "ErrImagePull": true, "InvalidImageName": true,
+	"CreateContainerConfigError": true, "CreateContainerError": true, "RunContainerError": true,
+}
+
+// What one pod says about its environment: "done" (a finished job), "degraded" (failing),
+// "unschedulable" (the scheduler cannot place it), "deploying" (on its way up) or "running", with the
+// reason to show and how often its containers restarted.
+func podCondition(p *corev1.Pod) (string, string, int) {
+	restarts := 0
+	statuses := append(append([]corev1.ContainerStatus{}, p.Status.InitContainerStatuses...), p.Status.ContainerStatuses...)
+	for _, cs := range p.Status.ContainerStatuses {
+		restarts += int(cs.RestartCount)
+	}
+	switch p.Status.Phase {
+	case corev1.PodSucceeded:
+		return "done", "", restarts
+	case corev1.PodFailed:
+		reason := p.Status.Reason
+		if reason == "" {
+			reason = "failed"
+		}
+		return "degraded", p.Name + ": " + reason, restarts
+	}
+	for _, cs := range statuses {
+		if cs.State.Waiting != nil && stuckReasons[cs.State.Waiting.Reason] {
+			reason := cs.Name + ": " + cs.State.Waiting.Reason
+			if cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.Reason != "" {
+				reason += " (last exit: " + cs.LastTerminationState.Terminated.Reason + ")"
+			}
+			if cs.RestartCount > 0 {
+				reason += fmt.Sprintf(" · %d restarts", cs.RestartCount)
+			}
+			return "degraded", reason, restarts
+		}
+	}
+	if p.Status.Phase == corev1.PodPending {
+		for _, cond := range p.Status.Conditions {
+			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse && cond.Reason == corev1.PodReasonUnschedulable {
+				return "unschedulable", cond.Message, restarts
+			}
+		}
+		for _, cs := range statuses {
+			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+				return "deploying", cs.Name + ": " + cs.State.Waiting.Reason, restarts
+			}
+		}
+		return "deploying", "starting", restarts
+	}
+	for _, cs := range p.Status.ContainerStatuses {
+		// Between crash-loop back-offs a container is briefly running or just exited, not waiting:
+		// restarts with an abnormal last exit mean it is failing whatever its state this second.
+		if !cs.Ready && cs.RestartCount > 0 && cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.ExitCode != 0 {
+			last := cs.LastTerminationState.Terminated
+			return "degraded", fmt.Sprintf("%s: exited with code %d (%s) · %d restarts", cs.Name, last.ExitCode, last.Reason, cs.RestartCount), restarts
+		}
+	}
+	for _, cs := range p.Status.ContainerStatuses {
+		if !cs.Ready {
+			// A container gets a few minutes to pass its probes before "not ready" means trouble.
+			if p.Status.StartTime != nil && time.Since(p.Status.StartTime.Time) < 5*time.Minute {
+				return "deploying", cs.Name + ": starting", restarts
+			}
+			return "degraded", cs.Name + ": not ready", restarts
+		}
+	}
+	return "running", "", restarts
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

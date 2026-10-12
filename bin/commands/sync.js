@@ -9,7 +9,7 @@ const { readState, writeState, STATE_FILE } = require('../../utils/state.js');
 const { makeServiceEntry } = require('../../utils/analyzer.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
 const { unmountedSecretKeys } = require('../../utils/secretWiring.js');
-const { validateDeclarations, validateRepositorySettings, validateSyncLock } = require('../../utils/flaropsValidate.js');
+const { validateDeclarations, validateRepositorySettings, validateSyncLock, suspiciousSecretNames } = require('../../utils/flaropsValidate.js');
 const { isDockerHub } = require('../../utils/registry.js');
 const { defaultUserFor, defaultImageFor, defaultPortFor, databaseVolumes } = require('../../utils/dbDefaults.js');
 const { claimNameFor } = require('../../templates/generic/volumes.js');
@@ -20,6 +20,8 @@ const renderDeployWorkflow = require('../../templates/deploy.yml.js');
 const renderPrCapsuleWorkflow = require('../../templates/pr-capsule.yml.js');
 const { AGENTS_BLOCK, withBlock, hasBlock } = require('../../utils/agentsDoc.js');
 const { renderDashboardFiles, included: includedInDashboard } = require('../../utils/dashboardFiles.js');
+const { formatChanges, secretReaders, dataNotes } = require('../../utils/syncReport.js');
+const { enterProjectRoot } = require('../../utils/projectRoot.js');
 
 // Defaults a newly declared service starts from before the author's values are laid over them.
 const SERVICE_DEFAULTS = Object.freeze({
@@ -530,23 +532,61 @@ function findOrphanTemplates(currentDir) {
   return { templatesDir, orphans: present.filter(f => !expected.has(f)) };
 }
 
-function describe(value) {
-  if (value === null || value === undefined) return 'none';
-  if (Array.isArray(value)) return value.length === 0 ? 'none' : JSON.stringify(value);
-  if (typeof value === 'object') return JSON.stringify(value);
-  return String(value);
+// The line of flarops.yaml a field path ("api.secretEnvs.STRIPE_KEY") is on: each part is looked up
+// among the keys one level below the previous one. The deepest part found wins; null if none is.
+function lineOf(text, where) {
+  const lines = text.split('\n');
+  const indentOf = (l) => l.length - l.trimStart().length;
+  const keyOf = (l) => {
+    const m = l.trim().replace(/^-\s+/, '').match(/^(["']?)([^"':]+)\1\s*:(\s|$)/);
+    return m ? m[2].trim() : null;
+  };
+  let from = 0;
+  let to = lines.length;
+  let rest = where;
+  let found = null;
+  while (rest) {
+    let childIndent = null;
+    let match = null;
+    for (let i = from; i < to; i++) {
+      const l = lines[i];
+      if (!l.trim() || l.trim().startsWith('#')) continue;
+      if (childIndent === null) childIndent = indentOf(l);
+      if (indentOf(l) !== childIndent) continue;
+      const key = keyOf(l);
+      if (key && (rest === key || rest.startsWith(`${key}.`)) && (!match || key.length > match.key.length)) match = { i, key };
+    }
+    if (!match) break;
+    found = match.i + 1;
+    rest = rest.slice(match.key.length + 1);
+    from = match.i + 1;
+    let end = from;
+    while (end < to && (!lines[end].trim() || lines[end].trim().startsWith('#') || indentOf(lines[end]) > childIndent)) end++;
+    to = end;
+  }
+  return found;
 }
 
-module.exports = async function sync() {
+// An error in flarops.yaml, with its line when the parser did not give one, and that nothing changed.
+function reportYamlError(e, text) {
+  let message = e.message;
+  const where = !e.line && (message.match(/^"([^"]+)"/) || [])[1];
+  const line = where ? lineOf(text, where) : null;
+  if (line) message = `line ${line}: ${message}`;
+  console.error(`\x1b[31mERROR in flarops.yaml, ${message}\x1b[0m`);
+  console.error('Nothing was written. Fix that and run sync again.');
+  process.exit(1);
+}
+
+module.exports = async function sync({ check = false } = {}) {
+  if (!enterProjectRoot()) {
+    console.error('\x1b[31mERROR: no flarops.yaml here or in any directory above, up to the repository root. Run sync inside a project Flarops has set up; to set one up, run "npx flarops init" from its root.\x1b[0m');
+    process.exit(1);
+  }
   const currentDir = process.cwd();
   const flaropsYamlFile = path.join(currentDir, 'flarops.yaml');
   const helmDir = path.join(currentDir, 'deploy', 'helm');
   const templatesDir = path.join(helmDir, 'templates');
-
-  if (!fs.existsSync(flaropsYamlFile)) {
-    console.error('\x1b[31mERROR: no flarops.yaml here. Run "flarops init" first - sync applies that file, it cannot invent it.\x1b[0m');
-    process.exit(1);
-  }
 
   let state;
   try {
@@ -565,14 +605,17 @@ module.exports = async function sync() {
   let declared;
   let repository = null;
   let locked = new Set();
+  const flaropsYamlText = fs.readFileSync(flaropsYamlFile, 'utf8');
   try {
-    ({ declared, repository, locked } = readFlaropsYaml(fs.readFileSync(flaropsYamlFile, 'utf8')));
+    ({ declared, repository, locked } = readFlaropsYaml(flaropsYamlText));
   } catch (e) {
-    if (e instanceof YamlError) {
-      console.error(`\x1b[31mERROR: flarops.yaml could not be read - ${e.message}\x1b[0m`);
-      process.exit(1);
-    }
+    if (e instanceof YamlError) reportYamlError(e, flaropsYamlText);
     throw e;
+  }
+
+  const suspicious = suspiciousSecretNames(declared);
+  if (suspicious.length > 0) {
+    console.warn(`\x1b[33mWARNING: these secretEnvs look like a secret's value, not its name: ${suspicious.join(', ')}. secretEnvs maps a variable to the NAME of a GitHub Secret (STRIPE_KEY: STRIPE_KEY); the value goes into the secret itself, never into this file. If one is already committed, rotate it.\x1b[0m`);
   }
 
   if (declared.size === 0) {
@@ -607,10 +650,7 @@ module.exports = async function sync() {
       { file: path.join(currentDir, '.github', 'workflows', 'pr-capsule.yml'), content: renderPrCapsuleWorkflow(config) },
     ].filter(w => fs.existsSync(path.dirname(w.file)));
   } catch (e) {
-    if (e instanceof YamlError || e instanceof ChartConflict) {
-      console.error(`\x1b[31mERROR: flarops.yaml cannot be applied - ${e.message}\x1b[0m`);
-      process.exit(1);
-    }
+    if (e instanceof YamlError || e instanceof ChartConflict) reportYamlError(e, flaropsYamlText);
     throw e;
   }
 
@@ -620,10 +660,7 @@ module.exports = async function sync() {
     checkSyncLock(locked, new Set([...templates, ...workflows].map(t => relative(t.file))
       .concat(present.map(f => relative(path.join(templatesDir, f))))));
   } catch (e) {
-    if (e instanceof YamlError) {
-      console.error(`\x1b[31mERROR: flarops.yaml cannot be applied - ${e.message}\x1b[0m`);
-      process.exit(1);
-    }
+    if (e instanceof YamlError) reportYamlError(e, flaropsYamlText);
     throw e;
   }
 
@@ -689,65 +726,76 @@ module.exports = async function sync() {
     .filter(o => (previousRender && previousRender.has(o.file) ? previousRender.get(o.file) !== o.content : differs(o)))
     .map(o => relative(o.file));
 
-  if (changes.length === 0 && toWrite.length === 0 && orphans.length === 0 && dashboardStale.length === 0) {
+  const nothing = changes.length === 0 && toWrite.length === 0 && orphans.length === 0 && dashboardStale.length === 0;
+  const color = process.stdout.isTTY && !process.env.NO_COLOR;
+  const paint = (code, text) => (color ? `\x1b[${code}m${text}\x1b[0m` : text);
+  // Each warning or note is its own paragraph.
+  const warn = (text) => { console.warn(paint(33, text)); console.warn(''); };
+
+  if (nothing) {
     console.log('Deployment already matches flarops.yaml - nothing to do.');
-    if (heldBack.length > 0) {
-      console.warn(`\x1b[33mWARNING: syncLock kept these files as they are, so what changed in them did not reach them: ${heldBack.join(', ')}.\x1b[0m`);
-    }
+    if (heldBack.length > 0) warn(`WARNING: syncLock kept these files as they are, so what changed in them did not reach them: ${heldBack.join(', ')}.`);
     return;
   }
 
-  if (changes.length > 0) {
-    console.log('Applying flarops.yaml:');
-    for (const c of changes) {
-      if (c.from === null && c.to !== null && /created|removed/.test(c.label)) console.log(`  ${c.label}`);
-      else console.log(`  ${c.label}: ${describe(c.from)} -> ${describe(c.to)}`);
-    }
-  } else {
-    console.log('flarops.yaml is unchanged; these files are rewritten from this version of Flarops\' templates:');
-    for (const o of toWrite) console.log(`  ${relative(o.file)}`);
-    for (const file of dashboardStale) console.log(`  ${relative(file)} (removed: no longer part of the dashboard)`);
-  }
+  const { lines, secretsAdded, secretsRemoved } = formatChanges(changes);
+  const allNotes = [...notes, ...dataNotes(previousState, config)];
+  // A file whose content on disk is not what sync rendered last time was edited by hand.
+  const handEdited = (o) => previousRender && previousRender.has(o.file) && fs.existsSync(o.file)
+    && !Buffer.isBuffer(o.content)
+    && fs.readFileSync(o.file, 'utf8').replace(/\r\n/g, '\n') !== previousRender.get(o.file);
+
+  console.log(check ? 'flarops sync --check: these changes would be applied (nothing was written).' : 'Applying flarops.yaml:');
+  if (lines.length > 0) for (const line of [...new Set(lines)]) console.log(`  ${line}`);
+  else console.log(`  flarops.yaml is unchanged, but the files below differ from what it produces${toWrite.some(handEdited) ? ' (hand edits are marked)' : ''} - they are put back to match it`);
   console.log('');
+  console.log(check ? 'Files that would be written:' : 'Files written:');
+  for (const o of toWrite) {
+    console.log(`  ${relative(o.file)}${handEdited(o) ? '   ' + paint(33, '(had hand edits - overwritten; restore them from git and list the file under syncLock to keep them)') : ''}`);
+  }
+  for (const file of dashboardStale) console.log(`  ${relative(file)} (removed: no longer part of the dashboard)`);
+  for (const f of orphans) console.log(`  ${relative(path.join(templatesDir, f))} (removed: its service is no longer declared)`);
+  console.log('');
+
+  if (check) {
+    for (const note of allNotes) warn(`NOTE: ${note}`);
+    process.exitCode = 1;
+    return;
+  }
 
   for (const o of toWrite) {
     fs.mkdirSync(path.dirname(o.file), { recursive: true });
     fs.writeFileSync(o.file, o.content);
   }
   for (const file of dashboardStale) fs.unlinkSync(file);
+  for (const f of orphans) fs.unlinkSync(path.join(templatesDir, f));
   writeState(currentDir, config);
 
-  for (const f of orphans) fs.unlinkSync(path.join(templatesDir, f));
-  if (orphans.length > 0) {
-    console.log(`Removed ${orphans.length} template(s) for services flarops.yaml no longer declares: ${orphans.join(', ')}`);
-  }
-
-  for (const note of notes) console.warn(`\x1b[33mNOTE: ${note}\x1b[0m`);
-
-  const needed = new Set();
-  for (const decl of declared.values()) {
-    for (const key of Object.values(decl.secretEnvs || {})) needed.add(String(key));
-    for (const key of Object.values((decl.db || {}).secretEnvs || {})) needed.add(String(key));
-  }
-  const workflow = path.join(currentDir, '.github', 'workflows', 'deploy.yml');
-  if (fs.existsSync(workflow)) {
-    const text = fs.readFileSync(workflow, 'utf8');
-    const missing = [...needed].filter(k => !text.includes(`SECRET_ENV_${k}:`) && !text.includes(`secrets.${k} `));
-    if (missing.length > 0) {
-      console.warn(`\x1b[33mWARNING: these Secret keys are now referenced by the chart but not passed by .github/workflows/deploy.yml: ${missing.join(', ')}. Add a "SECRET_ENV_<KEY>: \${{ secrets.<KEY> }}" line for each under the deploy step's env:, and add the secret to the repository - without it those pods stay in CreateContainerConfigError.\x1b[0m`);
-    }
-  }
-
+  for (const note of allNotes) warn(`NOTE: ${note}`);
   if (context.hasLocalhostWarnings) {
-    console.warn('\x1b[33mWARNING: some values still point at localhost, which inside a cluster reaches the pod itself. Change them to the service name in flarops.yaml.\x1b[0m');
+    const keys = [...new Set(context.localhostKeys || [])];
+    warn(`WARNING: ${keys.length ? keys.join(', ') : 'some values'} still point${keys.length === 1 ? 's' : ''} at localhost, which inside a cluster reaches the pod itself. In flarops.yaml, use the service's name for traffic inside the cluster ("database", "api"), or the project's domain for anything a browser reaches.`);
   }
-
-  console.log('\x1b[32mdeploy/helm, werf.yaml and the recorded state now match flarops.yaml.\x1b[0m');
-  console.log('Review the diff, commit it, and redeploy.');
-
   if (heldBack.length > 0) {
-    console.warn(`\x1b[33mWARNING: syncLock kept these files as they are, so the changes above did not reach them: ${heldBack.join(', ')}. Carry what they need over by hand, or remove them from syncLock and run sync again.\x1b[0m`);
+    warn(`WARNING: syncLock kept these files as they are, so the changes above did not reach them: ${heldBack.join(', ')}. Carry what they need over by hand, or remove them from syncLock and run sync again.`);
   }
+
+  // The GitHub Secrets this change needs: without one, its variable reaches the container empty.
+  if (secretsAdded.length > 0 || secretsRemoved.length > 0) {
+    const readers = secretReaders(declared);
+    if (secretsAdded.length > 0) {
+      console.log(paint(36, 'Before you push, create these GitHub repository secrets (Settings -> Secrets and variables -> Actions):'));
+      for (const key of secretsAdded) {
+        const who = readers.get(key);
+        console.log(`  ${key}${who ? `   read by ${who.join(', ')}` : ''}      e.g. gh secret set ${key}`);
+      }
+      console.log('  Without one, the variable reaches the container empty.');
+    }
+    if (secretsRemoved.length > 0) console.log(`No longer used - you can delete these GitHub secrets: ${secretsRemoved.join(', ')}`);
+    console.log('');
+  }
+
+  console.log(paint(32, 'Done.') + ` Next: review "git diff", then commit and push - a push to ${config.deployBranch || 'main'} deploys it.`);
 };
 
 module.exports.findOrphanTemplates = findOrphanTemplates;

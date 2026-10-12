@@ -67,6 +67,24 @@ async function run(check) {
       fakeAws(dir, { credentialsValid: false }), 'anything', creds, async () => 'x', 'us-west-2'));
     check('wrong credentials still stop init', bad.exitCode === 1, bad.said);
     check('and say so', /UNAUTHORIZED/.test(bad.said) && /InvalidClientTokenId/.test(bad.said), bad.said);
+
+    const { getDefaultAWSCredentials, checkAwsAccess } = require('../utils/awsHelper.js');
+    const fromEnv = getDefaultAWSCredentials({ AWS_ACCESS_KEY_ID: 'AKIAENV', AWS_SECRET_ACCESS_KEY: 'envsecret' });
+    check('credentials in the environment are used', fromEnv && fromEnv.accessKey === 'AKIAENV' && /environment/.test(fromEnv.source), JSON.stringify(fromEnv));
+    const temporary = getDefaultAWSCredentials({ AWS_ACCESS_KEY_ID: 'ASIATMP', AWS_SECRET_ACCESS_KEY: 's', AWS_SESSION_TOKEN: 't', HOME: dir });
+    check('expiring session credentials are not offered', !temporary || temporary.accessKey !== 'ASIATMP', JSON.stringify(temporary));
+
+    const typo = checkAwsAccess(fakeAws(dir, { credentialsValid: true }), creds, 'us-wset-2x');
+    check('a misspelt region is caught before AWS is asked', !typo.ok && typo.region, JSON.stringify(typo));
+    const good = checkAwsAccess(fakeAws(dir, { credentialsValid: true }), creds, 'eu-central-1');
+    check('valid credentials pass the early check, with their account', good.ok && good.account === '111111111111', JSON.stringify(good));
+    const wrong = checkAwsAccess(fakeAws(dir, { credentialsValid: false }), creds, 'eu-central-1');
+    check('wrong credentials fail the early check, saying why', !wrong.ok && /rejected these credentials/.test(wrong.message), JSON.stringify(wrong));
+
+    const names = ['', 'second'];
+    const emptyName = await withExitTrapped(() => handleS3Bucket(
+      fakeAws(dir, { credentialsValid: true }), 'taken', creds, async () => names.shift(), 'us-west-2'));
+    check('an empty bucket name is asked again, not turned into "000"', emptyName.result && emptyName.result.bucket === 'second', JSON.stringify(emptyName.result) + emptyName.said);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

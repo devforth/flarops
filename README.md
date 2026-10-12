@@ -55,7 +55,7 @@ It looks through your project: which services you have, what they build from, wh
 
 At the end it writes **`flarops.yaml`**: a plain description of everything it decided. From that point on, that file is the deployment.
 
-`init` will not run a second time. If you run it again in a project that already has `flarops.yaml`, it stops and says so. That is deliberate: a second run would ask for your registry password again, issue a new deploy key and a new dashboard password, and overwrite the chart from a fresh analysis — throwing away every change you made since. To change the deployment, edit `flarops.yaml` and run `sync`.
+`init` will not run a second time. If you run it again in a project that already has `flarops.yaml`, it stops and says so: a second run would analyse the project afresh and rewrite `flarops.yaml`, the chart and the workflows — throwing away every change you made to them. To change the deployment, edit `flarops.yaml` and run `sync`. To start over on purpose, delete `flarops.yaml` and run `init`; it keeps `.keys/`, `deploy/.env` (with the dashboard password) and `deploy/terraform/`, and updates the registry, AWS and Cloudflare credentials in `deploy/.env` with what you type.
 
 ### `flarops sync` — run after every edit
 
@@ -72,22 +72,49 @@ It reads `flarops.yaml` and brings the rest into line:
 | Remove a service block | Deletes its chart template and drops it from the configuration |
 | Add a secret | Adds it to the chart **and** to the GitHub Actions workflow, so CI passes it |
 
-Sync prints every change before writing anything:
+It says what changed, field by field, which files it wrote, and what you still have to do:
 
 ```
 Applying flarops.yaml:
   api.replicas: 1 -> 3
-  api.secretEnvs (same name): none -> ["STRIPE_KEY"]
-  GitHub Secret STRIPE_KEY: now required by the chart
+  api.secretEnvs.STRIPE_KEY: added (from GitHub Secret STRIPE_KEY)
+
+Files written:
+  deploy/helm/values.yaml
+  .github/workflows/deploy.yml
+  .github/workflows/pr-capsule.yml
+
+Before you push, create these GitHub repository secrets (Settings -> Secrets and variables -> Actions):
+  STRIPE_KEY   read by api      e.g. gh secret set STRIPE_KEY
+  Without one, the variable reaches the container empty.
+
+Done. Next: review "git diff", then commit and push - a push to main deploys it.
 ```
 
-Then commit what it changed (`flarops.yaml`, `deploy/`, `werf.yaml`, `werf-giterminism.yaml`, `.github/workflows/`) and push. The pipeline deploys from what is in Git, so an uncommitted change does not reach the cluster.
+`flarops sync --check` prints the same without writing anything, and exits with 1 when something would change — a check for CI or a coding agent. Run sync from anywhere inside the project: it finds `flarops.yaml` above the current directory.
+
+Then commit what it changed (`flarops.yaml`, `deploy/`, `werf.yaml`, `werf-giterminism.yaml`, `.github/workflows/`) and push to the branch that deploys (the one `init` ran on). The pipeline deploys from what is in Git, so an uncommitted change does not reach the cluster.
+
+### Common changes
+
+| To | In `flarops.yaml` | Then |
+| --- | --- | --- |
+| Add a secret | `STRIPE_KEY: STRIPE_KEY` under the service's `secretEnvs` | Create the GitHub secret sync names, before pushing |
+| Add a plain setting | `LOG_LEVEL: debug` under the service's `env` | — |
+| Run more copies | `replicas: 3` | — |
+| Add a service | A new block with `image:` or `dockerfile:` + `context:` | — |
+| Route a path to a service | `- /webhooks` under its `exposedRoutes` | — |
+| Keep data across restarts | A `volumes:` entry with `name` and `path` | — |
+| Give the code a database URL | The variable under `databaseUrls` | — |
+| Rename a service or its database | Change the key / `name:` | The data does not move: sync says where it stayed |
+
+Each one ends the same way: `npx flarops sync`, review `git diff`, commit, push.
 
 **Sync is a merge, not a regeneration.** `init` learned things by reading your code that you cannot reasonably be asked to write down again — the database URLs it builds for each container, a migration step it found, SQL that seeds the database on first start. Those live in `deploy/.flarops-state.json` (committed, and not meant to be edited). Your edits are laid over them, so changing one line does not erase the rest.
 
 **Sync also keeps the generated files current.** It renders every file it owns on each run — the chart, `werf.yaml`, the workflows and the dashboard's code in `deploy/dashboard/` — and rewrites the ones that differ, after you upgrade Flarops or when a generated file was edited by hand, even if `flarops.yaml` did not change. It says which files it rewrote. "Nothing to do" means no file changed.
 
-Sync refuses rather than guessing. Unreadable YAML is reported with its line number and nothing is written. An empty `flarops.yaml` is treated as a truncated file, not as an instruction to delete your deployment. Values that would end up somewhere they cannot be — a service name that is not a valid Kubernetes name, a secret name GitHub would not accept, a port outside 1–65535, a `context` outside the repository, a field that does not exist (a typo such as `replcas:` is an error, not ignored) — are refused with the field named, before anything is written.
+Sync refuses rather than guessing, and says where. Every error names the line of `flarops.yaml` and ends with "Nothing was written"; a misspelled field gets a suggestion (`"api.replcas" is not a field - did you mean replicas?`). An empty `flarops.yaml` is treated as a truncated file, not as an instruction to delete your deployment. Values that would end up somewhere they cannot be — a service name that is not a valid Kubernetes name, a secret name GitHub would not accept, a port outside 1–65535, a `context` outside the repository, a field that does not exist (a typo such as `replcas:` is an error, not ignored) — are refused with the field named, before anything is written.
 
 **Changes Flarops cannot express: `syncLock`.** When a chart template or a workflow needs something `flarops.yaml` has no field for — a sidecar in the backend's Deployment, an extra step in the deploy workflow — edit the file by hand and list it under `syncLock` in `flarops.yaml`:
 
@@ -106,7 +133,7 @@ A template you add to `deploy/helm/templates/` yourself (an extra ConfigMap, a C
 It opens with where the images are pushed:
 
 ```yaml
-# repository settings
+# Where the built images are pushed.
 repositorySettings:
   registry: docker.io        # registry host
   project: null              # namespace inside the registry
@@ -115,7 +142,7 @@ repositorySettings:
 
 The images end up at `<registry>/<project>/<repository>` — `harbor.example.com/team/shop` for a Harbor project, `ghcr.io/acme/shop` for a GitHub organisation. Leave `project` as `null` when the registry has no such level; on Docker Hub, `null` means your own user (`docker.io/<user>/shop`). `init` fills this in from the registry you gave it (`harbor.example.com/team` is split into registry and project) and names the repository after the project directory. Changing any of it and running `sync` updates both workflows; log-in still goes to the registry host with the same credentials.
 
-Every other top-level key is a service. Here is a complete, ordinary example:
+Every other top-level key is a service. The full field reference is the comment block at the end of the file itself. Here is a complete, ordinary example:
 
 ```yaml
 api:
@@ -143,12 +170,12 @@ frontend:
     - "VITE_API_URL=https://example.com/api"
 
 database:
+  type: postgres
   image: "postgres:16-alpine"
-  replicas: 1
   port: 5432
   user: appuser
   name: appdb
-  type: postgres
+  replicas: 1
   secretEnvs:
     POSTGRES_PASSWORD: POSTGRES_PASSWORD
 ```
@@ -166,7 +193,7 @@ A service is either **built here** or **pulled from a registry** — one or the 
   image: "redis:7"           # pulled
 ```
 
-and `replicas: 1` — how many copies run.
+`replicas` — how many copies run — is optional and defaults to 1.
 
 ### The fields you will actually use
 
@@ -270,7 +297,7 @@ topic-setup:
   command: ["create-topics"]
 ```
 
-`oneShot` replaces `replicas`. It runs on every deploy, so the command must be safe to repeat (`--if-not-exists`, an upsert). A task has no address, so it takes no `ports` and no `exposedRoutes`.
+`oneShot` replaces `replicas`. It runs on every deploy, so the command must be safe to repeat (`--if-not-exists`, an upsert). A task has no address, so it takes no `ports` and no `exposedRoutes` — sync refuses them rather than ignoring them.
 
 ### A service with its own database
 
@@ -331,20 +358,22 @@ database:
 This is the one part you do by hand, so it is worth seeing whole.
 
 1. `init` writes **`deploy/.env`** — a checklist, not a config file. It is gitignored and nothing reads it at deploy time; it exists so you know what to create.
-2. It also prints the list when it finishes, marking anything that needs attention:
+2. It also prints the list as the first of its next steps, marking anything that needs attention:
 
    ```
-   Create these 8 GitHub repository secrets before the first deploy
-   (Settings -> Secrets and variables -> Actions). Values are in deploy/.env:
-     AWS_ACCESS_KEY_ID  (infrastructure)
-     JWT_SECRET
-     RPK_PASS  <- give it the SAME value as REDPANDA_PASSWORD
-     STRIPE_KEY  <- no service reads this; declare it under a service's secretEnvs
+   1. Create these 8 GitHub repository secrets before the first deploy
+      (Settings -> Secrets and variables -> Actions). Values are in deploy/.env, without their quotes:
+        AWS_ACCESS_KEY_ID  (infrastructure)
+        JWT_SECRET
+        RPK_PASS  <- give it the SAME value as REDPANDA_PASSWORD
+        STRIPE_KEY  <- needs a real value (not the one in backend/.env.example: example file - committed, so the value is public)
    ```
-3. You create each one in **your repository's** GitHub Secrets, under the same name.
+3. You create each one in **your repository's** GitHub Secrets, under the same name, pasting the value without its quotes.
 4. On deploy, the workflow passes them to the chart, which puts them in a Kubernetes Secret, which your containers read.
 
-A secret is missing from step 3 → the pod cannot start. A secret exists but no service declares it in `secretEnvs` → it sits in the cluster unused. Both are reported; neither is guessed at.
+**Later secrets** go through `flarops.yaml`: list the variable under the service's `secretEnvs` (`STRIPE_KEY: STRIPE_KEY` — the name of the GitHub secret, never its value), run `sync`, and create the secret it names before you push. `deploy/.env` is not updated after `init`.
+
+A secret missing from GitHub → the pod starts, with the variable empty — usually a failure that only shows up when the code uses it. A secret that exists but no service declares in `secretEnvs` → it sits in the cluster unused. Sync and init report both; neither is guessed at.
 
 Values from `.env.example`, `.env.sample` and `.env.template` are never used: those files are committed, so their values are public. Values from `.env.development` are not used either — it says which variables exist, not what production should set them to. For the rest, `.env.production` wins over `.env`, which wins over `.env.local`. A value in any file git tracks — or would take with the next `git add .`, because nothing ignores it — counts as public too. Their keys still count — the secret is wired and listed — but its value is left empty, marked `<- no value found; you must supply one`. The same goes for an obvious placeholder in a real `.env` (`changeme`, `your-…-here`, `replace_me`). A database password taken from one of those, or set to the engine's default (`postgres`, `root`, `admin`), is replaced with a random one. `init` lists every value it set aside.
 
@@ -354,9 +383,11 @@ Some values appear more than once with a note to give them the same value. That 
 
 ## First deployment
 
-After `init`, follow **`FLAROPS.md`** — it is generated for your project specifically and lists the exact steps in order. In short: create the GitHub secrets, commit everything, push to `main`, and watch the Actions run.
+After `init`, follow **`FLAROPS.md`** — it is written for your project (its domain, its branch, its dashboard address) and lists the steps in order. In short: create the GitHub secrets, review `git diff`, commit everything, push to the branch `init` ran on, and watch the Actions run; its summary shows the server's IP and addresses.
 
 ## What `init` asks you
+
+It first says the project name it took from the directory (it names the image repository, the namespaces and the state bucket) and checks its tools: without `docker` the registry login is not checked; without the AWS CLI it offers to install a signature-verified copy into `~/.local` (Linux x86_64 and arm64; elsewhere it says how to install it and stops). Nothing is written until the questions are answered — stopping at one leaves the repository as it was.
 
 ### Values it collects
 
@@ -366,50 +397,48 @@ None of these change anything on their own — they are written into the generat
 | --- | --- |
 | `Enter docker registry` | Leave empty for Docker Hub. A project inside the registry can be included: `harbor.example.com/team`. Both can be changed later under `repositorySettings`. |
 | `Enter username for <registry>` | |
-| `Enter password for <registry>` | Hidden. Used immediately for `docker login`, then stored in `deploy/.env`. |
-| `Enter project domain` | Required, asked again until it is a valid domain name. The dashboard and the pull-request environments are addressed under it. |
-| `Enter Cloudflare API Token` | Only if you enabled Cloudflare DNS. Hidden. |
-| `Enter Cloudflare Zone ID` | Only if you enabled Cloudflare DNS. |
-| `Enter project AWS Access Key ID` | Press Enter to use your default `~/.aws/credentials`. |
-| `Enter project AWS Secret Access Key` | Hidden. Only asked if you entered an Access Key ID. |
-| `Enter AWS region` | Press Enter for `us-west-2`. |
-| `Enter new bucket name` | Only if the Terraform state bucket name is taken or invalid. |
+| `Enter password or access token for <registry>` | Hidden. Checked with `docker login` at once; a failure shows docker's reason and offers retry, skip or quit. Docker Hub with two-factor authentication needs an access token. |
+| `Enter project domain` | Required. A pasted URL is trimmed to its host. It then shows the three addresses: the application, `dashboard.<parent domain>` and the PR environments. |
+| `Enter Cloudflare API Token` / `Zone ID` | Only with Cloudflare DNS. The token needs Zone > DNS > Edit for the zone; the Zone ID is on the domain's Overview page. Leaving either empty skips Cloudflare, and says so. |
+| `Enter project AWS Access Key ID` | Enter uses the credentials already on this machine: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, else the `AWS_PROFILE` (or default) profile in `~/.aws/credentials`. |
+| `Enter AWS region` | Enter for `us-west-2`. The key and the region are checked against AWS right away; a wrong one is asked again. |
+| `Enter a new bucket name` | Only when the state bucket's name is taken, or you decline an existing one. |
 
 ### Questions that change what gets built
 
 | Prompt | What it changes |
 | --- | --- |
-| `Do you want to configure Cloudflare DNS for this domain automatically? [Y/n]` | **Defaults to yes.** Adds DNS records for your domain and its wildcard, so deploys point the domain at the cluster for you. Answer `n` to manage DNS yourself. |
+| `Do you want to configure Cloudflare DNS for this domain automatically? [Y/n]` | **Defaults to yes.** The deploy creates the DNS records: the domain, the wildcard for PR environments, the dashboard. Answer `n` to create them yourself; `FLAROPS.md` lists them. |
 | `This project has no docker-compose.yml, but it does have "<file>". Base the deployment on it? [Y/n]` | **Defaults to yes.** Asked when your compose file is not conventionally named — those are often a local development stack, and generating production from one would carry its images and mounts into the cluster. Answer `n` and services are found from the directory layout alone. |
 
 ### Questions that modify your source code
 
-**These default to yes.** Pressing Enter accepts them, and they rewrite files in your repository — not in `deploy/`. Commit or stash your work before running `init` if you want to review or undo the changes.
+Asked only when there is something to change, after listing the files it would touch:
 
-| Prompt | What it changes |
+| What it found | What it changes |
 | --- | --- |
-| `Do you want to automatically refactor hardcoded frontend API URLs to environment variables? [Y/n]` | Replaces hardcoded API URLs in your frontend source with environment variable reads. |
-| `Do you want to automatically refactor hardcoded database URLs in the backend to environment variables? [Y/n]` | Replaces hardcoded database connection strings in your backend source. |
-| `Found lowercase environment variables in backend code (…). Do you want to automatically refactor them? [Y/n]` | Renames the listed variables to UPPERCASE in your backend source and in your `.env` files. |
+| The frontend calls the backend at a hardcoded address | Reads it from an environment variable instead (`VITE_API_URL`, `NEXT_PUBLIC_API_URL`, … by framework); points nginx `proxy_pass` at the api service; writes the local value to `.env.local` and keeps that file out of git and the image. |
+| The backend connects to the database at a hardcoded URL | Reads `DATABASE_URL` (`DB_URL` for MongoDB) first, with the old URL as the fallback. |
+| Lowercase environment variables in backend code | Renames them to UPPERCASE in your backend source and `.env` files. |
 
-Answer `n` to any of them to leave your source untouched. Flarops still generates a complete deployment — you then wire those values yourself.
+Each ends with `Apply it? [Y/n]`. When a listed file has uncommitted changes, it says so and the default becomes no — commit or stash first, so the rewrite can be reviewed on its own. Answer `n` to leave your source untouched; you then wire those values yourself.
 
-### The one question where Enter means no
+### Where Enter means no
 
 | Prompt | Notes |
 | --- | --- |
-| `Bucket [name] is already exist, are you sure you want to use it? (...) [y/N]` | **Defaults to no.** An S3 bucket with the derived name already exists and your credentials can reach it. Answering yes stores this project's Terraform state in it — including the k3s cluster token — so check it is listed in **your** account first. This is the one prompt where Enter declines, because agreeing by reflex could put your state in a bucket that belongs to something else. A name taken by another account that you cannot reach is not asked about: `init` says so and asks for a different name. |
+| `Use "<bucket>"? [y/N]` | An S3 bucket with the derived name already exists and your credentials can reach it. Answer yes only if it is in **your** account and keeps no other project's state at `terraform.tfstate`: its owner could read this state, cluster token included, and two projects at one key overwrite each other. A name taken by another account is not asked about: `init` says so and asks for a different name. |
+| `Apply it? [y/N]` | A source rewrite whose files have uncommitted changes (above). |
 
 ### What `init` does without asking
 
-- **Writes `deploy/`, `werf.yaml`, `werf-giterminism.yaml`, `FLAROPS.md` and `flarops.yaml`.**
+- **Writes `deploy/`, `werf.yaml`, `werf-giterminism.yaml`, `FLAROPS.md` and `flarops.yaml`**, and a Flarops section in `AGENTS.md` (imported by `CLAUDE.md`).
 - **Generates an SSH deploy key in `.keys/`** if there is none, and appends `.env`, `.keys/` and Terraform artefacts to your `.gitignore`. A key already tracked by Git stops the run with instructions rather than being reused.
-- **Runs `docker login`** against your registry to verify the credentials.
 - **Creates the Terraform state S3 bucket** if it does not exist, with versioning, encryption and public access blocking enabled.
-- **Generates a dashboard password**, shows it once, and stores only its hash. It cannot be recovered — save it when it appears.
+- **Generates a dashboard password**, shows it once, and stores only its hash. A lost one is replaced with `npx flarops dashboard-password`.
 - **Creates `.dockerignore`** if any service builds from the repository root, to keep `deploy/`, `.env` and `.keys/` out of your images.
 
-Flarops prints warnings for anything it could not resolve — unset variables, ambiguous routes, files it could not carry into the cluster, compose services it had to skip. Read them: they are the parts of the deployment that need your attention before it will work.
+It ends with what needs your attention — warnings for anything it could not resolve — and then a numbered list of next steps: the GitHub secrets to create, `git diff`, commit and push, DNS, and the addresses to open. Without a terminal (an agent, CI) or with `NO_COLOR` set, the output has no colour codes.
 
 ## What gets generated
 
@@ -442,7 +471,7 @@ Everything under `deploy/helm/` is written by Flarops. Edit `flarops.yaml` and r
 
 Deployed alongside your application, showing every node, every PR environment, memory allocation and running AWS spend. Its address is `dashboard.` plus your domain without its first label: `dashboard.example.com` for both `example.com` and `app.example.com`.
 
-It needs the password `init` printed. Only the hash reaches the cluster, and the dashboard refuses to start without a credential rather than coming up open.
+Sign in as `admin` with the password `init` printed. Only the hash reaches the cluster, and the dashboard refuses to start without a credential rather than coming up open. A lost password cannot be recovered: `npx flarops dashboard-password` issues a new one and writes its hash into `deploy/.env` — copy it into the `DASHBOARD_PASSWORD_HASH` GitHub secret and redeploy.
 
 Memory figures account for what Kubernetes reserves for itself, so "free" means memory something can actually use — not memory the machine has.
 
@@ -473,7 +502,7 @@ A pull request environment runs with the production secrets and a copy of the pr
 - `deploy/terraform/main.tf` — the rest of the infrastructure: the AMI, the security group rules, disk encryption, the network.
 - `deploy/helm/` — the chart: `values.yaml` and one template per service (probes, resource limits, storage sizes, Ingress annotations).
 
-Terraform files are never touched again after `init`, so edit them freely. The chart is different: `flarops sync` rewrites `deploy/helm/`, so a hand edit there lasts only until the next sync. Anything `flarops.yaml` can express — replicas, ports, env, secrets, routes, volumes, commands — belongs in `flarops.yaml`; edit the chart directly only for what it cannot, and re-apply the edit after each sync.
+Terraform files are never touched again after `init`, so edit them freely. The chart is different: `flarops sync` rewrites `deploy/helm/`, so a hand edit there lasts only until the next sync. Anything `flarops.yaml` can express — replicas, ports, env, secrets, routes, volumes, commands — belongs in `flarops.yaml`; edit the chart directly only for what it cannot, and list the file under `syncLock` so sync keeps your edit.
 
 ## Good to know before you rely on it
 

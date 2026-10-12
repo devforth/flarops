@@ -2,6 +2,7 @@ const ciSsh = require('./ciSsh');
 const { registrySettings, imageRepository, isDockerHub } = require('../utils/registry.js');
 const werfCleanupStep = require('./werfCleanup.js');
 const { TERRAFORM_VERSION, WERF_VERSION } = require('../utils/toolVersions.js');
+const { prEstimateMiB } = require('../utils/prEstimate.js');
 
 module.exports = function prCapsuleYmlTemplate(config) {
   const registry = registrySettings(config);
@@ -109,12 +110,7 @@ module.exports = function prCapsuleYmlTemplate(config) {
   }
 
   // FALLBACK capsule size, used only when production cannot be measured yet.
-  let requiredMi = 0;
-  if (config.hasBackend) requiredMi += 256;
-  if (config.hasFrontend) requiredMi += 128;
-  if (config.hasDb) requiredMi += 256;
-  if (config.additionalServices && config.additionalServices.length > 0) requiredMi += config.additionalServices.length * 128;
-  if (requiredMi === 0) requiredMi = 256;
+  const requiredMi = prEstimateMiB(config);
 
   // A worker added for a capsule takes that capsule: asking for "any node with room" right after the
   // join let a capsule land back on a server whose free memory happened to cross the line, leaving the

@@ -1,6 +1,7 @@
 const ciSsh = require('./ciSsh');
 const { registrySettings, imageRepository, isDockerHub } = require('../utils/registry.js');
 const werfCleanupStep = require('./werfCleanup.js');
+const { dashboardHost } = require('../utils/dashboardAccess.js');
 const { TERRAFORM_VERSION, WERF_VERSION } = require('../utils/toolVersions.js');
 
 module.exports = function deployYmlTemplate(config) {
@@ -37,7 +38,7 @@ module.exports = function deployYmlTemplate(config) {
 on:
   push:
     branches:
-      - main
+      - ${config.deployBranch || 'main'}
   workflow_dispatch:
 
 permissions:
@@ -117,6 +118,18 @@ ${ciSsh.slotLock()}
           CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
           echo "Preserving existing worker slots: $CURRENT_SLOTS"
           terraform apply -var="worker_slots=$CURRENT_SLOTS" -auto-approve -lock-timeout=5m
+
+      - name: Deployment summary
+        working-directory: deploy/terraform
+        run: |
+          IP=$(terraform output -raw public_ip 2>/dev/null || true)
+          {
+            echo "### Deployed"
+            echo ""
+            echo "- Application: https://\${{ env.BASE_DOMAIN }}"
+            echo "- Dashboard: https://${dashboardHost(config.domain)}"
+            echo "- Server IP: \${IP:-unknown}${config.hasCloudflare ? ' (DNS is managed through Cloudflare)' : ' - point the DNS records listed in FLAROPS.md at it'}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fetch Kubeconfig from EC2
         working-directory: deploy/terraform

@@ -23,12 +23,12 @@ func startSampleRetention() {
 
 func pruneOldSamples() {
 	cutoff := time.Now().Add(-sampleRetention)
-	if res, err := db.Exec("DELETE FROM host_samples WHERE timestamp < ?", cutoff); err != nil {
+	if res, err := db.Exec("DELETE FROM host_samples WHERE timestamp < ?", sqlTime(cutoff)); err != nil {
 		log.Println("Error pruning host_samples:", err)
 	} else if n, _ := res.RowsAffected(); n > 0 {
 		log.Printf("Pruned %d old host_samples rows", n)
 	}
-	if res, err := db.Exec("DELETE FROM capsule_samples WHERE timestamp < ?", cutoff); err != nil {
+	if res, err := db.Exec("DELETE FROM capsule_samples WHERE timestamp < ?", sqlTime(cutoff)); err != nil {
 		log.Println("Error pruning capsule_samples:", err)
 	} else if n, _ := res.RowsAffected(); n > 0 {
 		log.Printf("Pruned %d old capsule_samples rows", n)
@@ -65,18 +65,25 @@ func initDB(dataSourceName string) error {
 	return err
 }
 
+// Timestamps are stored as UTC text SQLite's date functions read: a bound time.Time is written as Go's
+// String(), with a zone name and a monotonic-clock suffix, on which strftime returns NULL.
+func sqlTime(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05.000")
+}
+
 func recordHostSample(timestamp time.Time, hostID string, ratePerHour float64) error {
-	_, err := db.Exec("INSERT INTO host_samples (timestamp, host_id, rate_per_hour) VALUES (?, ?, ?)", timestamp, hostID, ratePerHour)
+	_, err := db.Exec("INSERT INTO host_samples (timestamp, host_id, rate_per_hour) VALUES (?, ?, ?)", sqlTime(timestamp), hostID, ratePerHour)
 	return err
 }
 
 func recordCapsuleSample(timestamp time.Time, capsuleID string, hostID string, ramMib int) error {
-	_, err := db.Exec("INSERT INTO capsule_samples (timestamp, capsule_id, host_id, ram_mib) VALUES (?, ?, ?, ?)", timestamp, capsuleID, hostID, ramMib)
+	_, err := db.Exec("INSERT INTO capsule_samples (timestamp, capsule_id, host_id, ram_mib) VALUES (?, ?, ?, ?)", sqlTime(timestamp), capsuleID, hostID, ramMib)
 	return err
 }
 
 func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error) {
-	now := time.Now()
+	// Days and months in UTC, the zone the stored timestamps are in.
+	now := time.Now().UTC()
 	startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 	startOfPrevMonth := startOfMonth.AddDate(0, -1, 0)
 	prevMonthSamePeriodEnd := now.AddDate(0, -1, 0)
@@ -86,7 +93,7 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 		SELECT COALESCE(SUM(rate_per_hour / 60.0), 0) 
 		FROM host_samples 
 		WHERE timestamp >= ?
-	`, startOfMonth).Scan(&mtd)
+	`, sqlTime(startOfMonth)).Scan(&mtd)
 	if err != nil {
 		log.Println("Error calculating MTD:", err)
 	}
@@ -96,15 +103,16 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 		SELECT COALESCE(SUM(rate_per_hour / 60.0), 0) 
 		FROM host_samples 
 		WHERE timestamp >= ? AND timestamp <= ?
-	`, startOfPrevMonth, prevMonthSamePeriodEnd).Scan(&prevSame)
+	`, sqlTime(startOfPrevMonth), sqlTime(prevMonthSamePeriodEnd)).Scan(&prevSame)
 	if err != nil {
 		log.Println("Error calculating prevSame:", err)
 	}
 
 	runRate := totalHourlyRate * 24.0
 
-	daysInMonth := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, now.Location()).Day()
-	projected := mtd + runRate*float64(daysInMonth-now.Day())
+	// The rest of the month from now, today's remaining hours included.
+	endOfMonth := time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, now.Location())
+	projected := mtd + totalHourlyRate*endOfMonth.Sub(now).Hours()
 
 	dayOfMonth := now.Day()
 	curDays := make([]int, dayOfMonth)
@@ -120,7 +128,7 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 		FROM host_samples 
 		WHERE timestamp >= ? 
 		GROUP BY day
-	`, startOfMonth)
+	`, sqlTime(startOfMonth))
 	if err == nil {
 		defer rows.Close()
 		dailyCosts := make(map[int]float64)
@@ -132,10 +140,9 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 			}
 		}
 
-		cumulative := 0.0
+		// Each day's own spend: the bars are days, and their mean is the average per day.
 		for i := 1; i <= dayOfMonth; i++ {
-			cumulative += dailyCosts[i]
-			curVals[i-1] = cumulative
+			curVals[i-1] = dailyCosts[i]
 		}
 	} else {
 		log.Println("Error querying daily sums:", err)
@@ -146,7 +153,7 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 		FROM host_samples 
 		WHERE timestamp >= ? AND timestamp < ?
 		GROUP BY day
-	`, startOfPrevMonth, startOfMonth)
+	`, sqlTime(startOfPrevMonth), sqlTime(startOfMonth))
 
 	if err == nil {
 		defer rowsPrev.Close()
@@ -158,13 +165,11 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 				dailyCostsPrev[d] = cost
 			}
 		}
-		cumulativePrev := 0.0
 		daysInPrevMonth := time.Date(now.Year(), now.Month(), 0, 0, 0, 0, 0, now.Location()).Day()
 		for i := 1; i <= dayOfMonth; i++ {
 			if i <= daysInPrevMonth {
-				cumulativePrev += dailyCostsPrev[i]
+				prevVals[i-1] = dailyCostsPrev[i]
 			}
-			prevVals[i-1] = cumulativePrev
 		}
 	} else {
 		log.Println("Error querying previous month daily sums:", err)
@@ -190,18 +195,22 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 	}, nil
 }
 
-func getCapsulesCostLife(hourlyRate float64) map[string]float64 {
+// Each environment's share of its node's rate, per one-minute sample, since `since[id]`: the node's
+// rate split across the environments on it at that minute.
+func getCapsulesCostLife(since map[string]time.Time) map[string]float64 {
 	res := make(map[string]float64)
-	rows, err := db.Query(`SELECT capsule_id, COUNT(*) FROM capsule_samples GROUP BY capsule_id`)
-	if err != nil {
-		return res
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		var count int
-		if err := rows.Scan(&id, &count); err == nil {
-			res[id] = float64(count) * (hourlyRate / 60.0)
+	for id, from := range since {
+		var cost float64
+		err := db.QueryRow(`
+			SELECT COALESCE(SUM(h.rate_per_hour / 60.0 / n.cnt), 0)
+			FROM capsule_samples c
+			JOIN host_samples h ON h.host_id = c.host_id AND h.timestamp = c.timestamp
+			JOIN (SELECT timestamp, host_id, COUNT(*) AS cnt FROM capsule_samples GROUP BY timestamp, host_id) n
+			  ON n.timestamp = c.timestamp AND n.host_id = c.host_id
+			WHERE c.capsule_id = ? AND c.timestamp >= ?
+		`, id, sqlTime(from)).Scan(&cost)
+		if err == nil {
+			res[id] = cost
 		}
 	}
 	return res

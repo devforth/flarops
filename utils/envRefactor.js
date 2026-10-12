@@ -63,7 +63,8 @@ function injectVariableDeclaration(content, ext, envVarSyntax) {
   }
 }
 
-async function refactorFrontendEnv(frontendDir, backendPorts) {
+// doModify false: work out the same changes, write nothing, and list the files they would touch.
+async function refactorFrontendEnv(frontendDir, backendPorts, doModify = true) {
   if (!frontendDir || !backendPorts || backendPorts.length === 0) {
     return null;
   }
@@ -109,6 +110,8 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
 
   const filesToScan = await walkDir(frontendDir);
   let refactoredFilesCount = 0;
+  const changedFiles = [];
+  const supportFiles = [];
   let backendDetectedUrl = null;
   const discoveredRoutes = new Set();
   
@@ -187,7 +190,8 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
       if (!isAngular) {
         content = injectVariableDeclaration(content, path.extname(filePath), envVarSyntax);
       }
-      await fsPromises.writeFile(filePath, content, 'utf8');
+      if (doModify) await fsPromises.writeFile(filePath, content, 'utf8');
+      changedFiles.push(filePath);
       refactoredFilesCount++;
     }
   }
@@ -195,8 +199,11 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
   if (!isAngular && refactoredFilesCount > 0 && backendDetectedUrl) {
     const envLocalPath = path.join(frontendDir, '.env.local');
     const envEntry = `${envVarKey}=${backendDetectedUrl}\n`;
-    
-    if (fs.existsSync(envLocalPath)) {
+    supportFiles.push(envLocalPath, path.join(frontendDir, '.dockerignore'), path.join(frontendDir, '.gitignore'));
+
+    if (!doModify) {
+      // Previewing: the files above are listed, nothing is written.
+    } else if (fs.existsSync(envLocalPath)) {
       const existingEnv = await fsPromises.readFile(envLocalPath, 'utf8');
       if (!existingEnv.includes(`${envVarKey}=`)) {
         await fsPromises.appendFile(envLocalPath, `\n# Added by Flarops\n${envEntry}`);
@@ -205,7 +212,7 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
       await fsPromises.writeFile(envLocalPath, `# Added by Flarops\n${envEntry}`);
     }
 
-    const ignoreFiles = ['.dockerignore', '.gitignore'];
+    const ignoreFiles = doModify ? ['.dockerignore', '.gitignore'] : [];
     for (const ignoreFile of ignoreFiles) {
       const ignorePath = path.join(frontendDir, ignoreFile);
       if (fs.existsSync(ignorePath)) {
@@ -222,6 +229,9 @@ async function refactorFrontendEnv(frontendDir, backendPorts) {
   if (refactoredFilesCount > 0 || Object.keys(existingEnvVars).length > 0) {
     return {
       filesChanged: refactoredFilesCount,
+      files: changedFiles,
+      // .env.local (the local value) and the ignore files that keep it out of git and the image.
+      supportFiles,
       envVarKey: envVarKey,
       discoveredRoutes: Array.from(discoveredRoutes)
     };
@@ -236,6 +246,7 @@ async function refactorBackendDbUrl(backendDir, doModify = false) {
   const discoveredVars = new Set();
   let filesChanged = 0;
   let anyHardcoded = false;
+  const hardcodedFiles = [];
 
   for (const filePath of filesToScan) {
     if (!['.js', '.ts'].includes(path.extname(filePath))) continue;
@@ -261,6 +272,7 @@ async function refactorBackendDbUrl(backendDir, doModify = false) {
       if (!before.match(/\|\|\s*$/) && !before.match(/process\.env\./)) {
         fileHasHardcoded = true;
         anyHardcoded = true;
+        hardcodedFiles.push(filePath);
         break;
       }
     }
@@ -288,15 +300,18 @@ async function refactorBackendDbUrl(backendDir, doModify = false) {
 
   return {
     filesChanged,
+    files: hardcodedFiles,
     discoveredVars: Array.from(discoveredVars),
     hasHardcoded: anyHardcoded
   };
 }
 
-async function refactorNginxConf(frontendDir, backendPorts) {
-  if (!frontendDir || !backendPorts || backendPorts.length === 0) return null;
+// The proxy_pass lines pointing at the backend's port, rewritten to the api Service. Returns the files
+// changed (or, with doModify false, that would be).
+async function refactorNginxConf(frontendDir, backendPorts, doModify = true) {
+  if (!frontendDir || !backendPorts || backendPorts.length === 0) return [];
   const filesToScan = await walkDir(frontendDir);
-  let filesChanged = 0;
+  const changed = [];
 
   for (const filePath of filesToScan) {
     if (path.extname(filePath) !== '.conf') continue;
@@ -316,11 +331,11 @@ async function refactorNginxConf(frontendDir, backendPorts) {
     }
 
     if (modified) {
-      await fsPromises.writeFile(filePath, content, 'utf8');
-      filesChanged++;
+      if (doModify) await fsPromises.writeFile(filePath, content, 'utf8');
+      changed.push(filePath);
     }
   }
-  return filesChanged;
+  return changed;
 }
 
 async function refactorLowercaseEnvVars(backendDir, keysToUppercase, doModify = false) {

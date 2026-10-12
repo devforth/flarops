@@ -6,6 +6,7 @@ const { YamlError } = require('./yamlLite.js');
 const { ENGINES } = require('./dbDefaults.js');
 const { REGISTRY_HOST, IMAGE_PATH } = require('./registry.js');
 const { claimNameFor } = require('../templates/generic/volumes.js');
+const { closest } = require('./closest.js');
 
 // A Kubernetes Service name (RFC 1035 label) - also safe as a file name.
 const SERVICE_NAME = /^[a-z]([-a-z0-9]*[a-z0-9])?$/;
@@ -63,9 +64,30 @@ function has(obj, key) {
   return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
-function checkKeys(where, block, allowed) {
+// What each kind of block is, for an error that names a field it does not take.
+const KIND_NAMES = {
+  api: 'the api block',
+  frontend: 'the frontend block',
+  database: 'the top-level database block',
+  db: 'a service\'s own db: block',
+  built: 'a service built from this repository (dockerfile:)',
+  support: 'a service run from a pre-built image (image:) - routes, health checks, build args and db: are for services built here',
+};
+// Every field of every kind: a key that exists elsewhere is misplaced, not misspelled.
+const ALL_KEYS = [...new Set(Object.values(KEYS).flat())];
+
+// "args" is the older spelling of buildArgs: still read, no longer offered.
+const shown = (allowed) => allowed.filter(k => k !== 'args');
+
+function checkKeys(where, block, allowed, kind) {
   for (const key of Object.keys(block || {})) {
-    if (!allowed.includes(key)) fail(`${where}.${key}`, `is not a field here - use ${allowed.join(', ')}`);
+    if (allowed.includes(key)) continue;
+    const guess = closest(key, shown(allowed));
+    if (guess) fail(`${where}.${key}`, `is not a field - did you mean ${guess}?`);
+    const what = KIND_NAMES[kind];
+    fail(`${where}.${key}`, ALL_KEYS.includes(key) && what
+      ? `is not a field of ${what}. Its fields: ${shown(allowed).join(', ')}`
+      : `is not a field here - use ${shown(allowed).join(', ')}`);
   }
 }
 
@@ -213,7 +235,7 @@ function checkCommon(name, decl) {
 function checkDatabase(where, db, { requireTypeAndPassword }) {
   if (db === null || db === undefined) return;
   if (typeof db !== 'object' || Array.isArray(db)) fail(where, 'must be a block with type, image, port, user, name and secretEnvs');
-  checkKeys(where, db, where === 'database' ? KEYS.database : KEYS.db);
+  checkKeys(where, db, where === 'database' ? KEYS.database : KEYS.db, where === 'database' ? 'database' : 'db');
   if (db.type !== null && db.type !== undefined && !DB_TYPES.has(String(db.type).toLowerCase())) {
     fail(`${where}.type`, `must be one of ${[...DB_TYPES].join(', ')}, not ${JSON.stringify(db.type)}`);
   }
@@ -263,7 +285,10 @@ function validateDeclarations(declared) {
       continue;
     }
     const kind = PRIMARY.has(name) ? name : (decl.dockerfile ? 'built' : 'support');
-    checkKeys(name, decl, KEYS[kind]);
+    if (kind === 'built' && has(decl, 'image')) {
+      fail(name, 'has both image and dockerfile - use image for a pre-built image, or dockerfile and context to build it from this repository, not both');
+    }
+    checkKeys(name, decl, KEYS[kind], kind);
     if (kind === 'support' && !decl.image) {
       fail(name, 'needs either image (a pre-built image) or dockerfile and context (built from this repository)');
     }
@@ -275,6 +300,9 @@ function validateDeclarations(declared) {
     if (decl.oneShot && asList(decl.exposedRoutes).length > 0) {
       fail(name, 'is oneShot, so it has no Service and cannot own exposedRoutes');
     }
+    // A task runs once per deploy and has no Service: these would be silently ignored.
+    if (decl.oneShot && has(decl, 'replicas')) fail(`${name}.replicas`, 'does not apply to a oneShot task, which runs once per deploy - remove it');
+    if (decl.oneShot && asList(decl.ports).length > 0) fail(`${name}.ports`, 'does not apply to a oneShot task, which has no Service - remove it');
   }
   // Claim names are sanitized ("data_a" and "data-a" both become <service>-data-a): two volumes must
   // not end up sharing one claim.
@@ -333,7 +361,26 @@ function validateRepositorySettings(block) {
   }
 }
 
+// secretEnvs entries whose secret name looks like a value pasted in: GitHub Secret names are
+// conventionally upper case, while "sk_live_abc123" or a token mixes lower case with digits. A
+// warning, not a refusal: such a name is legal, and only a guess says it is wrong.
+function suspiciousSecretNames(declared) {
+  const looksLikeValue = (v) => /[a-z]/.test(v) && (/\d/.test(v) || v.length >= 24);
+  const found = [];
+  const scan = (where, secretEnvs) => {
+    for (const [envName, secret] of Object.entries(secretEnvs || {})) {
+      if (secret !== null && secret !== undefined && looksLikeValue(String(secret))) found.push(`${where}.${envName}: ${secret}`);
+    }
+  };
+  for (const [name, decl] of declared) {
+    scan(`${name}.secretEnvs`, decl && decl.secretEnvs);
+    scan(`${name}.db.secretEnvs`, decl && decl.db && decl.db.secretEnvs);
+  }
+  return found;
+}
+
 module.exports = {
+  suspiciousSecretNames,
   validateDeclarations, validateRepositorySettings, validateSyncLock,
   SERVICE_NAME, RESERVED_SERVICE_NAMES, RESERVED_SECRET, MAX_SERVICE_NAME, MAX_SERVICE_NAME_WITH_DB,
 };

@@ -18,8 +18,7 @@ const ANSWERS = {
   'AWS Access Key': '',
   'AWS Secret Access Key': 'secrettest',
   'AWS region': 'us-west-2',
-  'refactor hardcoded frontend': 'n',
-  'refactor hardcoded database': 'n',
+  'Apply it?': 'n',
   'refactor them': 'n',
   'bucket name': 'test-bucket',
   'want to use it': 'y',
@@ -43,6 +42,7 @@ function installStubs(extraAnswers) {
   require.cache[awsPath].exports = {
     getDefaultAWSCredentials: () => ({ accessKey: 'AKIATEST', secretKey: 'secrettest' }),
     ensureAwsCli: () => '/bin/true',
+    checkAwsAccess: () => ({ ok: true }),
     handleS3Bucket: async (_cmd, name) => ({
       bucket: String(name).toLowerCase().replace(/[^a-z0-9-]/g, '-'),
       warning: null,
@@ -62,7 +62,7 @@ async function generate(fixtureDir, extraAnswers, options = {}) {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-test-'));
   const work = path.join(parent, path.basename(fixtureDir));
   fs.cpSync(fixtureDir, work, { recursive: true });
-  child_process.execFileSync('git', ['init', '-q'], { cwd: work });
+  child_process.execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: work });
   // .env and .env.local stay out of git, as in a real project: init treats committed values as public.
   fs.appendFileSync(path.join(work, '.git', 'info', 'exclude'), '.env\n.env.local\n');
   if (options.commit !== false) {

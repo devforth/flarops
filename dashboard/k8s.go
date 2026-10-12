@@ -152,6 +152,21 @@ func (k *K8sClient) GetPVCs() ([]*corev1.PersistentVolumeClaim, error) {
 	return res, nil
 }
 
+// Namespace name -> when it was created: an environment's age, which a redeploy's new pods do not reset.
+func (k *K8sClient) GetNamespaceCreation() (map[string]time.Time, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	list, err := k.clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	res := make(map[string]time.Time, len(list.Items))
+	for _, ns := range list.Items {
+		res[ns.Name] = ns.CreationTimestamp.Time
+	}
+	return res, nil
+}
+
 // Node name -> node-agent pod IP (instead of nodes/proxy, which would also authorize exec).
 func (k *K8sClient) GetNodeAgentIPs() (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

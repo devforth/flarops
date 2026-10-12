@@ -161,7 +161,7 @@ function parse(text) {
 
   function parseMapping(indent) {
     const out = {};
-    const seen = new Set();
+    const seen = new Map(); // key -> the line it is on
     while (pos < rows.length && rows[pos].indent === indent) {
       const row = rows[pos];
       if (row.text.startsWith('- ')) {
@@ -171,8 +171,8 @@ function parse(text) {
       if (!m) throw new YamlError(`expected "key: value", found ${JSON.stringify(row.text)}`, row.lineNo);
       const key = parseScalar(m[1], row.lineNo);
       // A repeated key would silently drop the earlier value.
-      if (seen.has(key)) throw new YamlError(`duplicate key ${JSON.stringify(String(key))}`, row.lineNo);
-      seen.add(key);
+      if (seen.has(key)) throw new YamlError(`duplicate key ${JSON.stringify(String(key))} - it is already on line ${seen.get(key)}`, row.lineNo);
+      seen.set(key, row.lineNo);
       pos++;
 
       const [anchor, inline] = takeAnchor(m[2] === undefined ? '' : m[2]);
@@ -241,7 +241,7 @@ function parse(text) {
   if (rows.length === 0) return {};
   const result = parseBlock(rows[0].indent);
   if (pos < rows.length) {
-    throw new YamlError(`unexpected indentation - expected ${rows[0].indent} spaces`, rows[pos].lineNo);
+    throw new YamlError(`this line is indented ${rows[pos].indent} spaces, which lines up with no key above it - indent it like the other fields of its block`, rows[pos].lineNo);
   }
   return result;
 }
