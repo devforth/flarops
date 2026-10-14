@@ -81,6 +81,28 @@ async function run(check) {
     const wrong = checkAwsAccess(fakeAws(dir, { credentialsValid: false }), creds, 'eu-central-1');
     check('wrong credentials fail the early check, saying why', !wrong.ok && /rejected these credentials/.test(wrong.message), JSON.stringify(wrong));
 
+    fs.mkdirSync(path.join(dir, '.aws'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.aws', 'credentials'), '[default]\naws_access_key_id = ASIAPROFILE\naws_secret_access_key = s\naws_session_token = t\n[static]\naws_access_key_id = AKIASTATIC\naws_secret_access_key = s\n');
+    const sessionProfile = getDefaultAWSCredentials({ HOME: dir });
+    check('a profile holding a session token is treated as absent', sessionProfile === null, JSON.stringify(sessionProfile));
+    const staticProfile = getDefaultAWSCredentials({ HOME: dir, AWS_PROFILE: 'static' });
+    check('a profile with long-lived keys is offered', staticProfile && staticProfile.accessKey === 'AKIASTATIC', JSON.stringify(staticProfile));
+
+    const { awsEnv } = require('../utils/awsHelper.js');
+    const proxied = awsEnv(creds, { PATH: '/bin', HOME: dir, HTTPS_PROXY: 'http://proxy:3128', no_proxy: 'localhost', AWS_CA_BUNDLE: '/etc/ca.pem', SECRET_OTHER: 'x' });
+    check('the AWS CLI gets the proxy and CA bundle settings, in either case, and nothing else',
+      proxied.HTTPS_PROXY === 'http://proxy:3128' && proxied.no_proxy === 'localhost' && proxied.AWS_CA_BUNDLE === '/etc/ca.pem' && !('SECRET_OTHER' in proxied) && proxied.AWS_ACCESS_KEY_ID === 'AKIATEST',
+      JSON.stringify(proxied));
+
+    const decided = await withExitTrapped(() => handleS3Bucket(
+      fakeAws(dir, { credentialsValid: true }), 'fresh', creds, async () => 'y', 'us-west-2'));
+    check('a free bucket name is only decided on, to be created after the questions',
+      decided.result && decided.result.bucket === 'fresh' && decided.result.create === true && !/Creating S3 bucket/.test(decided.said), JSON.stringify(decided.result) + decided.said);
+    const { createStateBucket } = require('../utils/awsHelper.js');
+    const created = await withExitTrapped(() => createStateBucket(
+      fakeAws(dir, { credentialsValid: true }), 'fresh', creds, async () => 'other', 'us-west-2'));
+    check('and createStateBucket creates it', created.result === 'fresh' && /Creating S3 bucket: fresh/.test(created.said), JSON.stringify(created.result) + created.said);
+
     const names = ['', 'second'];
     const emptyName = await withExitTrapped(() => handleS3Bucket(
       fakeAws(dir, { credentialsValid: true }), 'taken', creds, async () => names.shift(), 'us-west-2'));

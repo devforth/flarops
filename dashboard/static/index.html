@@ -250,6 +250,9 @@
 
     .board {
       display: grid;
+      /* minmax(0, ...): a long row (the data table, an instance type) scrolls inside its card
+         instead of widening the page. */
+      grid-template-columns: minmax(0, 1fr);
       gap: 18px;
       padding-bottom: 80px
     }
@@ -810,7 +813,7 @@
 
     @media (max-width:900px) {
       .cbody {
-        grid-template-columns: 1fr
+        grid-template-columns: minmax(0, 1fr)
       }
     }
 
@@ -1198,7 +1201,7 @@
 
     @media (max-width:960px) {
       .qrow {
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(0, 1fr);
         gap: 10px
       }
     }
@@ -1270,6 +1273,7 @@
     /* ---------------- free slot ---------------- */
     /* ---------------- spend ---------------- */
     .money {
+      min-width: 0;
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 10px;
@@ -1602,6 +1606,8 @@
     };
     let ORDERED = [];
     let GENERATED_AT = 0;
+    /* When this browser received the newest frame: its own clock, never compared with the server's. */
+    let RECEIVED_AT = 0;
     let CONNECTED = false;
     let ALL_CAPS = [];
     let FLEET_RAM = 0;
@@ -1916,9 +1922,8 @@
           pct(c.ram, h.ramTotal) + "% of host", pct(c.ram, h.ramTotal)) +
         st("CPU", vcpu(c.cpu) + " vCPU",
           Math.round(c.cpu / cpuCap(h) * 100) + "% of the machine", c.cpu / cpuCap(h) * 100) +
-        st("Swap", c.swap ? exact(sz(c.swap), szPairT(c.swap, h.swapTotal, "of host swap")) : "0",
-          c.swap ? pct(c.swap, h.swapTotal) + "% of swap" : "not swapping",
-          c.swap ? pct(c.swap, h.swapTotal) : 0) +
+        /* Swap is measured per machine only: an environment's share is unknown, not zero. */
+        st("Swap", "—", "not measured per environment", 0, false) +
         st("Cost", usd(c.costLife), usd(c.rateH) + "/h", 0, false) +
         "</div></div>" +
         '<div class="cbody">' +
@@ -2004,10 +2009,11 @@
           "/day · removed when the next PR environment closes") + "</div>";
     }
 
-    /** Names the environment doing the paging, so the alarm points somewhere. */
+    /** Swap is measured per machine, not per environment: point at the largest resident instead. */
     function worstSwapper(h) {
-      const c = h.capsules.slice().sort((a, b) => b.swap - a.swap)[0];
-      return c && c.swap ? esc(c.id) + " is paging " + sz(c.swap) : "no single environment accounts for it";
+      const c = h.capsules.slice().sort((a, b) => b.ram - a.ram)[0];
+      return c ? "the largest environment here is " + esc(c.id) + " at " + sz(c.ram) + " resident (swap per environment is not measured)"
+        : "swap per environment is not measured";
     }
 
     /* A queued capsule has a spec but no measurements, so it gets its own compact row
@@ -2063,7 +2069,7 @@
         (h.schedulable === false ? '<span class="chip warn" title="Cordoned, not ready or tainted: new pods will not land here">not schedulable</span>' : "") +
         (h.metricsKnown === false ? '<span class="chip warn" title="metrics-server or the node agent did not answer; usage below reads as zero">no metrics</span>' : "") +
         (h.priceKnown === false ? '<span class="chip warn" title="The price feed has no price for this type and region yet; a fallback rate is used">price estimated</span>' : "") +
-        '<span class="chip type">' + esc(h.type) + '</span><span class="chip">' + plural(threadsOf(h), "vCPU") +
+        (h.type ? '<span class="chip type">' + esc(h.type) + "</span>" : "") + '<span class="chip">' + plural(threadsOf(h), "vCPU") +
         '</span><span class="chip">' + usd(h.rate) + "/h</span></div></div>" +
         (alarm ? '<div class="alarmline"><svg class="ic"><use href="#i-warn"/></svg>Swap pressure ' +
           hostSwap(h) + "% — " + worstSwapper(h) + ". This host is over-committed, not busy.</div>" : "") +
@@ -2138,7 +2144,9 @@
       ws.onopen = function () { CONNECTED = true; };
       ws.onmessage = function (e) {
         const data = JSON.parse(e.data);
-        GENERATED_AT = data.generatedAt || Date.now();
+        /* A repeat of the last frame (the collector resends it when a cycle fails) is not news. */
+        if (!data.generatedAt || data.generatedAt !== GENERATED_AT) RECEIVED_AT = Date.now();
+        GENERATED_AT = data.generatedAt || 0;
         FLEET = data.FLEET;
         FRAMES++;
         if (FLEET.project) {
@@ -2176,7 +2184,7 @@
     /* How old the numbers on screen are, ticking between frames: a frame arrives every 2s, so
        a gap of 10s means the collector or the connection is stuck. */
     function freshnessState() {
-      const ageSec = GENERATED_AT ? Math.max(0, Math.round((Date.now() - GENERATED_AT) / 1000)) : null;
+      const ageSec = RECEIVED_AT ? Math.max(0, Math.round((Date.now() - RECEIVED_AT) / 1000)) : null;
       if (!CONNECTED) return { cls: "dead", text: "disconnected · reconnecting" + (ageSec !== null ? " · data " + dur(ageSec) + " old" : "") };
       if (ageSec === null) return { cls: "stale", text: "waiting for data" };
       if (ageSec >= 60) return { cls: "dead", text: "no update for " + dur(ageSec) };

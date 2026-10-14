@@ -10,6 +10,8 @@ npm install -g flarops
 
 or run it without installing: `npx flarops init`.
 
+**In a repository you did not write, use the global install, not `npx`.** Under `npx` (and any npm script), the project's own `node_modules/.bin` comes first on `PATH`, so a repository that commits its own `git`, `docker` or `gpg` there would have Flarops run them — with your registry password and AWS keys at hand. A global `flarops` runs the tools installed on your machine.
+
 ## Before you start
 
 **Your project**
@@ -140,7 +142,7 @@ repositorySettings:
   repository: shop           # repository the images are pushed to
 ```
 
-The images end up at `<registry>/<project>/<repository>` — `harbor.example.com/team/shop` for a Harbor project, `ghcr.io/acme/shop` for a GitHub organisation. Leave `project` as `null` when the registry has no such level; on Docker Hub, `null` means your own user (`docker.io/<user>/shop`). `init` fills this in from the registry you gave it (`harbor.example.com/team` is split into registry and project) and names the repository after the project directory. Changing any of it and running `sync` updates both workflows; log-in still goes to the registry host with the same credentials.
+The images end up at `<registry>/<project>/<repository>` — `harbor.example.com/team/shop` for a Harbor project, `ghcr.io/acme/shop` for a GitHub organisation. Leave `project` as `null` when the registry has no such level; on Docker Hub, `null` means your own user (`docker.io/<user>/shop`). `init` fills this in from the registry you gave it (`harbor.example.com/team` is split into registry and project) and names the repository after the project directory. Changing any of it and running `sync` updates both workflows. The workflows log in as the user `init` was given; an optional `user:` field changes it. Moving to another registry needs credentials for it: `sync` says so — update the `REGISTRY_PASSWORD` GitHub secret (and `user:`) before you push.
 
 Every other top-level key is a service. The full field reference is the comment block at the end of the file itself. Here is a complete, ordinary example:
 
@@ -469,7 +471,9 @@ Everything under `deploy/helm/` is written by Flarops. Edit `flarops.yaml` and r
 
 ## The dashboard
 
-Deployed alongside your application, showing every node, every PR environment, memory allocation and running AWS spend. Its address is `dashboard.` plus your domain without its first label: `dashboard.example.com` for both `example.com` and `app.example.com`.
+Deployed alongside your application, showing every node, every PR environment, memory allocation and running AWS spend. Its address is `dashboard.` plus your domain without its first label: `dashboard.example.com` for both `example.com` and `app.example.com` — never above the domain's zone, so `shop.co.uk` gets `dashboard.shop.co.uk`. PR environments follow the same rule: `app-pr-12.example.com`, `pr-12.shop.co.uk`.
+
+Without Cloudflare there is no TLS: the server answers plain HTTP on port 80, so the application and the dashboard are `http://` until you put a proxy that terminates HTTPS (Cloudflare, for example) in front of it. `init`, `FLAROPS.md` and the deploy summary print the addresses accordingly.
 
 Sign in as `admin` with the password `init` printed. Only the hash reaches the cluster, and the dashboard refuses to start without a credential rather than coming up open. A lost password cannot be recovered: `npx flarops dashboard-password` issues a new one and writes its hash into `deploy/.env` — copy it into the `DASHBOARD_PASSWORD_HASH` GitHub secret and redeploy.
 
@@ -510,7 +514,7 @@ Terraform files are never touched again after `init`, so edit them freely. The c
 - **Open ports.** The security group allows 22 (SSH), 80 (HTTP) and 6443 (Kubernetes API) from anywhere. Narrow them in `deploy/terraform/main.tf` if you need to.
 - **HTTPS comes from Cloudflare.** Port 443 is not open. Without Cloudflare's proxy the application is plain HTTP, and the dashboard cannot be logged into: its session cookies are only sent over HTTPS.
 - **The root volume is not encrypted** unless you turn it on in `deploy/terraform/main.tf`.
-- **Terraform is written once.** `init` generates `deploy/terraform/`; `sync` does not touch it, and keeping it up to date is up to you. Changes to the AMI or to the instance's startup script reach new instances only — replace one deliberately (`terraform apply -replace=aws_instance.server`), remembering that its disk holds the cluster's data.
+- **Terraform is written once.** `init` generates `deploy/terraform/`; `sync` does not touch it, and keeping it up to date is up to you. Changes to the AMI or to the instance's startup script reach new instances only — replace one deliberately (`terraform workspace select main`, then `terraform apply -replace=aws_instance.server` — CI keeps its state in the `main` workspace), remembering that its disk holds the cluster's data.
 - **It costs money.** EC2 instances, their volumes, the Elastic IP and the S3 bucket are billed to your AWS account. A worker added for a pull request is billed until the PR is closed and the worker is reclaimed.
 - **amd64 only.** The instances and the k3s install are x86_64.
 - **Pinned tools.** CI installs Terraform `1.15.8` and werf `v2.78.2`, never whatever is newest; Flarops raises them deliberately.

@@ -1,7 +1,8 @@
 const ciSsh = require('./ciSsh');
 const { registrySettings, imageRepository, isDockerHub } = require('../utils/registry.js');
 const werfCleanupStep = require('./werfCleanup.js');
-const { dashboardHost } = require('../utils/dashboardAccess.js');
+const { dashboardHost, appScheme } = require('../utils/dashboardAccess.js');
+const { safeBranch } = require('../utils/branch.js');
 const { TERRAFORM_VERSION, WERF_VERSION } = require('../utils/toolVersions.js');
 
 module.exports = function deployYmlTemplate(config) {
@@ -31,14 +32,15 @@ module.exports = function deployYmlTemplate(config) {
   // An unknown value is omitted, not written as null: Helm treats null in an override as "delete key".
   const buildValuesScript = `python3 -c "import json,os; data={'env': {k[len('SECRET_ENV_'):]: v for k,v in os.environ.items() if k.startswith('SECRET_ENV_')}, 'database': {'password': os.environ.get('SECRET_DB_PASSWORD','')}}; reg=os.environ.get('SECRET_REGISTRY_PASSWORD',''); data.update({'imagePullSecret': {'server': os.environ.get('REGISTRY_SERVER',''), 'username': os.environ.get('REGISTRY_USER',''), 'password': reg}} if reg else {}); aws={k:v for k,v in (('instanceType',os.environ.get('TF_INSTANCE_TYPE','')),('volumeSize',os.environ.get('TF_VOLUME_SIZE',''))) if v}; data.update({'aws': aws} if aws else {}); open('deploy/helm/flarops-ci-values.json','w').write(json.dumps(data))"`;
 
+  const scheme = appScheme(config);
+
   const dbPasswordEnvLine = config.hasDbPassword ? `          SECRET_DB_PASSWORD: \${{ secrets.${config.dbPasswordKey} }}\n` : '';
 
   return `name: Flarops CI/CD Pipeline
 
 on:
   push:
-    branches:
-      - ${config.deployBranch || 'main'}
+    branches: ['${safeBranch(config.deployBranch) || 'main'}']
   workflow_dispatch:
 
 permissions:
@@ -78,6 +80,7 @@ jobs:
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: ${TERRAFORM_VERSION}
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -126,9 +129,11 @@ ${ciSsh.slotLock()}
           {
             echo "### Deployed"
             echo ""
-            echo "- Application: https://\${{ env.BASE_DOMAIN }}"
-            echo "- Dashboard: https://${dashboardHost(config.domain)}"
-            echo "- Server IP: \${IP:-unknown}${config.hasCloudflare ? ' (DNS is managed through Cloudflare)' : ' - point the DNS records listed in FLAROPS.md at it'}"
+            echo "- Application: ${scheme}://\${{ env.BASE_DOMAIN }}"
+            echo "- Dashboard: ${scheme}://${dashboardHost(config.domain)}"
+            echo "- Server IP: \${IP:-unknown}${config.hasCloudflare ? ' (DNS is managed through Cloudflare)' : ' - point the DNS records listed in FLAROPS.md at it'}"${config.hasCloudflare ? '' : `
+            echo ""
+            echo "The server serves plain HTTP: HTTPS needs a proxy (Cloudflare, for example) in front of it."`}
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fetch Kubeconfig from EC2

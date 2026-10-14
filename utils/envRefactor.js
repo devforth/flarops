@@ -63,6 +63,10 @@ function injectVariableDeclaration(content, ext, envVarSyntax) {
   }
 }
 
+// A variable the frontend already has is reused only when its name says it is the backend's address:
+// NEXT_PUBLIC_SITE_URL, NEXTAUTH_URL or DATABASE_URL hold something else, which this would overwrite.
+const BACKEND_URL_ENV_KEY = /^(?:(?:VITE|NEXT_PUBLIC|REACT_APP|VUE_APP|NUXT_PUBLIC|GATSBY|EXPO_PUBLIC|PUBLIC|NG)_)?(?:BACKEND_)?(?:API|BACKEND|SERVER)_?(?:BASE_)?UR[LI]$/;
+
 // doModify false: work out the same changes, write nothing, and list the files they would touch.
 async function refactorFrontendEnv(frontendDir, backendPorts, doModify = true) {
   if (!frontendDir || !backendPorts || backendPorts.length === 0) {
@@ -124,8 +128,7 @@ async function refactorFrontendEnv(frontendDir, backendPorts, doModify = true) {
     let match;
     while ((match = envRegex.exec(content)) !== null) {
       const key = match[1];
-      if (key.match(/^(NODE_ENV|PUBLIC_URL)$/)) continue;
-      if (key.match(/API|URL|BASE/i)) {
+      if (BACKEND_URL_ENV_KEY.test(key)) {
         existingEnvVars[key] = (existingEnvVars[key] || 0) + 1;
       }
     }
@@ -338,47 +341,103 @@ async function refactorNginxConf(frontendDir, backendPorts, doModify = true) {
   return changed;
 }
 
-async function refactorLowercaseEnvVars(backendDir, keysToUppercase, doModify = false) {
-  if (!backendDir || !keysToUppercase || keysToUppercase.length === 0) return { modifiedCount: 0 };
-  
-  const filesToScan = await walkDir(backendDir);
-  let modifiedCount = 0;
+// Source files the upper-case rewrite edits; a key read anywhere else is not offered.
+const LOWERCASE_REWRITE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts', '.go', '.py', '.java', '.kt', '.php', '.cs', '.rb']);
+const DOC_FILE = /\.(md|markdown|txt|rst|adoc)$/i;
 
-  for (const filePath of filesToScan) {
-    if (!['.js', '.ts', '.go', '.py', '.java', '.php', '.cs'].includes(path.extname(filePath))) continue;
-    if (isTestFile(filePath)) continue;
+// The calls that take the variable's name as a string: the ones analyzeBackendForDbKeys reads
+// (utils/dbAnalyzer.js), and their siblings in the same languages.
+const NAMED_READ_PREFIX = '(?:process\\.env\\[|os\\.Getenv\\(|os\\.LookupEnv\\(|getenv\\(|System\\.getenv\\(|Environment\\.GetEnvironmentVariable\\(|os\\.environ\\[|os\\.environ\\.get\\(|ENV\\[|ENV\\.fetch\\(|\\$ENV\\[|\\$_ENV\\[|\\$_SERVER\\[)';
+// What analyzeBackendForDbKeys counts as a read, to find what the rewrite left behind.
+const ANALYZER_READ = (key) => new RegExp(`(?:process\\.env\\.|(?:process\\.env\\[|os\\.Getenv\\(|getenv\\(|System\\.getenv\\(|Environment\\.GetEnvironmentVariable\\(|\\$ENV\\[|\\$_ENV\\[)['"\`])${escapeRegex(key)}(?![A-Za-z0-9_])`);
+const DESTRUCTURE = /((?:const|let|var)\s*\{)([^}]+)(\}\s*=\s*process\.env\b)/g;
 
-    let content = await fsPromises.readFile(filePath, 'utf8');
-    let modified = false;
+function escapeRegex(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
-    for (const key of keysToUppercase) {
-      if (key === key.toUpperCase()) continue;
-      
-      const regex = new RegExp(`((?:process\\.env\\.|os\\.Getenv\\(['"\`]|getenv\\(['"\`]|System\\.getenv\\(['"\`]|Environment\\.GetEnvironmentVariable\\(['"\`]|\\$ENV\\[['"\`]|\\$_ENV\\[['"\`]))(${key})\\b`, 'g');
-      
-      let match;
-      while ((match = regex.exec(content)) !== null) {
-        if (match[2] === key) {
-          modified = true;
-        }
-      }
-      
-      if (modified) {
-         content = content.replace(regex, (m, prefix, k) => {
-           return prefix + k.toUpperCase();
-         });
-      }
-    }
+// One key's reads in one file, upper-cased. Returns the new content and how many reads changed.
+function rewriteKeyIn(content, key) {
+  const upper = key.toUpperCase();
+  const k = escapeRegex(key);
+  let count = 0;
+  let out = content.replace(new RegExp(`(${NAMED_READ_PREFIX}\\s*)(['"\`])${k}\\2`, 'g'), (m, prefix, quote) => {
+    count++;
+    return `${prefix}${quote}${upper}${quote}`;
+  });
+  out = out.replace(new RegExp(`(process\\.env\\.)${k}(?![A-Za-z0-9_$])`, 'g'), (m, prefix) => {
+    count++;
+    return prefix + upper;
+  });
+  // const { db_host } = process.env reads DB_HOST into the same local name: { DB_HOST: db_host }.
+  out = out.replace(DESTRUCTURE, (m, open, body, close) => {
+    const parts = body.split(',').map(part => {
+      const p = part.match(/^(\s*)([A-Za-z_$][\w$]*)([\s\S]*)$/);
+      if (!p || p[2] !== key) return part;
+      count++;
+      return /^\s*:/.test(p[3]) ? `${p[1]}${upper}${p[3]}` : `${p[1]}${upper}: ${key}${p[3]}`;
+    });
+    return open + parts.join(',') + close;
+  });
+  return { content: out, count };
+}
 
-    if (modified && doModify) {
-      await fsPromises.writeFile(filePath, content, 'utf8');
-      modifiedCount++;
-    } else if (modified) {
-      modifiedCount++; // count files that would be modified
-    }
+// Whether a read of the key is left that the rewrite does not cover: a form it does not know, or the
+// name as a string anywhere in the code (os.environ.get('db_host') in a helper, a config map).
+function readLeftBehind(content, key, isCode) {
+  if (ANALYZER_READ(key).test(content)) return true;
+  DESTRUCTURE.lastIndex = 0;
+  for (const m of content.matchAll(DESTRUCTURE)) {
+    if (m[2].split(',').some(part => part.split(':')[0].split('=')[0].trim() === key)) return true;
   }
-  
-  return { modifiedCount };
+  return isCode && new RegExp(`(['"\`])${escapeRegex(key)}\\1`).test(content);
+}
+
+// Upper-cases the backend's reads of these lower-case variables. A key is rewritten only when every
+// read of it can be (test files aside, as they are not deployed); rewrittenKeys says which were.
+// doModify false: the same answer, nothing written.
+async function refactorLowercaseEnvVars(backendDir, keysToUppercase, doModify = false) {
+  const none = { modifiedCount: 0, files: [], rewrittenKeys: [], blockedKeys: [] };
+  const keys = (keysToUppercase || []).filter(k => k && k !== k.toUpperCase());
+  if (!backendDir || keys.length === 0) return none;
+
+  const sources = [];
+  for (const filePath of await walkDir(backendDir)) {
+    if (isTestFile(filePath) || DOC_FILE.test(filePath)) continue;
+    let content;
+    try { content = await fsPromises.readFile(filePath, 'utf8'); } catch (e) { logDebug(e); continue; }
+    sources.push({ filePath, content, isCode: LOWERCASE_REWRITE_EXTENSIONS.has(path.extname(filePath)) });
+  }
+
+  const rewritable = [];
+  const blockedKeys = [];
+  for (const key of keys) {
+    let reads = 0;
+    let blocked = false;
+    for (const src of sources) {
+      if (!src.isCode) {
+        if (readLeftBehind(src.content, key, false)) blocked = true;
+        continue;
+      }
+      const { content, count } = rewriteKeyIn(src.content, key);
+      reads += count;
+      if (readLeftBehind(content, key, true)) blocked = true;
+    }
+    if (blocked) blockedKeys.push(key);
+    else if (reads > 0) rewritable.push(key);
+  }
+
+  const files = [];
+  for (const src of sources) {
+    if (!src.isCode) continue;
+    let content = src.content;
+    for (const key of rewritable) content = rewriteKeyIn(content, key).content;
+    if (content === src.content) continue;
+    if (doModify) await fsPromises.writeFile(src.filePath, content, 'utf8');
+    files.push(src.filePath);
+  }
+
+  return { modifiedCount: files.length, files, rewrittenKeys: rewritable, blockedKeys };
 }
 
 module.exports = {

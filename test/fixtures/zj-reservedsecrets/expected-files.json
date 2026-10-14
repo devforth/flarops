@@ -1,0 +1,33 @@
+{
+  ".github/workflows/deploy.yml": [
+    "!SECRET_ENV_AWS_",
+    "!SECRET_ENV_SSH_",
+    "!SECRET_ENV_REGISTRY_",
+    "!SECRET_ENV_CLOUDFLARE_",
+    "!SECRET_ENV_GITHUB_",
+    "SECRET_ENV_APP_AWS_SECRET_ACCESS_KEY: ${{ secrets.APP_AWS_SECRET_ACCESS_KEY }}",
+    "SECRET_ENV_APP_GITHUB_TOKEN: ${{ secrets.APP_GITHUB_TOKEN }}",
+    "SECRET_ENV_APP_CLOUDFLARE_API_TOKEN: ${{ secrets.APP_CLOUDFLARE_API_TOKEN }}"
+  ],
+  ".github/workflows/pr-capsule.yml": [
+    "!SECRET_ENV_AWS_",
+    "!SECRET_ENV_SSH_",
+    "!SECRET_ENV_REGISTRY_",
+    "!SECRET_ENV_CLOUDFLARE_",
+    "!SECRET_ENV_GITHUB_",
+    "SECRET_ENV_APP_AWS_SECRET_ACCESS_KEY"
+  ],
+  "flarops.yaml": [
+    "AWS_SECRET_ACCESS_KEY: APP_AWS_SECRET_ACCESS_KEY",
+    "SSH_PRIVATE_KEY: APP_SSH_PRIVATE_KEY",
+    "GITHUB_TOKEN: APP_GITHUB_TOKEN",
+    "CLOUDFLARE_API_TOKEN: APP_CLOUDFLARE_API_TOKEN"
+  ],
+  "deploy/.env": [
+    "AWS_SECRET_ACCESS_KEY=\"secrettest\"",
+    "APP_AWS_SECRET_ACCESS_KEY=application-s3-secret-value",
+    "!\nAWS_SECRET_ACCESS_KEY=application-s3-secret-value",
+    "APP_CLOUDFLARE_API_TOKEN=\n",
+    "!${CLOUDFLARE_API_TOKEN}"
+  ]
+}

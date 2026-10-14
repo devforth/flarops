@@ -38,9 +38,25 @@ function parseScalar(raw, lineNo) {
   if (text === 'null' || text === '~') return null;
   if (text === 'true') return true;
   if (text === 'false') return false;
-  if (/^-?\d+$/.test(text)) return parseInt(text, 10);
-  if (/^-?\d*\.\d+$/.test(text)) return parseFloat(text);
+  // A number only when it reads back as written: 812345678901234567, 1.10 or 007 stay text.
+  if (/^-?\d+$/.test(text) || /^-?\d*\.\d+$/.test(text)) {
+    const n = Number(text);
+    return String(n) === text ? n : text;
+  }
   return text;
+}
+
+// A quote opens a quoted scalar only where a value starts: at the start of the line, or after ": ",
+// "- ", "[", "{" or ",". Elsewhere (Bob's app) it is an ordinary character.
+function opensQuote(text, i) {
+  let j = i - 1;
+  while (j >= 0 && /\s/.test(text[j])) j--;
+  if (j < 0) return true;
+  const prev = text[j];
+  if (prev === '[' || prev === '{' || prev === ',') return true;
+  const spaced = j < i - 1;
+  if (prev === ':' && spaced) return true;
+  return prev === '-' && spaced && (j === 0 || /\s/.test(text[j - 1]));
 }
 
 function splitFlow(body, lineNo) {
@@ -51,10 +67,11 @@ function splitFlow(body, lineNo) {
     const c = body[i];
     if (quote) {
       if (c === '\\' && quote === '"') i++;
+      else if (c === "'" && quote === "'" && body[i + 1] === "'") i++;
       else if (c === quote) quote = null;
       continue;
     }
-    if (c === '"' || c === "'") quote = c;
+    if ((c === '"' || c === "'") && opensQuote(body, i)) quote = c;
     else if (c === '[' || c === '{') depth++;
     else if (c === ']' || c === '}') depth--;
     else if (c === ',' && depth === 0) { parts.push(body.slice(start, i)); start = i + 1; }
@@ -99,8 +116,9 @@ function stripComment(line) {
     const c = line[i];
     if (quote) {
       if (c === '\\' && quote === '"') i++;
+      else if (c === "'" && quote === "'" && line[i + 1] === "'") i++;
       else if (c === quote) quote = null;
-    } else if (c === '"' || c === "'") {
+    } else if ((c === '"' || c === "'") && opensQuote(line, i)) {
       quote = c;
     } else if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) {
       return line.slice(0, i);
@@ -154,9 +172,10 @@ function parse(text) {
     return m ? [m[1], m[2]] : [null, text];
   }
 
+  const isItem = (text) => text.startsWith('- ') || text === '-';
+
   function parseBlock(indent) {
-    const isSequence = rows[pos].text.startsWith('- ') || rows[pos].text === '-';
-    return isSequence ? parseSequence(indent) : parseMapping(indent);
+    return isItem(rows[pos].text) ? parseSequence(indent) : parseMapping(indent);
   }
 
   function parseMapping(indent) {
@@ -181,6 +200,9 @@ function parse(text) {
         value = resolveInline(inline, row.lineNo);
       } else if (pos < rows.length && rows[pos].indent > indent) {
         value = parseBlock(rows[pos].indent);
+      } else if (pos < rows.length && rows[pos].indent === indent && isItem(rows[pos].text)) {
+        // A sequence may sit at its key's own indent ("ports:", then "- 4000" right below it).
+        value = parseSequence(indent, { compact: true });
       } else {
         value = null;
       }
@@ -202,11 +224,12 @@ function parse(text) {
     return out;
   }
 
-  function parseSequence(indent) {
+  function parseSequence(indent, { compact = false } = {}) {
     const out = [];
     while (pos < rows.length && rows[pos].indent === indent) {
       const row = rows[pos];
-      if (!row.text.startsWith('- ') && row.text !== '-') {
+      if (!isItem(row.text)) {
+        if (compact) break;
         throw new YamlError('a "key: value" where a sequence item was expected', row.lineNo);
       }
       const [seqAnchor, inline] = takeAnchor(row.text === '-' ? '' : row.text.slice(2).trim());

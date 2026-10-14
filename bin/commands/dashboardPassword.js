@@ -1,8 +1,7 @@
 // `flarops dashboard-password`: replace a lost dashboard password without regenerating anything.
 
-const fs = require('fs');
 const path = require('path');
-const { EnvFile } = require('../../utils/envFile.js');
+const { safeReadFile, safeWriteFile, SymlinkError } = require('../../utils/safeWrite.js');
 const { readState } = require('../../utils/state.js');
 const { newDashboardPassword, printDashboardLogin } = require('../../utils/dashboardAccess.js');
 const { enterProjectRoot } = require('../../utils/projectRoot.js');
@@ -16,17 +15,22 @@ module.exports = async function dashboardPassword() {
   let state = null;
   try { state = readState(currentDir); } catch (e) { /* the domain is only shown */ }
 
-  const envIO = new EnvFile(fs, path.join(currentDir, 'deploy', '.env'));
+  // deploy/.env holds the secrets: never read or written through a link, and 0600 from the first byte.
+  const envRel = path.join('deploy', '.env');
   const { password, hash } = newDashboardPassword();
   const line = `DASHBOARD_PASSWORD_HASH='${hash}'`;
-  if (envIO.has('DASHBOARD_PASSWORD_HASH')) {
-    const current = envIO.read();
-    fs.writeFileSync(envIO.path, current.replace(/^DASHBOARD_PASSWORD_HASH=.*$/m, () => line));
-  } else {
-    fs.mkdirSync(path.dirname(envIO.path), { recursive: true });
-    envIO.append(`${envIO.read() && !envIO.read().endsWith('\n') ? '\n' : ''}${line}\n`);
+  try {
+    const current = safeReadFile(currentDir, envRel) || '';
+    const content = /^DASHBOARD_PASSWORD_HASH=.*$/m.test(current)
+      ? current.replace(/^DASHBOARD_PASSWORD_HASH=.*$/m, () => line)
+      : `${current}${current && !current.endsWith('\n') ? '\n' : ''}${line}\n`;
+    safeWriteFile(currentDir, envRel, content, { mode: 0o600 });
+  } catch (e) {
+    if (!(e instanceof SymlinkError)) throw e;
+    console.error(`\x1b[31mERROR: ${e.message}\x1b[0m`);
+    console.error('Nothing was written.');
+    process.exit(1);
   }
-  try { fs.chmodSync(envIO.path, 0o600); } catch (e) { /* best effort */ }
 
-  printDashboardLogin({ password, domain: state && state.domain, reset: true });
+  printDashboardLogin({ password, domain: state && state.domain, reset: true, tls: !!(state && state.hasCloudflare) });
 };

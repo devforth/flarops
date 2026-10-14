@@ -1,6 +1,7 @@
 // Everything `flarops init` asks the operator, in one place (stubbed by test/harness.js).
 
 const path = require('path');
+const { dashboardHost, prHost } = require('../../utils/dashboardAccess.js');
 const { splitRegistry, REGISTRY_HOST, IMAGE_PATH } = require('../../utils/registry.js');
 // Enter accepts. The one [y/N] prompt (reusing an existing state bucket) lives in utils/awsHelper.js.
 // At least two labels, each 1-63 letters, digits or hyphens, not starting or ending with a hyphen.
@@ -17,9 +18,10 @@ module.exports = async function collectOperatorAnswers({
   currentDir, askQuestion, askPassword, execFileSync,
   ensureAwsCli, handleS3Bucket, getDefaultAWSCredentials, checkAwsAccess,
 }) {
-  // Names "<project>-production" and "<project>-pr-<n>" must stay within Kubernetes' 63 characters.
+  // Names "<project>-production", "<project>-pr-<n>" and the worker hostname
+  // "<project>-instance-worker-<slot>" must stay within the 63 characters of a DNS label.
   let projectName = path.basename(currentDir).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
-    .slice(0, 50).replace(/-+$/, '');
+    .slice(0, 45).replace(/-+$/, '');
   if (!projectName) projectName = 'flarops-project';
   console.log(`Project name: ${projectName} (from this directory's name). It names the image`);
   console.log(`repository, the namespaces (${projectName}-production, ${projectName}-pr-<N>) and the state bucket.`);
@@ -94,12 +96,9 @@ module.exports = async function collectOperatorAnswers({
     console.log(domain ? `"${domain}" is not a domain name - expected something like app.example.com` : 'domain is required');
   }
   {
-    const parts = domain.split('.');
-    const parent = parts.length > 2 ? parts.slice(1).join('.') : domain;
-    const prHost = parts.length > 2 ? `${parts[0]}-pr-<N>.${parent}` : `pr-<N>.${domain}`;
-    console.log(`  application:      https://${domain}`);
-    console.log(`  dashboard:        https://dashboard.${parent}`);
-    console.log(`  PR environments:  https://${prHost}`);
+    console.log(`  application:      ${domain}`);
+    console.log(`  dashboard:        ${dashboardHost(domain)}`);
+    console.log(`  PR environments:  ${prHost(domain, '<N>')}`);
     console.log('');
   }
 
@@ -161,11 +160,13 @@ module.exports = async function collectOperatorAnswers({
   const bucketResult = await handleS3Bucket(awsCmd, defaultBucketName, awsCredentials, askQuestion, awsRegion);
   const remoteStateBucket = bucketResult.bucket;
   let s3BucketWarning = bucketResult.warning;
+  // Created by init once every question is answered.
+  const createRemoteStateBucket = !!bucketResult.create;
 
   return {
     projectName, dockerRegistry, dockerProject, dockerRepository: projectName, registryUser, registryPassword,
     domain, cloudflareApiToken, cloudflareZoneId,
-    awsCredentials, awsRegion, remoteStateBucket, s3BucketWarning,
+    awsCredentials, awsCmd, awsRegion, remoteStateBucket, createRemoteStateBucket, s3BucketWarning,
   };
 };
 

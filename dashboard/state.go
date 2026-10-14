@@ -19,7 +19,6 @@ type CapsuleState struct {
 	UpMin     int              `json:"upMin"`
 	Ram       int              `json:"ram"`
 	Cpu       int              `json:"cpu"`
-	Swap      int              `json:"swap"`
 	Status    string           `json:"status"`
 	StatusSec int              `json:"statusSec"`
 	RateH     float64          `json:"rateH"`

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,17 +16,85 @@ import (
 // Over 300 MB, decoded while streaming; the timeout covers the whole download.
 var pricingHTTPClient = &http.Client{Timeout: 10 * time.Minute}
 
-const maxPriceFeedBytes = 2 << 30
+// The feed is read one instance type at a time, so memory is bounded by the per-entry limit, not the
+// total; the total only bounds the download.
+const (
+	maxPriceFeedBytes     = 1 << 30
+	maxPriceEntryBytes    = 16 << 20
+	maxPriceEntries       = 20000
+	maxPriceRegions       = 256
+	maxInstanceTypeLength = 64
+	maxRegionLength       = 32
+)
 
 var priceFeedURL = "https://instances.vantage.sh/instances.json"
 
 type VantageInstance struct {
-	InstanceType string `json:"instance_type"`
-	Pricing      map[string]struct {
-		Linux struct {
-			OnDemand string `json:"ondemand"`
-		} `json:"linux"`
-	} `json:"pricing"`
+	InstanceType string       `json:"instance_type"`
+	Pricing      regionPrices `json:"pricing"`
+}
+
+// Region -> on-demand Linux price; regions without a parsable one are left out.
+type regionPrices map[string]float64
+
+func (rp *regionPrices) UnmarshalJSON(b []byte) error {
+	out := regionPrices{}
+	*rp = out
+	if string(b) == "null" {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return errors.New("pricing is not an object")
+	}
+	seen := 0
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		region, _ := t.(string)
+		if seen++; seen > maxPriceRegions {
+			return fmt.Errorf("more than %d regions", maxPriceRegions)
+		}
+		if len(region) > maxRegionLength {
+			return fmt.Errorf("region name of %d bytes", len(region))
+		}
+		var osTypes struct {
+			Linux struct {
+				OnDemand string `json:"ondemand"`
+			} `json:"linux"`
+		}
+		if err := dec.Decode(&osTypes); err != nil {
+			return err
+		}
+		if price, err := strconv.ParseFloat(osTypes.Linux.OnDemand, 64); err == nil {
+			out[region] = price
+		}
+	}
+	return nil
+}
+
+var errPriceEntryTooLarge = fmt.Errorf("an entry over %d bytes", maxPriceEntryBytes)
+
+// Lets the decoder hold at most `limit` bytes past what it has consumed: one huge entry fails instead
+// of being buffered whole.
+type entryBudgetReader struct {
+	r     io.Reader
+	read  int64
+	limit int64
+}
+
+func (b *entryBudgetReader) Read(p []byte) (int, error) {
+	if b.read >= b.limit {
+		return 0, errPriceEntryTooLarge
+	}
+	if room := b.limit - b.read; int64(len(p)) > room {
+		p = p[:room]
+	}
+	n, err := b.r.Read(p)
+	b.read += int64(n)
+	return n, err
 }
 
 var (
@@ -43,30 +113,9 @@ func fetchAWSPrices() error {
 		return fmt.Errorf("fetching AWS prices: HTTP %d", resp.StatusCode)
 	}
 
-	dec := json.NewDecoder(io.LimitReader(resp.Body, maxPriceFeedBytes))
-	if _, err := dec.Token(); err != nil {
-		return fmt.Errorf("reading AWS price feed: %w", err)
-	}
-
-	newPrices := make(map[string]map[string]float64)
-	for dec.More() {
-		var inst VantageInstance
-		if err := dec.Decode(&inst); err != nil {
-			return fmt.Errorf("decoding AWS price feed after %d instance types: %w", len(newPrices), err)
-		}
-		regionMap := make(map[string]float64)
-		for region, osTypes := range inst.Pricing {
-			if price, err := strconv.ParseFloat(osTypes.Linux.OnDemand, 64); err == nil {
-				regionMap[region] = price
-			}
-		}
-		newPrices[inst.InstanceType] = regionMap
-	}
-	if _, err := dec.Token(); err != nil {
-		return fmt.Errorf("reading AWS price feed end: %w", err)
-	}
-	if len(newPrices) == 0 {
-		return fmt.Errorf("AWS price feed contained no instance types")
+	newPrices, err := decodePriceFeed(resp.Body)
+	if err != nil {
+		return err
 	}
 
 	awsPricesMutex.Lock()
@@ -74,6 +123,39 @@ func fetchAWSPrices() error {
 	awsPricesMutex.Unlock()
 	log.Printf("Updated AWS EC2 prices from vantage.sh (%d instance types)", len(newPrices))
 	return nil
+}
+
+func decodePriceFeed(body io.Reader) (map[string]map[string]float64, error) {
+	budget := &entryBudgetReader{r: io.LimitReader(body, maxPriceFeedBytes), limit: maxPriceEntryBytes}
+	dec := json.NewDecoder(budget)
+	if _, err := dec.Token(); err != nil {
+		return nil, fmt.Errorf("reading AWS price feed: %w", err)
+	}
+
+	newPrices := make(map[string]map[string]float64)
+	entries := 0
+	for dec.More() {
+		if entries++; entries > maxPriceEntries {
+			return nil, fmt.Errorf("AWS price feed lists more than %d instance types", maxPriceEntries)
+		}
+		budget.limit = dec.InputOffset() + maxPriceEntryBytes
+		var inst VantageInstance
+		if err := dec.Decode(&inst); err != nil {
+			return nil, fmt.Errorf("decoding AWS price feed after %d instance types: %w", len(newPrices), err)
+		}
+		if len(inst.InstanceType) > maxInstanceTypeLength {
+			return nil, fmt.Errorf("AWS price feed has an instance type name of %d bytes", len(inst.InstanceType))
+		}
+		newPrices[inst.InstanceType] = inst.Pricing
+	}
+	budget.limit = dec.InputOffset() + maxPriceEntryBytes
+	if _, err := dec.Token(); err != nil {
+		return nil, fmt.Errorf("reading AWS price feed end: %w", err)
+	}
+	if len(newPrices) == 0 {
+		return nil, fmt.Errorf("AWS price feed contained no instance types")
+	}
+	return newPrices, nil
 }
 
 // Retry delays after a failed fetch.

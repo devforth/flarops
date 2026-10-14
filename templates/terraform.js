@@ -1,8 +1,21 @@
 // Generates deploy/terraform/{main.tf,variables.tf}.
 
 const fs = require('fs');
+const crypto = require('crypto');
 const { TERRAFORM_REQUIRED } = require('../utils/toolVersions.js');
+const { MULTI_LABEL_SUFFIXES } = require('../utils/dashboardAccess.js');
 const path = require('path');
+
+// A worker's hostname, and so its node name, is "<instance_name>-worker-<slot>": with slots up to 999
+// that stays within the 63 characters of a DNS label only while instance_name is 52 or shorter.
+const MAX_INSTANCE_NAME = 52;
+
+function instanceNameFor(projectName) {
+  const name = `${projectName}-instance`;
+  if (name.length <= MAX_INSTANCE_NAME) return name;
+  const hash = crypto.createHash('sha1').update(String(projectName)).digest('hex').slice(0, 6);
+  return `${String(projectName).slice(0, MAX_INSTANCE_NAME - hash.length - 1).replace(/-+$/, '')}-${hash}`;
+}
 
 // Escapes a value for a double-quoted HCL string, including HCL's own ${ and %{.
 function hclEscapeString(s) {
@@ -234,8 +247,8 @@ ${installerDownload}
 
   lifecycle {
     # Changes to the AMI or to user_data reach only new instances; replace this
-    # one deliberately (terraform apply -replace=...) to apply them here. The
-    # cluster's data lives on its root volume.
+    # one deliberately to apply them here (terraform workspace select main, then
+    # terraform apply -replace=...). The cluster's data lives on its root volume.
     ignore_changes = [ami, user_data]
   }
 }
@@ -306,13 +319,14 @@ ${installerDownload}
 
   lifecycle {
     # Changes to the AMI or to user_data reach only new instances; replace this
-    # one deliberately (terraform apply -replace=...) to apply them here. The
-    # cluster's data lives on its root volume.
+    # one deliberately to apply them here (terraform workspace select main, then
+    # terraform apply -replace=...). The cluster's data lives on its root volume.
     ignore_changes = [ami, user_data]
   }
 }
 `;
 
+  const hclSuffixList = `[${MULTI_LABEL_SUFFIXES.map(x => `"${x}"`).join(', ')}]`;
   const cloudflareResourceBlock = cloudflareApiToken && cloudflareZoneId ? `
 resource "cloudflare_record" "domain" {
   count   = var.cloudflare_zone_id != "" ? 1 : 0
@@ -332,7 +346,8 @@ data "cloudflare_zone" "zone" {
 
 locals {
   domain_labels = split(".", var.domain)
-  domain_parent = length(local.domain_labels) > 2 ? join(".", slice(local.domain_labels, 1, length(local.domain_labels))) : var.domain
+  domain_rest   = join(".", slice(local.domain_labels, 1, length(local.domain_labels)))
+  domain_parent = length(local.domain_labels) > 2 && !contains(${hclSuffixList}, local.domain_rest) ? local.domain_rest : var.domain
 }
 
 resource "cloudflare_record" "parent_wildcard" {
@@ -407,7 +422,12 @@ variable "cloudflare_zone_id" {
 variable "instance_name" {
   description = "Name tag for the EC2 instance"
   type        = string
-  default     = "${projectName}-instance"
+  default     = "${instanceNameFor(projectName)}"
+
+  validation {
+    condition     = length(var.instance_name) <= ${MAX_INSTANCE_NAME}
+    error_message = "instance_name must be at most ${MAX_INSTANCE_NAME} characters: worker hostnames add -worker-<slot> and must fit in 63."
+  }
 }
 
 # Worker nodes, by slot number. The PR-capsule workflow adds and removes them;
@@ -425,7 +445,8 @@ variable "instance_type" {
 }
 
 # Read by the server and every worker. A change applies to NEW nodes only -
-# replace an existing one (terraform apply -replace=...) to upgrade it.
+# replace an existing one (terraform workspace select main, then
+# terraform apply -replace=...) to upgrade it.
 variable "k3s_version" {
   description = "k3s version installed on every node (see https://github.com/k3s-io/k3s/releases)"
   type        = string
@@ -476,3 +497,4 @@ variable "domain" {
 };
 
 module.exports.hclEscapeString = hclEscapeString;
+module.exports.instanceNameFor = instanceNameFor;

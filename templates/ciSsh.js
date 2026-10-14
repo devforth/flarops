@@ -105,6 +105,45 @@ flarops_slots_unlock() {
 }`, indent);
 }
 
+// A node chosen for a capsule is empty until its pods are scheduled: the worker just added for it
+// for many minutes. Placement marks the node (a key "<node>__<env>" in the flarops-placing ConfigMap,
+// written under the slot lock, cleared after converge) and reclaim leaves marked nodes alone. A mark
+// outlives a failed or cancelled run by at most PLACING_MARK_MINUTES. Uses the runner's kubeconfig.
+const PLACING_MARK_MINUTES = 60;
+
+function placementMarks(indent = '          ') {
+  const ttl = PLACING_MARK_MINUTES * 60;
+  return indentBlock(`flarops_node_state() {
+  if FLAROPS_NODE_ERR=$(kubectl get node "$1" -o name 2>&1); then echo present
+  elif printf '%s' "$FLAROPS_NODE_ERR" | grep -q NotFound; then echo missing
+  else echo "$FLAROPS_NODE_ERR" >&2; echo unknown; fi
+}
+
+flarops_mark_placing() {
+  kubectl create configmap flarops-placing -n default > /dev/null 2>&1 || true
+  kubectl patch configmap flarops-placing -n default --type merge -p "{\\"data\\":{\\"$1__$PR_ENV_NAME\\":\\"$PR_ENV_NAME@$(date +%s)\\"}}" > /dev/null
+  echo "Marked $1 as taken by $PR_ENV_NAME until its pods are scheduled."
+}
+
+flarops_read_placing() {
+  if FLAROPS_MARKS=$(kubectl get configmap flarops-placing -n default -o json 2>/tmp/placing.err); then return 0; fi
+  if grep -q NotFound /tmp/placing.err; then FLAROPS_MARKS='{}'; return 0; fi
+  cat /tmp/placing.err
+  return 1
+}
+
+flarops_prune_placing() {
+  FLAROPS_DROP=$(FLAROPS_MARKS="$FLAROPS_MARKS" PR_ENV_NAME="$PR_ENV_NAME" python3 -c "import json,os,time; d=json.loads(os.environ['FLAROPS_MARKS']).get('data') or {}; t=lambda v: v.rsplit('@',1)[-1]; drop={k: None for k,v in d.items() if v.rsplit('@',1)[0] == os.environ['PR_ENV_NAME'] or not t(v).isdigit() or time.time()-int(t(v)) >= ${ttl}}; print(json.dumps({'data': drop}) if drop else '')")
+  if [ -n "$FLAROPS_DROP" ]; then
+    kubectl patch configmap flarops-placing -n default --type merge -p "$FLAROPS_DROP" > /dev/null || true
+  fi
+}
+
+flarops_placing_on() {
+  FLAROPS_MARKS="$FLAROPS_MARKS" PR_ENV_NAME="$PR_ENV_NAME" NODE="$1" python3 -c "import json,os,time; d=json.loads(os.environ['FLAROPS_MARKS']).get('data') or {}; p=os.environ['NODE']+'__'; t=lambda v: v.rsplit('@',1)[-1]; print(' '.join(v.rsplit('@',1)[0] for k,v in d.items() if k.startswith(p) and v.rsplit('@',1)[0] != os.environ['PR_ENV_NAME'] and t(v).isdigit() and time.time()-int(t(v)) < ${ttl}))"
+}`, indent);
+}
+
 function fetchKubeconfig(indent = '          ') {
   return helpers(indent) + '\n' + indentBlock(`
 flarops_wait_for_k3s "$EC2_IP"
@@ -117,4 +156,4 @@ sed -i "s/127.0.0.1/$EC2_IP/g" ~/.kube/config
 test -s ~/.kube/config`, indent);
 }
 
-module.exports = { SSH_OPTS, helpers, fetchKubeconfig, slotLock };
+module.exports = { SSH_OPTS, helpers, fetchKubeconfig, slotLock, placementMarks };

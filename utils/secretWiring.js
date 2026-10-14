@@ -51,7 +51,8 @@ function mountedSecretKeys(config) {
     addAll(config.frontendSecretKeys);
     addMappings(config.frontendExtraSecretEnvMappings);
   }
-  if (config.hasDbPassword) add(config.dbPasswordKey);
+  // The database reads its password, and the api may have it in a block of its own.
+  if (config.hasDb || (config.hasBackend && (config.apiDbPassword ?? config.hasDbPassword))) add(config.dbPasswordKey);
 
   for (const service of config.additionalServices || []) {
     addAll(service.secretKeys);

@@ -1,9 +1,8 @@
 const { prEstimateMiB } = require('../utils/prEstimate.js');
+const { dashboardHost, hostParent } = require('../utils/dashboardAccess.js');
 
 module.exports = function dashboardYamlTemplate(config) {
-  const domainParts = config.domain.split('.');
-  const baseDomain = domainParts.length > 2 ? domainParts.slice(1).join('.') : config.domain;
-  const dashboardDomain = `dashboard.${baseDomain}`;
+  const dashboardDomain = dashboardHost(config.domain);
 
   return `{{- if eq .Values.werf.env "production" }}
 ---
@@ -194,6 +193,8 @@ spec:
           value: {{ .Values.aws.volumeSize | default "" | quote }}
         - name: FLAROPS_PROJECT
           value: {{ .Values.projectName | quote }}
+        - name: FLAROPS_HOST_PARENT
+          value: "${hostParent(config.domain)}"
         - name: FLAROPS_PR_ESTIMATE_MIB
           value: "${prEstimateMiB(config)}"
         ports:

@@ -6,18 +6,20 @@ const { execSync, execFileSync } = require('child_process');
 
 // Credentials already on this machine, as the AWS CLI finds them: AWS_ACCESS_KEY_ID and
 // AWS_SECRET_ACCESS_KEY in the environment, else the AWS_PROFILE (or default) profile in
-// ~/.aws/credentials. Session credentials are skipped: they expire, and these go into GitHub Secrets.
+// ~/.aws/credentials. Session credentials are skipped, in either place: they expire, and work only
+// with their token, which is not what goes into GitHub Secrets.
 function getDefaultAWSCredentials(env = process.env) {
   if (env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY && !env.AWS_SESSION_TOKEN) {
     return { accessKey: env.AWS_ACCESS_KEY_ID, secretKey: env.AWS_SECRET_ACCESS_KEY, source: 'AWS_ACCESS_KEY_ID in the environment' };
   }
   const profile = env.AWS_PROFILE || 'default';
   try {
-    const credPath = path.join(os.homedir(), '.aws', 'credentials');
+    const credPath = path.join(env.HOME || os.homedir(), '.aws', 'credentials');
     if (!fs.existsSync(credPath)) return null;
     let inProfile = false;
     let accessKey = '';
     let secretKey = '';
+    let sessionToken = '';
     for (const line of fs.readFileSync(credPath, 'utf8').split('\n')) {
       const trimmed = line.trim();
       if (trimmed.startsWith('[')) {
@@ -28,10 +30,24 @@ function getDefaultAWSCredentials(env = process.env) {
       const [k, ...v] = trimmed.split('=');
       if (k.trim() === 'aws_access_key_id') accessKey = v.join('=').trim();
       else if (k.trim() === 'aws_secret_access_key') secretKey = v.join('=').trim();
+      else if (k.trim() === 'aws_session_token' || k.trim() === 'aws_security_token') sessionToken = v.join('=').trim();
     }
-    if (accessKey && secretKey) return { accessKey, secretKey, source: `the "${profile}" profile in ~/.aws/credentials` };
+    if (accessKey && secretKey && !sessionToken) return { accessKey, secretKey, source: `the "${profile}" profile in ~/.aws/credentials` };
   } catch (err) { /* unreadable: as if absent */ }
   return null;
+}
+
+// What the AWS CLI is given from the environment: the credentials, and what it needs to reach AWS
+// from behind a proxy.
+const PASSED_THROUGH = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'AWS_CA_BUNDLE'];
+function awsEnv(credentials, env = process.env) {
+  const out = { PATH: env.PATH, HOME: env.HOME, AWS_ACCESS_KEY_ID: credentials.accessKey, AWS_SECRET_ACCESS_KEY: credentials.secretKey };
+  for (const name of PASSED_THROUGH) {
+    for (const spelling of [name, name.toLowerCase()]) {
+      if (env[spelling] !== undefined) out[spelling] = env[spelling];
+    }
+  }
+  return out;
 }
 
 const REGION = /^[a-z]{2}(-gov|-iso[a-z]*)?-[a-z]+-\d$/;
@@ -40,7 +56,7 @@ const REGION = /^[a-z]{2}(-gov|-iso[a-z]*)?-[a-z]+-\d$/;
 // exist are both found here, before any question that depends on them.
 function checkAwsAccess(awsCmd, credentials, region) {
   if (!REGION.test(region)) return { ok: false, region: true, message: `"${region}" is not an AWS region - expected something like us-west-2 or eu-central-1` };
-  const env = { PATH: process.env.PATH, HOME: process.env.HOME, AWS_ACCESS_KEY_ID: credentials.accessKey, AWS_SECRET_ACCESS_KEY: credentials.secretKey };
+  const env = awsEnv(credentials);
   try {
     const out = execFileSync(awsCmd, ['sts', 'get-caller-identity', '--region', region, '--output', 'json'], { env, stdio: 'pipe' }).toString();
     let account = '';
@@ -307,11 +323,20 @@ function hardenStateBucket(awsCmd, bucket, env) {
   }
 }
 
+function createBucketArgs(bucket, region) {
+  // us-east-1 rejects an explicit LocationConstraint.
+  const args = ['s3api', 'create-bucket', '--bucket', bucket, '--region', region];
+  if (region !== 'us-east-1') args.push('--create-bucket-configuration', `LocationConstraint=${region}`);
+  return args;
+}
+
+// Decides the state bucket: an existing one the operator accepts, or a free name to create. Nothing is
+// created here - init asks every question first, and createStateBucket creates it afterwards.
 function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = 'us-west-2') {
   const sanitized = sanitizeBucketName(bucketName);
 
   // Pass the CLI only what it needs from the environment.
-  const env = { PATH: process.env.PATH, HOME: process.env.HOME, AWS_ACCESS_KEY_ID: credentials.accessKey, AWS_SECRET_ACCESS_KEY: credentials.secretKey };
+  const env = awsEnv(credentials);
 
   // HeadBucket answers a wrong key and a bucket owned by another account with the same bare 403,
   // so the credentials are checked once via STS first.
@@ -337,7 +362,7 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
         console.log('  the cluster token, and two projects at one key overwrite each other.');
         const answer = await askQuestion(`Use "${currentBucket}"? [y/N] `);
         if (answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes') {
-          resolve({ bucket: currentBucket, warning: null });
+          resolve({ bucket: currentBucket, warning: null, create: false });
           return;
         } else {
           currentBucket = await askBucketName(askQuestion);
@@ -352,22 +377,9 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
           console.warn(`\x1b[33mBucket name "${currentBucket}" is already taken by another AWS account. S3 bucket names are global - choose a different one.\x1b[0m`);
           currentBucket = await askBucketName(askQuestion);
         } else if (stderr.includes('404') || stderr.includes('Not Found')) {
-          try {
-            console.log(`Creating S3 bucket: ${currentBucket} in ${region}...`);
-            // us-east-1 rejects an explicit LocationConstraint.
-            const createArgs = ['s3api', 'create-bucket', '--bucket', currentBucket, '--region', region];
-            if (region !== 'us-east-1') {
-              createArgs.push('--create-bucket-configuration', `LocationConstraint=${region}`);
-            }
-            execFileSync(awsCmd, createArgs, { env, stdio: 'pipe' });
-            hardenStateBucket(awsCmd, currentBucket, env);
-            resolve({ bucket: currentBucket, warning: null });
-            return;
-          } catch (createErr) {
-            console.error(`Failed to create bucket ${currentBucket}.`);
-            console.error(createErr.stderr ? createErr.stderr.toString() : createErr.message);
-            currentBucket = await askBucketName(askQuestion);
-          }
+          console.log(`The S3 bucket "${currentBucket}" for the Terraform state is free; it is created once every question is answered.`);
+          resolve({ bucket: currentBucket, warning: null, create: true });
+          return;
         } else {
           console.error(`Error checking bucket: ${stderr}`);
           currentBucket = await askBucketName(askQuestion);
@@ -377,9 +389,32 @@ function handleS3Bucket(awsCmd, bucketName, credentials, askQuestion, region = '
   });
 }
 
+// Creates the bucket handleS3Bucket decided on and returns its name - or another one the operator
+// gives, when this one cannot be created.
+async function createStateBucket(awsCmd, bucket, credentials, askQuestion, region = 'us-west-2') {
+  const env = awsEnv(credentials);
+  let currentBucket = bucket;
+  while (true) {
+    try {
+      console.log(`Creating S3 bucket: ${currentBucket} in ${region}...`);
+      execFileSync(awsCmd, createBucketArgs(currentBucket, region), { env, stdio: 'pipe' });
+      hardenStateBucket(awsCmd, currentBucket, env);
+      return currentBucket;
+    } catch (createErr) {
+      console.error(`Failed to create bucket ${currentBucket}.`);
+      console.error(createErr.stderr ? createErr.stderr.toString() : createErr.message);
+      const next = await handleS3Bucket(awsCmd, await askBucketName(askQuestion), credentials, askQuestion, region);
+      if (!next.create) return next.bucket;
+      currentBucket = next.bucket;
+    }
+  }
+}
+
 module.exports = {
   getDefaultAWSCredentials,
   checkAwsAccess,
   ensureAwsCli,
-  handleS3Bucket
+  handleS3Bucket,
+  createStateBucket,
+  awsEnv,
 };

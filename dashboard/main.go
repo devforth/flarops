@@ -106,35 +106,43 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	go func() {
-		ping := time.NewTicker(30 * time.Second)
-		defer func() {
-			ping.Stop()
-			conn.Close()
-		}()
-		for {
-			select {
-			case <-ping.C:
-				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					return
-				}
-			case message, ok := <-client.send:
-				if !ok {
-					conn.WriteMessage(websocket.CloseMessage, []byte{})
-					return
-				}
-				w, err := conn.NextWriter(websocket.TextMessage)
-				if err != nil {
-					return
-				}
-				w.Write(message)
-				if err := w.Close(); err != nil {
-					return
-				}
+	go writePump(conn, client.send, 30*time.Second)
+}
+
+// How long one write may take before the client counts as gone.
+var wsWriteWait = 10 * time.Second
+
+// Every write sets its own deadline: a deadline is absolute, so one set for a ping would otherwise
+// expire under the data frames that follow it.
+func writePump(conn *websocket.Conn, send <-chan []byte, pingEvery time.Duration) {
+	ping := time.NewTicker(pingEvery)
+	defer func() {
+		ping.Stop()
+		conn.Close()
+	}()
+	for {
+		select {
+		case <-ping.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		case message, ok := <-send:
+			_ = conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if !ok {
+				conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			w, err := conn.NextWriter(websocket.TextMessage)
+			if err != nil {
+				return
+			}
+			w.Write(message)
+			if err := w.Close(); err != nil {
+				return
 			}
 		}
-	}()
+	}
 }
 
 func main() {

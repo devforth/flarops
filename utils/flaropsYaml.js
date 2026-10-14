@@ -226,6 +226,16 @@ const TEMPLATE_COMMENT = `
 # allowed: secret, dashboard, registry-secret, flarops-..., and words YAML
 # reads as something else (null, true, false, yes, no, on, off, y, n).
 #
+# --- repositorySettings ------------------------------------------------------
+#
+# registry:   the registry host the images are pushed to (no path).
+# project:    the namespace inside it, or null.
+# repository: the repository name.
+# user:       optional - the login CI pushes as (REGISTRY_USER in the
+#             workflows); init's answer when left out. The password is the
+#             REGISTRY_PASSWORD GitHub secret: when registry, project or user
+#             changes, update that secret so it belongs to this login.
+#
 # --- The special blocks ------------------------------------------------------
 #
 # api:        the backend; the Ingress routes its exposedRoutes to it.

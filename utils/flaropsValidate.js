@@ -183,8 +183,11 @@ function checkVolumes(where, volumes) {
       if (seen.has(key)) fail(`${where}[${i}].name`, `"${v.name}" is the same claim as another volume of this service - rename one`);
       seen.add(key);
     }
-    if (!v || typeof v !== 'object') return; // shape errors are reported by the parser in sync
+    if (!v || typeof v !== 'object' || Array.isArray(v)) {
+      fail(`${where}[${i}]`, `must be a block with name and path ("- name: data", then "path: /data" below it), not ${JSON.stringify(v)}`);
+    }
     checkKeys(`${where}[${i}]`, v, ['name', 'path', 'size']);
+    if (!v.name || !v.path) fail(`${where}[${i}]`, 'needs both a name and a path');
     // claimNameFor sanitizes the name; refuse only what would break the line.
     if (v.name !== undefined && !VOLUME_NAME.test(String(v.name))) fail(`${where}[${i}].name`, 'must be letters, digits, "-", "_" or "."');
     if (v.path !== undefined && !URL_PATH.test(String(v.path))) fail(`${where}[${i}].path`, 'must be an absolute path inside the container, without spaces, quotes or braces');
@@ -292,8 +295,13 @@ function validateDeclarations(declared) {
     if (kind === 'support' && !decl.image) {
       fail(name, 'needs either image (a pre-built image) or dockerfile and context (built from this repository)');
     }
-    if (kind === 'api' && has(decl, 'ports') && asList(decl.ports).length === 0) {
+    if ((kind === 'api' || kind === 'frontend') && has(decl, 'ports') && asList(decl.ports).length === 0) {
       fail(`${name}.ports`, 'needs at least one port - the Ingress routes to the first');
+    }
+    // The probes go to healthPort, or else the first port.
+    const noPorts = has(decl, 'ports') && asList(decl.ports).length === 0;
+    if (noPorts && decl.healthRoute !== null && decl.healthRoute !== undefined && (decl.healthPort === null || decl.healthPort === undefined)) {
+      fail(`${name}.healthRoute`, 'needs a port to probe - list one under ports, or set healthPort');
     }
     checkCommon(name, decl);
     checkDatabase(`${name}.db`, decl.db, { requireTypeAndPassword: true });
@@ -340,15 +348,21 @@ function validateSyncLock(block) {
   }
 }
 
-const REPOSITORY_FIELDS = ['registry', 'project', 'repository'];
+const REPOSITORY_FIELDS = ['registry', 'project', 'repository', 'user'];
+// A registry login as the workflows write it, unquoted: a Docker Hub user, an e-mail, or a Harbor
+// robot account (robot$project+ci) - nothing that ends the YAML value or opens a ${{ }} expression.
+const REGISTRY_USER = /^[A-Za-z0-9][A-Za-z0-9._@+$-]*$/;
 
-// The repositorySettings block: registry host, optional project, repository name.
+// The repositorySettings block: registry host, optional project, repository name, optional user.
 function validateRepositorySettings(block) {
   if (block === null || typeof block !== 'object' || Array.isArray(block)) {
     fail('repositorySettings', 'must be a block with registry, project and repository');
   }
   for (const key of Object.keys(block)) {
-    if (!REPOSITORY_FIELDS.includes(key)) fail(`repositorySettings.${key}`, 'is not a setting - use registry, project or repository');
+    if (!REPOSITORY_FIELDS.includes(key)) fail(`repositorySettings.${key}`, 'is not a setting - use registry, project, repository or user');
+  }
+  if (block.user !== undefined && (block.user === null || !REGISTRY_USER.test(String(block.user)) || String(block.user).length > 255)) {
+    fail('repositorySettings.user', `must be the registry login (letters, digits, ".", "_", "@", "+", "$" and "-"), not ${JSON.stringify(block.user)}`);
   }
   if (block.registry !== undefined && !REGISTRY_HOST.test(String(block.registry))) {
     fail('repositorySettings.registry', `must be a registry host such as docker.io or harbor.example.com (no path), not ${JSON.stringify(block.registry)}`);

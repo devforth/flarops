@@ -3,6 +3,9 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { safeWriteFile } = require('./safeWrite.js');
+const { shippedDashboardFiles } = require('./dashboardFiles.js');
 
 const STATE_FILE = path.join('deploy', '.flarops-state.json');
 
@@ -24,7 +27,15 @@ function statePath(currentDir) {
 function writeState(currentDir, config) {
   const state = serializable(config);
   for (const service of state.additionalServices || []) delete service.path;
-  fs.writeFileSync(statePath(currentDir), JSON.stringify(state, null, 2) + '\n');
+  // The dashboard files this version ships, so a later sync removes only those a newer one drops.
+  if (state.dashboardFiles === undefined) state.dashboardFiles = shippedDashboardFiles();
+  safeWriteFile(currentDir, STATE_FILE, JSON.stringify(state, null, 2) + '\n');
+}
+
+// What a generated file held when sync last rendered it; line endings are not a difference.
+function contentHash(content) {
+  const text = Buffer.isBuffer(content) ? content : Buffer.from(String(content).replace(/\r\n/g, '\n'), 'utf8');
+  return crypto.createHash('sha256').update(text).digest('hex');
 }
 
 function readState(currentDir) {
@@ -44,4 +55,4 @@ function readState(currentDir) {
   }
 }
 
-module.exports = { writeState, readState, statePath, STATE_FILE };
+module.exports = { writeState, readState, statePath, contentHash, STATE_FILE };

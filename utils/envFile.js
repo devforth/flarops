@@ -38,13 +38,14 @@ class EnvFile {
     }
   }
 
+  // Owner-only from the start: the file holds every secret of the deployment.
   write(content) {
-    this.fs.writeFileSync(this.path, content);
+    this.fs.writeFileSync(this.path, content, { mode: 0o600 });
     this.track(content);
   }
 
   append(text) {
-    this.fs.appendFileSync(this.path, text);
+    this.fs.appendFileSync(this.path, text, { mode: 0o600 });
     this.track(text);
   }
 

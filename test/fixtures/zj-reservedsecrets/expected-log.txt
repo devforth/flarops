@@ -1,0 +1,2 @@
+they are passed from GitHub secrets named APP_AWS_ACCESS_KEY_ID, APP_AWS_SECRET_ACCESS_KEY
+APP_CLOUDFLARE_API_TOKEN <- no value found; you must supply one

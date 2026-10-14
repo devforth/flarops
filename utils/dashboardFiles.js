@@ -16,22 +16,24 @@ function included(rel) {
   return true;
 }
 
-// [{ file, content }] under destDir; text files as strings, anything else as a Buffer.
-function renderDashboardFiles(destDir) {
+// The files renderDashboardFiles writes, relative to deploy/dashboard.
+function shippedDashboardFiles() {
   if (!fs.existsSync(SOURCE_DIR)) return [];
   const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true })
     .flatMap(e => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
-  return walk(SOURCE_DIR)
-    .map(abs => path.relative(SOURCE_DIR, abs))
-    .filter(included)
-    .sort()
-    .map(rel => {
-      const strip = rel.endsWith('.go') ? stripGoComments
-        : path.basename(rel) === 'Dockerfile' ? stripHashComments
-          : rel.endsWith('.html') ? stripHtmlComments : null;
-      const raw = fs.readFileSync(path.join(SOURCE_DIR, rel));
-      return { file: path.join(destDir, rel), content: strip ? strip(raw.toString('utf8')) : raw };
-    });
+  return walk(SOURCE_DIR).map(abs => path.relative(SOURCE_DIR, abs)).filter(included).sort()
+    .map(rel => rel.split(path.sep).join('/'));
 }
 
-module.exports = { renderDashboardFiles, included };
+// [{ file, content }] under destDir; text files as strings, anything else as a Buffer.
+function renderDashboardFiles(destDir) {
+  return shippedDashboardFiles().map(rel => {
+    const strip = rel.endsWith('.go') ? stripGoComments
+      : path.basename(rel) === 'Dockerfile' ? stripHashComments
+        : rel.endsWith('.html') ? stripHtmlComments : null;
+    const raw = fs.readFileSync(path.join(SOURCE_DIR, rel));
+    return { file: path.join(destDir, rel), content: strip ? strip(raw.toString('utf8')) : raw };
+  });
+}
+
+module.exports = { renderDashboardFiles, shippedDashboardFiles, included };

@@ -60,24 +60,47 @@ func fetchNodeDisk(podIP string) (nodeDisk, error) {
 	return disk, nil
 }
 
+// A gap longer than this between samples is billed as this much: the dashboard was likely down or
+// asleep, and minutes it was not running are not counted.
+const maxSampleGap = 10 * time.Minute
+
+// How much time a sample taken now stands for, and whether one is due: one a minute, billed for the
+// actual time since the last recorded one, so a slow or failed cycle loses no time. The first after a
+// start counts as one minute.
+func sampleElapsed(now, lastRecorded time.Time) (time.Duration, bool) {
+	if lastRecorded.IsZero() {
+		return time.Minute, true
+	}
+	gap := now.Sub(lastRecorded)
+	if gap < time.Minute {
+		return 0, false
+	}
+	if gap > maxSampleGap {
+		gap = maxSampleGap
+	}
+	return gap, true
+}
+
 func startCollector(k8s *K8sClient) {
 	var lastData []byte
-	var lastSnapshot time.Time
+	var lastRecorded time.Time
 	for {
 		now := time.Now()
-		shouldSnapshot := false
-		if now.Sub(lastSnapshot) >= time.Minute {
-			shouldSnapshot = true
-			lastSnapshot = now
+		elapsed, due := sampleElapsed(now, lastRecorded)
+		if !due {
+			elapsed = 0
 		}
 
-		data, err := buildDashboardData(k8s, shouldSnapshot)
+		data, err := buildDashboardData(k8s, now, elapsed)
 		if err != nil {
 			log.Println("error building dashboard data:", err)
 			if lastData != nil {
 				hub.broadcast <- lastData
 			}
 		} else {
+			if due {
+				lastRecorded = now
+			}
 			// The capacity oracle reports this exact view.
 			publishSnapshot(data)
 			b, marshalErr := json.Marshal(data)
@@ -93,7 +116,15 @@ func startCollector(k8s *K8sClient) {
 	}
 }
 
-func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, error) {
+// The environments' running costs, which read their whole history: refreshed once a minute, after the
+// minute's samples are written, not on every two-second cycle.
+var (
+	costLifeCache = map[string]float64{}
+	costLifeAt    time.Time
+)
+
+// sampleElapsed > 0: record a sample standing for that much time.
+func buildDashboardData(k8s *K8sClient, now time.Time, sampleElapsed time.Duration) (DashboardData, error) {
 	baseDomain := os.Getenv("DOMAIN")
 
 	defaultRegion := os.Getenv("AWS_REGION")
@@ -114,11 +145,7 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		log.Println("collector: FLAROPS_DEFAULT_INSTANCE_TYPE/FLAROPS_EBS_GB not set - CI normally fills these from the Terraform outputs; fleet cost will be missing those components")
 	}
 
-	dashboardDomain := "dashboard." + baseDomain
-	parts := strings.Split(baseDomain, ".")
-	if len(parts) > 2 {
-		dashboardDomain = "dashboard." + strings.Join(parts[1:], ".")
-	}
+	dashboardDomain := "dashboard." + hostParent(baseDomain)
 
 	data := DashboardData{
 		Fleet: FleetState{
@@ -178,9 +205,34 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		nsPods[p.Namespace] = append(nsPods[p.Namespace], p)
 	}
 
+	// An environment's age, which a redeploy's new pods do not reset.
+	nsCreated, nsErr := k8s.GetNamespaceCreation()
+	if nsErr != nil {
+		log.Println("collector: could not list namespaces:", nsErr)
+	}
+
+	// Jobs that have succeeded, by namespace/name, with when their latest succeeded pod was created:
+	// an earlier failed attempt of such a job is history, not a failure.
+	jobSucceeded := map[string]time.Time{}
+	for _, p := range pods {
+		if p.Status.Phase != corev1.PodSucceeded {
+			continue
+		}
+		if job := ownerOfKind(p, "Job"); job != "" {
+			key := p.Namespace + "/" + job
+			if t := p.CreationTimestamp.Time; t.After(jobSucceeded[key]) {
+				jobSucceeded[key] = t
+			}
+		}
+	}
+
 	pvcs, _ := k8s.GetPVCs()
 	nsPVCs := make(map[string][]*corev1.PersistentVolumeClaim)
 	for _, pvc := range pvcs {
+		// The dashboard's own disk is Flarops', not the application's, like its pods.
+		if pvc.Name == "flarops-dashboard-data" {
+			continue
+		}
 		nsPVCs[pvc.Namespace] = append(nsPVCs[pvc.Namespace], pvc)
 	}
 
@@ -219,7 +271,11 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		}
 		ec2Rate, priceKnown := getEC2HourlyRate(instanceType, region)
 		if !priceKnown {
-			unpriced[instanceType+" in "+region] = true
+			if instanceType == "" {
+				unpriced["an unknown instance type (FLAROPS_DEFAULT_INSTANCE_TYPE is set by CI from the Terraform outputs)"] = true
+			} else {
+				unpriced[instanceType+" in "+region] = true
+			}
 		}
 		gp3, gp3Known := getGP3Rate(region)
 		if !gp3Known {
@@ -261,7 +317,6 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 			SwapTotal:      swapTotal,
 			SwapUsed:       swapUsed,
 			AgentKnown:     agentKnown,
-			PromisedMiB:    reservedOn(n.Name, ""),
 			DiskTotal:      diskTotal,
 			DiskUsed:       diskUsed,
 			CpuUsed:        cpuUsed,
@@ -296,17 +351,25 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 
 		var oldest time.Time
 		nodeVotes := map[string]int{}
-		kinds := map[string]string{} // kind -> first reason seen
+		kinds := map[string]string{}    // kind -> first reason seen
+		since := map[string]time.Time{} // kind -> when the environment entered it
 		live := 0
 		for _, p := range pList {
 			kind, reason, restarts := podCondition(p)
 			cap.Restarts += restarts
-			if kind == "done" {
+			if kind == "done" || podIsDone(p, jobSucceeded) {
 				continue
 			}
 			live++
 			if _, seen := kinds[kind]; !seen || kinds[kind] == "" {
 				kinds[kind] = reason
+			}
+			// Running since the last pod became ready; anything else since the first pod got there.
+			if t := statusSince(p, kind); !t.IsZero() {
+				prev, seen := since[kind]
+				if !seen || (kind == "running" && t.After(prev)) || (kind != "running" && t.Before(prev)) {
+					since[kind] = t
+				}
 			}
 			if oldest.IsZero() || p.CreationTimestamp.Time.Before(oldest) {
 				oldest = p.CreationTimestamp.Time
@@ -336,21 +399,32 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 			cap.Ram += c.Ram
 			cap.Cpu += c.Cpu
 		}
-		if !oldest.IsZero() {
-			cap.UpMin = int(time.Since(oldest).Minutes())
-			cap.StatusSec = int(time.Since(oldest).Seconds())
+		created := oldest
+		if t, ok := nsCreated[ns]; ok && !t.IsZero() {
+			created = t
+		}
+		if !created.IsZero() {
+			cap.UpMin = int(now.Sub(created).Minutes())
 		}
 
 		// Worst first: a failing container outranks a pod still starting.
+		kind := "running"
 		switch {
 		case hasKey(kinds, "degraded"):
-			cap.Status, cap.Reason = "degraded", kinds["degraded"]
+			kind, cap.Status, cap.Reason = "degraded", "degraded", kinds["degraded"]
 		case hasKey(kinds, "unschedulable"):
-			cap.Status, cap.Reason = "waiting", kinds["unschedulable"]
+			kind, cap.Status, cap.Reason = "unschedulable", "waiting", kinds["unschedulable"]
 		case hasKey(kinds, "deploying"):
-			cap.Status, cap.Reason = "deploying", kinds["deploying"]
+			kind, cap.Status, cap.Reason = "deploying", "deploying", kinds["deploying"]
 		default:
 			cap.Status = "running"
+		}
+		statusFrom := since[kind]
+		if statusFrom.IsZero() {
+			statusFrom = oldest
+		}
+		if !statusFrom.IsZero() && now.After(statusFrom) {
+			cap.StatusSec = int(now.Sub(statusFrom).Seconds())
 		}
 
 		// The node most of its pods run on; none at all means the scheduler could not place it.
@@ -367,8 +441,12 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		}
 	}
 
+	// A promise is settled by the environment it was made for showing up on its node.
+	settleReservations(hostMap)
+
 	runRate := 0.0
 	for _, h := range hostMap {
+		h.PromisedMiB = reservedOn(h.ID, "")
 		data.Hosts = append(data.Hosts, *h)
 		runRate += h.Rate
 	}
@@ -412,33 +490,48 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 		data.Spend.Notes = append(data.Spend.Notes, fmt.Sprintf("No gp3 disk price for %s - counted at us-east-1's $0.08/GB-month.", region))
 	}
 
-	if shouldSnapshot {
-		nowTs := time.Now()
+	if sampleElapsed > 0 {
 		for _, h := range data.Hosts {
-			recordHostSample(nowTs, h)
+			if err := recordHostSample(now, sampleElapsed, h); err != nil {
+				log.Printf("collector: could not record the sample for %s: %v", h.ID, err)
+			}
 			for _, c := range h.Capsules {
-				recordCapsuleSample(nowTs, c.ID, h.ID, c.Ram)
+				if err := recordCapsuleSample(now, c.ID, h.ID, c.Ram); err != nil {
+					log.Printf("collector: could not record the sample for %s: %v", c.ID, err)
+				}
 			}
 		}
 	}
 
-	// An environment's cost is its share of its node, minute by minute, since its namespace was created -
+	// An environment's cost is its share of its node, sample by sample, since its namespace was created -
 	// not the rate of the whole fleet, and not what an earlier environment of the same name ran up.
-	nsCreated, _ := k8s.GetNamespaceCreation()
 	since := map[string]time.Time{}
+	missing := false
 	for _, h := range data.Hosts {
 		for _, c := range h.Capsules {
 			if t, ok := nsCreated[c.ID]; ok {
 				since[c.ID] = t
 			} else {
-				since[c.ID] = time.Now().Add(-time.Duration(c.UpMin) * time.Minute)
+				since[c.ID] = now.Add(-time.Duration(c.UpMin) * time.Minute)
+			}
+			if _, ok := costLifeCache[c.ID]; !ok {
+				missing = true
 			}
 		}
 	}
-	capsulesCostLife := getCapsulesCostLife(since)
+	if sampleElapsed > 0 || missing || now.Sub(costLifeAt) >= time.Minute {
+		costLifeCache = getCapsulesCostLife(since)
+		costLifeAt = now
+		// One that could not be read waits for the next refresh too.
+		for id := range since {
+			if _, ok := costLifeCache[id]; !ok {
+				costLifeCache[id] = 0
+			}
+		}
+	}
 	for i, h := range data.Hosts {
 		for j, c := range h.Capsules {
-			data.Hosts[i].Capsules[j].CostLife = capsulesCostLife[c.ID]
+			data.Hosts[i].Capsules[j].CostLife = costLifeCache[c.ID]
 			data.Hosts[i].Capsules[j].RateH = h.Rate / float64(len(h.Capsules))
 		}
 	}
@@ -447,15 +540,26 @@ func buildDashboardData(k8s *K8sClient, shouldSnapshot bool) (DashboardData, err
 	return data, nil
 }
 
+// The domain the dashboard and PR environments sit under: the chart passes the generator's answer
+// (utils/dashboardAccess.js hostParent), which never climbs above a zone such as co.uk; without it,
+// the domain minus its first label.
+func hostParent(domain string) string {
+	if p := os.Getenv("FLAROPS_HOST_PARENT"); p != "" {
+		return p
+	}
+	if parts := strings.Split(domain, "."); len(parts) > 2 {
+		return strings.Join(parts[1:], ".")
+	}
+	return domain
+}
+
 func getCapsuleDomain(ns, baseDomain string) string {
 	idx := strings.Index(ns, "-pr-")
 	if idx != -1 {
 		prSuffix := ns[idx+1:]
-		domainParts := strings.Split(baseDomain, ".")
-		if len(domainParts) > 2 {
-			subdomain := domainParts[0]
-			rootDomain := strings.Join(domainParts[1:], ".")
-			return subdomain + "-" + prSuffix + "." + rootDomain
+		parent := hostParent(baseDomain)
+		if parent != baseDomain {
+			return strings.Split(baseDomain, ".")[0] + "-" + prSuffix + "." + parent
 		}
 		return prSuffix + "." + baseDomain
 	}
@@ -576,6 +680,96 @@ func podCondition(p *corev1.Pod) (string, string, int) {
 		}
 	}
 	return "running", "", restarts
+}
+
+// A pod that no longer says anything about its environment, whatever podCondition makes of it: one
+// being deleted (a deploy replacing it), one evicted or failed under a controller that has already
+// replaced it, or a failed attempt of a job that later succeeded.
+func podIsDone(p *corev1.Pod, jobSucceeded map[string]time.Time) bool {
+	if p.DeletionTimestamp != nil {
+		return true
+	}
+	if p.Status.Phase != corev1.PodFailed {
+		return false
+	}
+	if p.Status.Reason == "Evicted" {
+		return true
+	}
+	for _, kind := range []string{"ReplicaSet", "StatefulSet", "DaemonSet"} {
+		if ownerOfKind(p, kind) != "" {
+			return true
+		}
+	}
+	if job := ownerOfKind(p, "Job"); job != "" {
+		if t, ok := jobSucceeded[p.Namespace+"/"+job]; ok && !t.Before(p.CreationTimestamp.Time) {
+			return true
+		}
+	}
+	return false
+}
+
+func ownerOfKind(p *corev1.Pod, kind string) string {
+	for _, o := range p.OwnerReferences {
+		if o.Kind == kind {
+			return o.Name
+		}
+	}
+	return ""
+}
+
+// When the pod entered what podCondition reports for it, zero if it does not say.
+func statusSince(p *corev1.Pod, kind string) time.Time {
+	switch kind {
+	case "unschedulable":
+		if t := conditionSince(p, corev1.PodScheduled, corev1.ConditionFalse); !t.IsZero() {
+			return t
+		}
+	case "deploying":
+		return p.CreationTimestamp.Time
+	case "degraded":
+		if t := conditionSince(p, corev1.PodReady, corev1.ConditionFalse); !t.IsZero() {
+			return t
+		}
+		var first time.Time
+		for _, cs := range p.Status.ContainerStatuses {
+			for _, st := range []corev1.ContainerState{cs.State, cs.LastTerminationState} {
+				if st.Terminated != nil && !st.Terminated.FinishedAt.IsZero() {
+					if t := st.Terminated.FinishedAt.Time; first.IsZero() || t.Before(first) {
+						first = t
+					}
+				}
+			}
+		}
+		if !first.IsZero() {
+			return first
+		}
+	case "running":
+		if t := conditionSince(p, corev1.PodReady, corev1.ConditionTrue); !t.IsZero() {
+			return t
+		}
+		var last time.Time
+		for _, cs := range p.Status.ContainerStatuses {
+			if cs.State.Running != nil && cs.State.Running.StartedAt.Time.After(last) {
+				last = cs.State.Running.StartedAt.Time
+			}
+		}
+		if !last.IsZero() {
+			return last
+		}
+	}
+	if p.Status.StartTime != nil {
+		return p.Status.StartTime.Time
+	}
+	return p.CreationTimestamp.Time
+}
+
+func conditionSince(p *corev1.Pod, typ corev1.PodConditionType, status corev1.ConditionStatus) time.Time {
+	for _, c := range p.Status.Conditions {
+		if c.Type == typ && c.Status == status {
+			return c.LastTransitionTime.Time
+		}
+	}
+	return time.Time{}
 }
 
 func sortedKeys(m map[string]bool) []string {

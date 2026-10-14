@@ -4,11 +4,15 @@ const { dbUrlScheme } = require('../../utils/dbDefaults.js');
 module.exports = (config) => {
   const extraSecretEnvBlock = secretRefs(config.apiExtraSecretEnvMappings, '.');
   const hasExtraSecretEnv = extraSecretEnvBlock.length > 0;
+  // Its own block for the database password: sync records whether api.secretEnvs declares it; init's
+  // state, written before that, has only hasDbPassword.
+  const hasDbPassword = !!(config.apiDbPassword ?? config.hasDbPassword);
+  const usesDbPassword = hasDbPassword || (config.dbUrlVars || []).length > 0;
   // Keys rendered directly must be named for the checksum, or rotating them would not roll the pod.
   const quoteKeys = (keys) => keys.filter(Boolean).map(k => JSON.stringify(k)).join(' ');
   const apiExtraKeyList = quoteKeys([
     ...(config.apiExtraSecretEnvMappings || []).map(m => m.secretKey),
-    config.dbPasswordKey,
+    usesDbPassword ? config.dbPasswordKey : null,
     (config.dbUrlVars || []).length > 0 && config.dbPasswordKey ? `${config.dbPasswordKey}_URLENCODED` : null,
   ]);
 
@@ -47,7 +51,6 @@ module.exports = (config) => {
 
   let hasCustomEnv = config.dbUrlVars && config.dbUrlVars.length > 0;
 
-  const hasDbPassword = !!config.hasDbPassword;
   // "Already emitted" under this env name by any mechanism: a duplicate is rejected by the API server.
   const dbPasswordAlreadyEmitted = alreadyEmitted(config.apiSecretKeys, config.apiExtraSecretEnvMappings, config.dbPasswordKey);
   const dbPasswordBlock = (hasDbPassword && !dbPasswordAlreadyEmitted) ? `

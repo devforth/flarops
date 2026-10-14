@@ -5,12 +5,13 @@ const fs = require('fs');
 const path = require('path');
 
 const { parse, YamlError } = require('../../utils/yamlLite.js');
-const { readState, writeState, STATE_FILE } = require('../../utils/state.js');
+const { readState, writeState, contentHash, STATE_FILE } = require('../../utils/state.js');
+const { safeWriteFile, safeUnlink, assertNoSymlink, SymlinkError } = require('../../utils/safeWrite.js');
 const { makeServiceEntry } = require('../../utils/analyzer.js');
 const { normalizeRoutes } = require('../../utils/routes.js');
 const { unmountedSecretKeys } = require('../../utils/secretWiring.js');
 const { validateDeclarations, validateRepositorySettings, validateSyncLock, suspiciousSecretNames } = require('../../utils/flaropsValidate.js');
-const { isDockerHub } = require('../../utils/registry.js');
+const { isDockerHub, imageRepository } = require('../../utils/registry.js');
 const { defaultUserFor, defaultImageFor, defaultPortFor, databaseVolumes } = require('../../utils/dbDefaults.js');
 const { claimNameFor } = require('../../templates/generic/volumes.js');
 const { renderChartTemplates, ChartConflict } = require('../../templates/chart.js');
@@ -19,7 +20,7 @@ const renderWerf = require('../../templates/werf.yaml.js');
 const renderDeployWorkflow = require('../../templates/deploy.yml.js');
 const renderPrCapsuleWorkflow = require('../../templates/pr-capsule.yml.js');
 const { AGENTS_BLOCK, withBlock, hasBlock } = require('../../utils/agentsDoc.js');
-const { renderDashboardFiles, included: includedInDashboard } = require('../../utils/dashboardFiles.js');
+const { renderDashboardFiles } = require('../../utils/dashboardFiles.js');
 const { formatChanges, secretReaders, dataNotes } = require('../../utils/syncReport.js');
 const { enterProjectRoot } = require('../../utils/projectRoot.js');
 
@@ -42,7 +43,8 @@ const SERVICE_DEFAULTS = Object.freeze({
   db: null,
 });
 
-const PRIMARY = new Set(['api', 'frontend', 'database']);
+// What init names the top-level database when it finds no name.
+const DEFAULT_DB_NAME = 'appdb';
 
 const ALWAYS_PRESENT = new Set([
   '_helpers.tpl', '01-ingress.yaml', 'secret.yaml', 'registry-secret.yaml', 'dashboard.yaml',
@@ -234,28 +236,63 @@ function envOf(decl) {
   return out;
 }
 
-function applyPrimary(config, name, decl, set, notes) {
+// secretEnvs as flarops.yaml has them: the keys a block lists, wherever the chart mounts each - its
+// own block for a database password, or the shared list. The report compares these, so moving a
+// key from one to the other is not a change.
+function declaredSecretView(sameName, mappings, dedicated = []) {
+  const same = new Set((sameName || []).map(String));
+  const renamed = new Map((mappings || []).map(m => [m.envName, m.secretKey]));
+  for (const d of dedicated) {
+    if (d.envName === d.secretKey) same.add(d.envName);
+    else renamed.set(d.envName, d.secretKey);
+  }
+  return {
+    same: [...same].sort(),
+    renamed: [...renamed].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([envName, secretKey]) => ({ envName, secretKey })),
+  };
+}
+
+function recordSecretEnvs(set, label, before, after) {
+  set({ v: before.same }, 'v', after.same, `${label}.secretEnvs (same name)`);
+  set({ v: before.renamed }, 'v', after.renamed, `${label}.secretEnvs (renamed)`);
+}
+
+// `before`: the database password key and whether the api had it in a block of its own, as they
+// were before this sync.
+function applyPrimary(config, name, decl, set, notes, before) {
   const prefix = name === 'api' ? 'api' : 'frontend';
   const { secretKeys, extraSecretEnvMappings } = splitSecretEnvs(decl.secretEnvs);
-  const cap = prefix[0].toUpperCase() + prefix.slice(1);
 
   set(config, `${prefix}Replicas`, decl.replicas, `${name}.replicas`);
   set(config, `${prefix}Ports`, asList(decl.ports).map(Number), `${name}.ports`);
   set(config, `${prefix}Env`, envOf(decl), `${name}.env`);
-  set(config, `${prefix}SecretKeys`,
-    withoutDedicatedKeys(secretKeys, config.hasDbPassword ? config.dbPasswordKey : null),
-    `${name}.secretEnvs (same name)`);
-  set(config, `${prefix}ExtraSecretEnvMappings`, extraSecretEnvMappings, `${name}.secretEnvs (renamed)`);
+  if (prefix === 'api') {
+    // The api gets the database password in a block of its own only while api.secretEnvs lists it.
+    const dbKey = config.hasDb && config.dbPasswordKey ? config.dbPasswordKey : null;
+    const dedicated = !!dbKey && secretKeys.includes(dbKey);
+    const had = before.apiDbPassword && before.dbPasswordKey ? [{ envName: before.dbPasswordKey, secretKey: before.dbPasswordKey }] : [];
+    recordSecretEnvs(set, name,
+      declaredSecretView(config.apiSecretKeys, config.apiExtraSecretEnvMappings, had),
+      declaredSecretView(secretKeys, extraSecretEnvMappings));
+    config.apiSecretKeys = withoutDedicatedKeys(secretKeys, dedicated ? dbKey : null);
+    config.apiExtraSecretEnvMappings = extraSecretEnvMappings;
+    config.apiDbPassword = dedicated;
+  } else {
+    recordSecretEnvs(set, name,
+      declaredSecretView(config.frontendSecretKeys, config.frontendExtraSecretEnvMappings),
+      declaredSecretView(secretKeys, extraSecretEnvMappings));
+    config.frontendSecretKeys = secretKeys;
+    config.frontendExtraSecretEnvMappings = extraSecretEnvMappings;
+  }
   set(config, `${prefix}Command`, decl.command ? asList(decl.command).map(String) : null, `${name}.command`);
   set(config, `${prefix}BuildArgs`, parseBuildArgs(buildArgsOf(decl)), `${name}.buildArgs`);
   const volumes = parseVolumes(decl.volumes);
   volumeNotes(name, config[`${prefix}Volumes`], volumes, (v) => claimNameFor(name, v), {}, notes);
   set(config, `${prefix}Volumes`, volumes, `${name}.volumes`);
   replicaNote(name, decl.replicas, volumes, notes);
-  if (decl.dockerfile) set(config, `${prefix}Dockerfile`, String(decl.dockerfile), `${name}.dockerfile`);
-  if (decl.context !== null && decl.context !== undefined) {
-    set(config, prefix === 'api' ? 'backendPath' : 'frontendPath', String(decl.context), `${name}.context`);
-  }
+  // A field left out is its default, not whatever it was before.
+  set(config, `${prefix}Dockerfile`, decl.dockerfile ? String(decl.dockerfile) : 'Dockerfile', `${name}.dockerfile`);
+  set(config, prefix === 'api' ? 'backendPath' : 'frontendPath', contextOf(decl), `${name}.context`);
   if (prefix === 'api') {
     const urlVars = declaredUrlVars(config, decl, config.dbUrlVars);
     if (urlVars.length > 0 && !config.hasDb) {
@@ -266,7 +303,11 @@ function applyPrimary(config, name, decl, set, notes) {
     set(config, 'apiHealthPort', decl.healthPort, 'api.healthPort');
     set(config, 'apiRoutes', normalizeRoutes(asList(decl.exposedRoutes)), 'api.exposedRoutes');
   }
-  set(config, `has${cap === 'Api' ? 'Backend' : 'Frontend'}`, true, `${name} present`);
+}
+
+// context: is the repository root when left out.
+function contextOf(decl) {
+  return decl.context === null || decl.context === undefined || decl.context === '' ? '.' : String(decl.context);
 }
 
 function applyDatabase(config, decl, set, notes) {
@@ -280,9 +321,10 @@ function applyDatabase(config, decl, set, notes) {
     set(config, 'dbHasLocalDockerfile', false, 'database.image');
   }
   if (decl.type) set(config, 'dbType', String(decl.type).toLowerCase(), 'database.type');
-  if (decl.port) set(config, 'dbPort', Number(decl.port), 'database.port');
-  if (decl.user) set(config, 'dbUser', String(decl.user), 'database.user');
-  if (decl.name) set(config, 'dbName', String(decl.name), 'database.name');
+  // Left out, these are the engine's defaults (as in a db: block), not what they were before.
+  set(config, 'dbPort', decl.port ? Number(decl.port) : defaultPortFor(config.dbType), 'database.port');
+  set(config, 'dbUser', decl.user ? String(decl.user) : defaultUserFor(config.dbType), 'database.user');
+  set(config, 'dbName', decl.name ? String(decl.name) : DEFAULT_DB_NAME, 'database.name');
   set(config, 'dbCommand', decl.command ? asList(decl.command).map(String) : null, 'database.command');
   const volumes = databaseVolumes(parseVolumes(decl.volumes), config.dbType, config.images && config.images.db);
   volumeNotes('database', config.dbVolumes, volumes, (v) => `${String(v).toLowerCase().replace(/[^a-z0-9-]/g, '-')}-database-0`, { statefulSet: true }, notes);
@@ -327,15 +369,32 @@ function ownDatabaseOf(name, declDb, previous) {
   return db;
 }
 
-function applyService(service, decl, set, label, notes) {
+const SPRING_PASSWORD = 'SPRING_DATASOURCE_PASSWORD';
+
+function applyService(config, service, decl, set, label, notes) {
   const { secretKeys, extraSecretEnvMappings } = splitSecretEnvs(decl.secretEnvs);
   set(service, 'replicas', decl.replicas, `${label}.replicas`);
   set(service, 'ports', asList(decl.ports).map(Number), `${label}.ports`);
   set(service, 'env', envOf(decl), `${label}.env`);
-  set(service, 'secretKeys',
-    withoutDedicatedKeys(secretKeys, service.dbPasswordKey, service.springDatasourcePasswordSecretKey),
-    `${label}.secretEnvs (same name)`);
-  set(service, 'extraSecretEnvMappings', extraSecretEnvMappings, `${label}.secretEnvs (renamed)`);
+
+  // A database password init gave a block of its own keeps it only while secretEnvs still lists it,
+  // under the same name and, for the top-level database's, while that database and key exist.
+  const dbKey = service.dbPasswordKey && config.hasDb && service.dbPasswordKey === config.dbPasswordKey
+    && secretKeys.includes(service.dbPasswordKey) ? service.dbPasswordKey : null;
+  const declaredSpring = decl.secretEnvs && Object.prototype.hasOwnProperty.call(decl.secretEnvs, SPRING_PASSWORD)
+    ? String(decl.secretEnvs[SPRING_PASSWORD]) : null;
+  const springKey = service.springDatasourcePasswordSecretKey && declaredSpring ? declaredSpring : null;
+  const had = [
+    ...(service.dbPasswordKey ? [{ envName: service.dbPasswordKey, secretKey: service.dbPasswordKey }] : []),
+    ...(service.springDatasourcePasswordSecretKey ? [{ envName: SPRING_PASSWORD, secretKey: service.springDatasourcePasswordSecretKey }] : []),
+  ];
+  recordSecretEnvs(set, label,
+    declaredSecretView(service.secretKeys, service.extraSecretEnvMappings, had),
+    declaredSecretView(secretKeys, extraSecretEnvMappings));
+  service.secretKeys = withoutDedicatedKeys(secretKeys, dbKey, springKey ? SPRING_PASSWORD : null);
+  service.extraSecretEnvMappings = extraSecretEnvMappings.filter(m => !(springKey && m.envName === SPRING_PASSWORD));
+  service.dbPasswordKey = dbKey;
+  service.springDatasourcePasswordSecretKey = springKey;
   set(service, 'exposedRoutes', normalizeRoutes(asList(decl.exposedRoutes)), `${label}.exposedRoutes`);
   const volumes = parseVolumes(decl.volumes);
   volumeNotes(label, service.volumes, volumes, (v) => claimNameFor(label, v), {}, notes);
@@ -346,9 +405,9 @@ function applyService(service, decl, set, label, notes) {
   set(service, 'healthPort', decl.healthPort, `${label}.healthPort`);
   set(service, 'command', decl.command ? asList(decl.command).map(String) : null, `${label}.command`);
   set(service, 'buildArgs', parseBuildArgs(buildArgsOf(decl)), `${label}.buildArgs`);
-  if (decl.dockerfile) set(service, 'dockerfile', String(decl.dockerfile), `${label}.dockerfile`);
-  if (decl.context !== null && decl.context !== undefined) {
-    set(service, 'relativePath', String(decl.context), `${label}.context`);
+  if (decl.dockerfile) {
+    set(service, 'dockerfile', String(decl.dockerfile), `${label}.dockerfile`);
+    set(service, 'relativePath', contextOf(decl), `${label}.context`);
   }
   if (decl.image) set(service, 'image', String(decl.image), `${label}.image`);
 
@@ -375,7 +434,7 @@ function applyDatabaseUrls(config, service, decl, set, label) {
   set(service, 'dbUrlVars', urlVars, `${label}.databaseUrls`);
   if (ownDb) return;
   if (urlVars.length === 0) {
-    if (service.db) set(service, 'db', null, `${label}.databaseUrls`);
+    if (service.db) set(service, 'db', null, `${label}.databaseUrls (top-level database)`);
     return;
   }
   // Read from the top-level database on every sync, so a change there reaches the URL too.
@@ -436,6 +495,40 @@ function secretKeysFor(declared, config) {
   return [...kept, ...keys.filter(k => !kept.includes(k))];
 }
 
+// repositorySettings: where the images go, and the login CI pushes with.
+function applyRepositorySettings(config, repository, set, changes, notes) {
+  const count = changes.length;
+  if (repository.registry !== undefined) {
+    const host = String(repository.registry).toLowerCase();
+    const value = isDockerHub(host) ? '' : host;
+    if ((config.dockerRegistry || '') !== value) {
+      changes.push({ label: 'repositorySettings.registry', from: config.dockerRegistry || 'docker.io', to: value || 'docker.io' });
+      config.dockerRegistry = value;
+    }
+  }
+  if (repository.project !== undefined) {
+    set(config, 'dockerProject', repository.project === null ? null : String(repository.project), 'repositorySettings.project');
+  }
+  if (repository.repository !== undefined) {
+    set(config, 'dockerRepository', String(repository.repository), 'repositorySettings.repository');
+  }
+  // user: left out, it is the login init asked for.
+  if (repository.user !== undefined) {
+    if (config.registryUserFromInit === undefined) config.registryUserFromInit = config.registryUser ?? null;
+    set(config, 'registryUser', String(repository.user), 'repositorySettings.user');
+  } else if (config.registryUserFromInit !== undefined) {
+    set(config, 'registryUser', config.registryUserFromInit, 'repositorySettings.user');
+    delete config.registryUserFromInit;
+  }
+  // On Docker Hub without a project the login is also the namespace, written into shell commands.
+  if (repository.user !== undefined && isDockerHub(config.dockerRegistry) && !config.dockerProject && !/^[a-z0-9]+$/.test(String(repository.user))) {
+    throw new YamlError(`"repositorySettings.user" must be a Docker Hub user name (lowercase letters and digits) when the images go to Docker Hub without a project, not ${JSON.stringify(String(repository.user))}`);
+  }
+  if (changes.slice(count).some(c => /^repositorySettings\.(registry|project|user)$/.test(c.label))) {
+    notes.push(`CI now pushes to ${imageRepository(config).replace('${{ env.REGISTRY_USER }}', config.registryUser || '<REGISTRY_USER>')}, logging in as ${config.registryUser || 'REGISTRY_USER'} with the REGISTRY_PASSWORD GitHub secret. Both must belong to that registry: set repositorySettings.user to your login there if it differs, and update the secret ("gh secret set REGISTRY_PASSWORD") before you push.`);
+  }
+}
+
 function applyDeclarations(state, declared, repository = null) {
   const changes = [];
   const notes = [];
@@ -443,40 +536,40 @@ function applyDeclarations(state, declared, repository = null) {
   const config = state;
   normalizeState(config);
 
-  if (repository) {
-    if (repository.registry !== undefined) {
-      const host = String(repository.registry).toLowerCase();
-      const value = isDockerHub(host) ? '' : host;
-      if ((config.dockerRegistry || '') !== value) {
-        changes.push({ label: 'repositorySettings.registry', from: config.dockerRegistry || 'docker.io', to: value || 'docker.io' });
-        config.dockerRegistry = value;
-      }
-    }
-    if (repository.project !== undefined) {
-      set(config, 'dockerProject', repository.project === null ? null : String(repository.project), 'repositorySettings.project');
-    }
-    if (repository.repository !== undefined) {
-      set(config, 'dockerRepository', String(repository.repository), 'repositorySettings.repository');
-    }
-  }
+  if (repository) applyRepositorySettings(config, repository, set, changes, notes);
+
+  // A block that was not there before is reported as added, not field by field against what an
+  // earlier one left in the state.
+  const wasPresent = { api: !!config.hasBackend, frontend: !!config.hasFrontend, database: !!config.hasDb };
+  const quiet = (target, key, value) => { target[key] = value; };
+  const previous = {
+    dbPasswordKey: config.dbPasswordKey,
+    apiDbPassword: !!config.hasBackend && !!(config.apiDbPassword ?? config.hasDbPassword),
+  };
 
   // What exists is settled first, so no block depends on where it sits in the file.
   if (!declared.has('api')) set(config, 'hasBackend', false, 'api removed');
   if (!declared.has('frontend')) set(config, 'hasFrontend', false, 'frontend removed');
   if (declared.has('database')) {
     set(config, 'hasDb', true, 'database present');
-    applyDatabase(config, declared.get('database'), set, notes);
+    applyDatabase(config, declared.get('database'), wasPresent.database ? set : quiet, wasPresent.database ? notes : []);
   } else {
     set(config, 'hasDb', false, 'database removed');
     set(config, 'dbType', null, 'database removed');
   }
+  // CI hands the database password to the chart (for its checksum) while there is a database.
+  config.hasDbPassword = !!(config.hasDb && config.dbPasswordKey);
 
   const seenAdditional = new Set();
   const seenSupport = new Set();
 
   for (const [name, decl] of declared) {
     if (name === 'database') continue;
-    if (name === 'api' || name === 'frontend') { applyPrimary(config, name, decl, set, notes); continue; }
+    if (name === 'api' || name === 'frontend') {
+      applyPrimary(config, name, decl, wasPresent[name] ? set : quiet, wasPresent[name] ? notes : [], previous);
+      set(config, name === 'api' ? 'hasBackend' : 'hasFrontend', true, `${name} present`);
+      continue;
+    }
 
     const isBuilt = !!decl.dockerfile;
     const list = isBuilt ? (config.additionalServices ||= []) : (config.supportServices ||= []);
@@ -488,7 +581,7 @@ function applyDeclarations(state, declared, repository = null) {
       list.push(service);
       changes.push({ label: `${name}: created from the shared template`, from: null, to: name });
     }
-    applyService(service, decl, set, name, notes);
+    applyService(config, service, decl, set, name, notes);
     if (isBuilt) applyDatabaseUrls(config, service, decl, set, name);
   }
 
@@ -532,36 +625,64 @@ function findOrphanTemplates(currentDir) {
   return { templatesDir, orphans: present.filter(f => !expected.has(f)) };
 }
 
-// The line of flarops.yaml a field path ("api.secretEnvs.STRIPE_KEY") is on: each part is looked up
-// among the keys one level below the previous one. The deepest part found wins; null if none is.
+// The line of flarops.yaml a field path ("api.secretEnvs.STRIPE_KEY", "api.ports[1]") is on: each
+// part is looked up among the keys one level below the previous one, and [i] among the items of a
+// sequence. The deepest part found wins; null if none is.
 function lineOf(text, where) {
   const lines = text.split('\n');
   const indentOf = (l) => l.length - l.trimStart().length;
+  const blank = (l) => !l.trim() || l.trim().startsWith('#');
+  const isItem = (l) => /^\s*-(\s|$)/.test(l);
   const keyOf = (l) => {
     const m = l.trim().replace(/^-\s+/, '').match(/^(["']?)([^"':]+)\1\s*:(\s|$)/);
     return m ? m[2].trim() : null;
   };
+  const firstLine = (from, to) => { for (let i = from; i < to; i++) if (!blank(lines[i])) return i; return -1; };
   let from = 0;
   let to = lines.length;
   let rest = where;
   let found = null;
   while (rest) {
+    const item = rest.match(/^\[(\d+)\]\.?/);
+    if (item) {
+      // The n-th "- " entry of the sequence below the line found last.
+      const first = firstLine(from, to);
+      if (first === -1 || !isItem(lines[first])) break;
+      const indent = indentOf(lines[first]);
+      const starts = [];
+      for (let i = first; i < to; i++) if (!blank(lines[i]) && indentOf(lines[i]) === indent && isItem(lines[i])) starts.push(i);
+      const at = starts[Number(item[1])];
+      if (at === undefined) break;
+      found = at + 1;
+      rest = rest.slice(item[0].length);
+      // The entry's first key is on its "- " line: read that line as if the dash were a space.
+      lines[at] = lines[at].replace(/^(\s*)-/, '$1 ');
+      from = at;
+      to = starts.find(i => i > at) ?? to;
+      continue;
+    }
     let childIndent = null;
     let match = null;
     for (let i = from; i < to; i++) {
       const l = lines[i];
-      if (!l.trim() || l.trim().startsWith('#')) continue;
+      if (blank(l)) continue;
       if (childIndent === null) childIndent = indentOf(l);
       if (indentOf(l) !== childIndent) continue;
       const key = keyOf(l);
-      if (key && (rest === key || rest.startsWith(`${key}.`)) && (!match || key.length > match.key.length)) match = { i, key };
+      if (key && (rest === key || rest.startsWith(`${key}.`) || rest.startsWith(`${key}[`)) && (!match || key.length > match.key.length)) match = { i, key };
     }
     if (!match) break;
     found = match.i + 1;
-    rest = rest.slice(match.key.length + 1);
+    rest = rest.slice(match.key.length).replace(/^\./, '');
     from = match.i + 1;
     let end = from;
-    while (end < to && (!lines[end].trim() || lines[end].trim().startsWith('#') || indentOf(lines[end]) > childIndent)) end++;
+    while (end < to && (blank(lines[end]) || indentOf(lines[end]) > childIndent)) end++;
+    // A sequence may sit at its key's own indent.
+    const next = firstLine(from, to);
+    if (firstLine(from, end) === -1 && next !== -1 && indentOf(lines[next]) === childIndent && isItem(lines[next])) {
+      end = next;
+      while (end < to && (blank(lines[end]) || indentOf(lines[end]) > childIndent || (indentOf(lines[end]) === childIndent && isItem(lines[end])))) end++;
+    }
     to = end;
   }
   return found;
@@ -623,7 +744,8 @@ module.exports = async function sync({ check = false } = {}) {
     process.exit(1);
   }
 
-  // What the previous sync rendered: which files sync owns, and what a locked file would have become.
+  // The recorded state rendered by these templates: which files sync owns, and - for a state written
+  // before sync recorded hashes - what each file held.
   const previousState = JSON.parse(JSON.stringify(state));
   normalizeState(previousState);
   let previousRender = null;
@@ -671,10 +793,13 @@ module.exports = async function sync({ check = false } = {}) {
   }
 
   // Only templates sync generated itself are removed; a file added by hand is left alone.
+  const recordedHashes = previousState.fileHashes && typeof previousState.fileHashes === 'object' ? previousState.fileHashes : null;
   const expected = new Set([...templates.map(t => path.basename(t.file)), ...ALWAYS_PRESENT]);
-  const ownedBefore = previousRender
-    ? new Set([...[...previousRender.keys()].map(f => path.basename(f)), ...ALWAYS_PRESENT])
-    : new Set();
+  const ownedBefore = new Set([
+    ...(previousRender ? [...previousRender.keys()].map(f => path.basename(f)) : []),
+    ...Object.keys(recordedHashes || {}).filter(f => path.posix.dirname(f) === 'deploy/helm/templates').map(f => path.posix.basename(f)),
+    ...(previousRender || recordedHashes ? ALWAYS_PRESENT : []),
+  ]);
   const orphans = present.filter(f => ownedBefore.has(f) && !expected.has(f));
   const lockedOrphans = orphans.filter(f => locked.has(relative(path.join(templatesDir, f))));
   if (lockedOrphans.length > 0) {
@@ -684,16 +809,19 @@ module.exports = async function sync({ check = false } = {}) {
 
   const dashboardDir = path.join(currentDir, 'deploy', 'dashboard');
   const dashboardFiles = renderDashboardFiles(dashboardDir);
-  // Files a previous version shipped and this one does not: a stale .go file would break the build.
+  // Files an earlier sync (or init) shipped and this version does not: a stale .go file would break
+  // the build. Only those recorded are removed - anything else there is the project's own.
   const dashboardStale = [];
-  if (dashboardFiles.length > 0 && fs.existsSync(dashboardDir)) {
-    const wanted = new Set(dashboardFiles.map(f => f.file));
-    const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true })
-      .flatMap(e => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
-    // Only what could be a dashboard source: a local build's binary or SQLite file stays.
-    for (const file of walk(dashboardDir)) {
-      if (!wanted.has(file) && includedInDashboard(path.relative(dashboardDir, file))) dashboardStale.push(file);
+  if (dashboardFiles.length > 0) {
+    const shipped = dashboardFiles.map(f => path.relative(dashboardDir, f.file).split(path.sep).join('/'));
+    const recorded = Array.isArray(previousState.dashboardFiles) ? previousState.dashboardFiles.map(String) : [];
+    for (const rel of recorded) {
+      const parts = rel.split('/');
+      if (shipped.includes(rel) || path.posix.isAbsolute(rel) || parts.some(p => p === '' || p === '.' || p === '..')) continue;
+      const file = path.join(dashboardDir, ...parts);
+      try { if (fs.lstatSync(file).isFile()) dashboardStale.push(file); } catch (e) { /* already gone */ }
     }
+    config.dashboardFiles = shipped;
   }
 
   // The Flarops section of AGENTS.md follows this version of Flarops; the rest of the file is the project's.
@@ -704,27 +832,41 @@ module.exports = async function sync({ check = false } = {}) {
     if (hasBlock(current)) agentsDocs.push({ file: agentsFile, content: withBlock(current, AGENTS_BLOCK) ?? current });
   }
 
-  const outputs = [
+  // The files sync generates whole; the state records a hash of what each held when sync rendered it.
+  const generated = [
     { file: path.join(helmDir, 'values.yaml'), content: valuesYaml },
     ...templates,
     { file: path.join(currentDir, 'werf.yaml'), content: werfYaml },
     ...workflows,
+  ];
+  const outputs = [
+    ...generated,
     ...agentsDocs,
     // The dashboard is Flarops' own code: a fix in it reaches the project with the next sync.
     ...dashboardFiles,
   ];
   // Line endings are not a difference: a checkout with autocrlf would otherwise be rewritten each time.
+  const onDisk = (file) => fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
   const differs = (o) => {
     if (!fs.existsSync(o.file)) return true;
     if (Buffer.isBuffer(o.content)) return !fs.readFileSync(o.file).equals(o.content);
-    return fs.readFileSync(o.file, 'utf8').replace(/\r\n/g, '\n') !== o.content;
+    return onDisk(o.file) !== o.content;
+  };
+  // The hash of what sync rendered for a file last time: recorded, or - for a state written before
+  // hashes were - the recorded state rendered again.
+  const hashBefore = (o) => {
+    if (recordedHashes) return recordedHashes[relative(o.file)] || null;
+    return previousRender && previousRender.has(o.file) ? contentHash(previousRender.get(o.file)) : null;
   };
   const toWrite = outputs.filter(o => !locked.has(relative(o.file)) && differs(o));
   // A locked file is reported only when what sync renders for it changed - not merely because it was edited.
   const heldBack = outputs
     .filter(o => locked.has(relative(o.file)))
-    .filter(o => (previousRender && previousRender.has(o.file) ? previousRender.get(o.file) !== o.content : differs(o)))
+    .filter(o => (hashBefore(o) ? hashBefore(o) !== contentHash(o.content) : differs(o)))
     .map(o => relative(o.file));
+  // A file whose content on disk is not what sync rendered last time was edited by hand.
+  const handEdited = (o) => !Buffer.isBuffer(o.content) && !!hashBefore(o) && fs.existsSync(o.file)
+    && contentHash(onDisk(o.file)) !== hashBefore(o);
 
   const nothing = changes.length === 0 && toWrite.length === 0 && orphans.length === 0 && dashboardStale.length === 0;
   const color = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -738,12 +880,21 @@ module.exports = async function sync({ check = false } = {}) {
     return;
   }
 
+  // Every path written or removed is checked before the first write: none may lead through a symlink.
+  const deletions = [...dashboardStale, ...orphans.map(f => path.join(templatesDir, f))];
+  try {
+    for (const o of toWrite) assertNoSymlink(currentDir, o.file);
+    for (const file of deletions) assertNoSymlink(currentDir, file, { parentsOnly: true });
+    assertNoSymlink(currentDir, STATE_FILE);
+  } catch (e) {
+    if (!(e instanceof SymlinkError)) throw e;
+    console.error(`\x1b[31mERROR: ${e.message}\x1b[0m`);
+    console.error(check ? 'A sync would refuse to write anything.' : 'Nothing was written.');
+    process.exit(1);
+  }
+
   const { lines, secretsAdded, secretsRemoved } = formatChanges(changes);
   const allNotes = [...notes, ...dataNotes(previousState, config)];
-  // A file whose content on disk is not what sync rendered last time was edited by hand.
-  const handEdited = (o) => previousRender && previousRender.has(o.file) && fs.existsSync(o.file)
-    && !Buffer.isBuffer(o.content)
-    && fs.readFileSync(o.file, 'utf8').replace(/\r\n/g, '\n') !== previousRender.get(o.file);
 
   console.log(check ? 'flarops sync --check: these changes would be applied (nothing was written).' : 'Applying flarops.yaml:');
   if (lines.length > 0) for (const line of [...new Set(lines)]) console.log(`  ${line}`);
@@ -757,44 +908,51 @@ module.exports = async function sync({ check = false } = {}) {
   for (const f of orphans) console.log(`  ${relative(path.join(templatesDir, f))} (removed: its service is no longer declared)`);
   console.log('');
 
-  if (check) {
+  // What follows the change list; --check says all of it too, so a real run holds no surprise.
+  const report = () => {
     for (const note of allNotes) warn(`NOTE: ${note}`);
+    if (context.hasLocalhostWarnings) {
+      const keys = [...new Set(context.localhostKeys || [])];
+      warn(`WARNING: ${keys.length ? keys.join(', ') : 'some values'} still point${keys.length === 1 ? 's' : ''} at localhost, which inside a cluster reaches the pod itself. In flarops.yaml, use the service's name for traffic inside the cluster ("database", "api"), or the project's domain for anything a browser reaches.`);
+    }
+    if (heldBack.length > 0) {
+      warn(`WARNING: syncLock kept these files as they are, so the changes above did not reach them: ${heldBack.join(', ')}. Carry what they need over by hand, or remove them from syncLock and run sync again.`);
+    }
+
+    // The GitHub Secrets this change needs: without one, its variable reaches the container empty.
+    if (secretsAdded.length > 0 || secretsRemoved.length > 0) {
+      const readers = secretReaders(declared);
+      if (secretsAdded.length > 0) {
+        console.log(paint(36, 'Before you push, create these GitHub repository secrets (Settings -> Secrets and variables -> Actions):'));
+        for (const key of secretsAdded) {
+          const who = readers.get(key);
+          console.log(`  ${key}${who ? `   read by ${who.join(', ')}` : ''}      e.g. gh secret set ${key}`);
+        }
+        console.log('  Without one, the variable reaches the container empty.');
+      }
+      if (secretsRemoved.length > 0) console.log(`No longer used - you can delete these GitHub secrets: ${secretsRemoved.join(', ')}`);
+      console.log('');
+    }
+  };
+
+  if (check) {
+    report();
     process.exitCode = 1;
     return;
   }
 
-  for (const o of toWrite) {
-    fs.mkdirSync(path.dirname(o.file), { recursive: true });
-    fs.writeFileSync(o.file, o.content);
-  }
-  for (const file of dashboardStale) fs.unlinkSync(file);
-  for (const f of orphans) fs.unlinkSync(path.join(templatesDir, f));
-  writeState(currentDir, config);
-
-  for (const note of allNotes) warn(`NOTE: ${note}`);
-  if (context.hasLocalhostWarnings) {
-    const keys = [...new Set(context.localhostKeys || [])];
-    warn(`WARNING: ${keys.length ? keys.join(', ') : 'some values'} still point${keys.length === 1 ? 's' : ''} at localhost, which inside a cluster reaches the pod itself. In flarops.yaml, use the service's name for traffic inside the cluster ("database", "api"), or the project's domain for anything a browser reaches.`);
-  }
-  if (heldBack.length > 0) {
-    warn(`WARNING: syncLock kept these files as they are, so the changes above did not reach them: ${heldBack.join(', ')}. Carry what they need over by hand, or remove them from syncLock and run sync again.`);
+  try {
+    for (const o of toWrite) safeWriteFile(currentDir, o.file, o.content);
+    for (const file of deletions) safeUnlink(currentDir, file);
+    config.fileHashes = Object.fromEntries(generated.map(o => [relative(o.file), contentHash(o.content)]));
+    writeState(currentDir, config);
+  } catch (e) {
+    if (!(e instanceof SymlinkError)) throw e;
+    console.error(`\x1b[31mERROR: ${e.message}\x1b[0m`);
+    process.exit(1);
   }
 
-  // The GitHub Secrets this change needs: without one, its variable reaches the container empty.
-  if (secretsAdded.length > 0 || secretsRemoved.length > 0) {
-    const readers = secretReaders(declared);
-    if (secretsAdded.length > 0) {
-      console.log(paint(36, 'Before you push, create these GitHub repository secrets (Settings -> Secrets and variables -> Actions):'));
-      for (const key of secretsAdded) {
-        const who = readers.get(key);
-        console.log(`  ${key}${who ? `   read by ${who.join(', ')}` : ''}      e.g. gh secret set ${key}`);
-      }
-      console.log('  Without one, the variable reaches the container empty.');
-    }
-    if (secretsRemoved.length > 0) console.log(`No longer used - you can delete these GitHub secrets: ${secretsRemoved.join(', ')}`);
-    console.log('');
-  }
-
+  report();
   console.log(paint(32, 'Done.') + ` Next: review "git diff", then commit and push - a push to ${config.deployBranch || 'main'} deploys it.`);
 };
 
@@ -802,3 +960,4 @@ module.exports.findOrphanTemplates = findOrphanTemplates;
 module.exports.applyDeclarations = applyDeclarations;
 module.exports.declaredServices = declaredServices;
 module.exports.normalizeState = normalizeState;
+module.exports.lineOf = lineOf;

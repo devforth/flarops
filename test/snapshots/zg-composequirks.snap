@@ -59,8 +59,7 @@ name: Flarops CI/CD Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: ['main']
   workflow_dispatch:
 
 permissions:
@@ -100,6 +99,7 @@ jobs:
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: 1.15.8
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -216,9 +216,11 @@ jobs:
           {
             echo "### Deployed"
             echo ""
-            echo "- Application: https://${{ env.BASE_DOMAIN }}"
-            echo "- Dashboard: https://dashboard.example.test"
+            echo "- Application: http://${{ env.BASE_DOMAIN }}"
+            echo "- Dashboard: http://dashboard.example.test"
             echo "- Server IP: ${IP:-unknown} - point the DNS records listed in FLAROPS.md at it"
+            echo ""
+            echo "The server serves plain HTTP: HTTPS needs a proxy (Cloudflare, for example) in front of it."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fetch Kubeconfig from EC2
@@ -351,7 +353,7 @@ env:
 jobs:
   deploy-capsule:
     name: Deploy PR Capsule
-    if: github.event.action != 'closed'
+    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -372,6 +374,7 @@ jobs:
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: 1.15.8
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -468,6 +471,7 @@ jobs:
       - name: Decide where this capsule goes
         env:
           TF_VAR_domain: ${{ env.BASE_DOMAIN }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
 
@@ -545,6 +549,39 @@ jobs:
             fi
           }
 
+          flarops_node_state() {
+            if FLAROPS_NODE_ERR=$(kubectl get node "$1" -o name 2>&1); then echo present
+            elif printf '%s' "$FLAROPS_NODE_ERR" | grep -q NotFound; then echo missing
+            else echo "$FLAROPS_NODE_ERR" >&2; echo unknown; fi
+          }
+
+          flarops_mark_placing() {
+            kubectl create configmap flarops-placing -n default > /dev/null 2>&1 || true
+            kubectl patch configmap flarops-placing -n default --type merge -p "{\"data\":{\"$1__$PR_ENV_NAME\":\"$PR_ENV_NAME@$(date +%s)\"}}" > /dev/null
+            echo "Marked $1 as taken by $PR_ENV_NAME until its pods are scheduled."
+          }
+
+          flarops_read_placing() {
+            if FLAROPS_MARKS=$(kubectl get configmap flarops-placing -n default -o json 2>/tmp/placing.err); then return 0; fi
+            if grep -q NotFound /tmp/placing.err; then FLAROPS_MARKS='{}'; return 0; fi
+            cat /tmp/placing.err
+            return 1
+          }
+
+          flarops_prune_placing() {
+            FLAROPS_DROP=$(FLAROPS_MARKS="$FLAROPS_MARKS" PR_ENV_NAME="$PR_ENV_NAME" python3 -c "import json,os,time; d=json.loads(os.environ['FLAROPS_MARKS']).get('data') or {}; t=lambda v: v.rsplit('@',1)[-1]; drop={k: None for k,v in d.items() if v.rsplit('@',1)[0] == os.environ['PR_ENV_NAME'] or not t(v).isdigit() or time.time()-int(t(v)) >= 3600}; print(json.dumps({'data': drop}) if drop else '')")
+            if [ -n "$FLAROPS_DROP" ]; then
+              kubectl patch configmap flarops-placing -n default --type merge -p "$FLAROPS_DROP" > /dev/null || true
+            fi
+          }
+
+          flarops_placing_on() {
+            FLAROPS_MARKS="$FLAROPS_MARKS" PR_ENV_NAME="$PR_ENV_NAME" NODE="$1" python3 -c "import json,os,time; d=json.loads(os.environ['FLAROPS_MARKS']).get('data') or {}; p=os.environ['NODE']+'__'; t=lambda v: v.rsplit('@',1)[-1]; print(' '.join(v.rsplit('@',1)[0] for k,v in d.items() if k.startswith(p) and v.rsplit('@',1)[0] != os.environ['PR_ENV_NAME'] and t(v).isdigit() and time.time()-int(t(v)) < 3600))"
+          }
+
+          EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
+          trap 'flarops_slots_unlock "$EC2_IP"' EXIT
+
           TARGET_NODE=$(kubectl get pvc -n "${{ env.PR_NAMESPACE }}" \
             -o jsonpath='{range .items[*]}{.metadata.annotations.volume\.kubernetes\.io/selected-node}{"\n"}{end}' 2>/dev/null | grep -m1 . || true)
           if [ -z "$TARGET_NODE" ]; then
@@ -553,16 +590,33 @@ jobs:
           fi
 
           if [ -n "$TARGET_NODE" ]; then
-            echo "Capsule already runs on $TARGET_NODE - keeping it there."
-            echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
-            exit 0
+            flarops_slots_lock "$EC2_IP"
+            case "$(flarops_node_state "$TARGET_NODE")" in
+              present)
+                flarops_mark_placing "$TARGET_NODE"
+                flarops_slots_unlock "$EC2_IP"
+                echo "Capsule already runs on $TARGET_NODE - keeping it there."
+                echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
+                exit 0
+                ;;
+              missing)
+                flarops_slots_unlock "$EC2_IP"
+                echo "::warning::This capsule ran on $TARGET_NODE, which no longer exists, and its volumes went with it. Recreating the environment (and its database copy) on another node."
+                kubectl delete namespace "${{ env.PR_NAMESPACE }}" --ignore-not-found --wait=true --timeout=300s
+                TARGET_NODE=""
+                ;;
+              *)
+                echo "::error::Could not check whether $TARGET_NODE still exists - the Kubernetes API did not answer."
+                exit 1
+                ;;
+            esac
           fi
 
           REQUIRED_MI=$(kubectl top pods -n "${{ env.MAIN_NAMESPACE }}" --no-headers 2>/dev/null \
             | awk '$1 !~ /^flarops-(dashboard|node-agent)/ { v = $3; if (v ~ /Gi$/) { sub(/Gi$/, "", v); v = v * 1024 } else if (v ~ /Ki$/) { sub(/Ki$/, "", v); v = v / 1024 } else { sub(/Mi$/, "", v) } s += v } END { printf "%d", s }' || true)
           if [ -z "$REQUIRED_MI" ] || [ "$REQUIRED_MI" -lt 64 ]; then
-            echo "No usable measurement of ${{ env.MAIN_NAMESPACE }} yet - planning with the generated estimate of 512 MiB."
-            REQUIRED_MI=512
+            echo "No usable measurement of ${{ env.MAIN_NAMESPACE }} yet - planning with the generated estimate of 896 MiB."
+            REQUIRED_MI=896
           else
             echo "Planning this capsule at $REQUIRED_MI MiB - what the same stack uses in ${{ env.MAIN_NAMESPACE }} right now."
           fi
@@ -573,13 +627,15 @@ jobs:
           }
 
           OUT=""
-          for attempt in 1 2 3; do
+          for attempt in $(seq 1 8); do
             if OUT=$(ask_capacity 2>/tmp/capacity.err); then
-              break
+              if [ "$(printf '%s' "$OUT" | head -1)" != "unknown" ]; then break; fi
+              echo "The dashboard cannot answer yet (attempt $attempt/8): $(printf '%s' "$OUT" | sed -n 's/^reason=//p')"
+            else
+              echo "Capacity oracle not answering (attempt $attempt/8): $(cat /tmp/capacity.err)"
+              OUT=""
             fi
-            echo "Capacity oracle not answering (attempt $attempt): $(cat /tmp/capacity.err)"
-            OUT=""
-            sleep 10
+            if [ "$attempt" -lt 8 ]; then sleep 15; fi
           done
 
           if [ -z "$OUT" ]; then
@@ -592,7 +648,7 @@ jobs:
           TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
 
           if [ "$VERDICT" = "unknown" ]; then
-            echo "::error::The dashboard has no fresh fleet data, so it cannot say whether this capsule fits. Refusing to deploy blind."
+            echo "::error::The dashboard still had no fresh fleet data after 8 attempts, so it cannot say whether this capsule fits. Refusing to deploy blind."
             exit 1
           fi
 
@@ -633,16 +689,43 @@ jobs:
             fi
           fi
 
+          if [ "$VERDICT" = "yes" ]; then
+            if [ -z "$TARGET_NODE" ]; then
+              echo "::error::The capacity oracle said yes but named no node."
+              exit 1
+            fi
+            flarops_slots_lock "$EC2_IP"
+            case "$(flarops_node_state "$TARGET_NODE")" in
+              present)
+                flarops_mark_placing "$TARGET_NODE"
+                ;;
+              missing)
+                echo "::warning::$TARGET_NODE was removed while this capsule was being placed - adding a worker instead."
+                VERDICT=no
+                ;;
+              *)
+                echo "::error::Could not check whether $TARGET_NODE still exists - the Kubernetes API did not answer."
+                exit 1
+                ;;
+            esac
+            flarops_slots_unlock "$EC2_IP"
+          fi
+
           if [ "$VERDICT" = "no" ]; then
             echo "::warning::No node has room for this capsule. Adding a worker..."
 
-            cd deploy/terraform
-            terraform init
+            echo "Adding it with deploy/terraform from $BASE_REF, the base branch - never this pull request's."
+            BASE_TREE="$RUNNER_TEMP/flarops-base"
+            git worktree add --detach "$BASE_TREE" "origin/$BASE_REF" > /dev/null
+            if [ ! -d "$BASE_TREE/deploy/terraform" ]; then
+              echo "::error::$BASE_REF has no deploy/terraform, so there is no reviewed Terraform to add a worker with."
+              exit 1
+            fi
+            cd "$BASE_TREE/deploy/terraform"
+            terraform init -input=false
             terraform workspace select -or-create main
 
-            EC2_IP=$(terraform output -raw public_ip)
             flarops_slots_lock "$EC2_IP"
-            trap 'flarops_slots_unlock "$EC2_IP"' EXIT
             ALL_OUTPUTS=$(terraform output -json)
             CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
             NEW_SLOTS=$(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; s=[int(x) for x in json.load(sys.stdin)]; f=next(n for n in range(1,1000) if n not in s); print(json.dumps(sorted(s+[f])))")
@@ -654,11 +737,12 @@ jobs:
             fi
             NEW_NODE="${INSTANCE_NAME}-worker-${NEW_SLOT}"
             flarops_ssh "$EC2_IP" "sudo k3s kubectl delete node ${NEW_NODE} --ignore-not-found" > /dev/null
+            flarops_mark_placing "$NEW_NODE"
             echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
             terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
             flarops_slots_unlock "$EC2_IP"
-            trap - EXIT
             cd - > /dev/null
+            git worktree remove --force "$BASE_TREE"
 
             echo "Waiting for $NEW_NODE to join..."
             flarops_wait_for_k3s "$EC2_IP"
@@ -722,6 +806,12 @@ jobs:
             --set "dataNodeSelector.kubernetes\.io/hostname=$TARGET_NODE" \
             --values deploy/helm/flarops-ci-values.json
 
+      - name: Release the placement mark
+        if: env.TARGET_NODE != ''
+        run: |
+          kubectl patch configmap flarops-placing -n default --type merge \
+            -p "{\"data\":{\"${TARGET_NODE}__${PR_ENV_NAME}\":null}}" > /dev/null 2>&1 || true
+
       - name: Database Clone & Restore
         run: |
           set -euo pipefail
@@ -749,7 +839,7 @@ jobs:
 
   cleanup-capsule:
     name: Teardown PR Capsule
-    if: github.event.action == 'closed'
+    if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -770,6 +860,7 @@ jobs:
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: 1.15.8
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -947,6 +1038,36 @@ jobs:
             fi
           }
 
+          flarops_node_state() {
+            if FLAROPS_NODE_ERR=$(kubectl get node "$1" -o name 2>&1); then echo present
+            elif printf '%s' "$FLAROPS_NODE_ERR" | grep -q NotFound; then echo missing
+            else echo "$FLAROPS_NODE_ERR" >&2; echo unknown; fi
+          }
+
+          flarops_mark_placing() {
+            kubectl create configmap flarops-placing -n default > /dev/null 2>&1 || true
+            kubectl patch configmap flarops-placing -n default --type merge -p "{\"data\":{\"$1__$PR_ENV_NAME\":\"$PR_ENV_NAME@$(date +%s)\"}}" > /dev/null
+            echo "Marked $1 as taken by $PR_ENV_NAME until its pods are scheduled."
+          }
+
+          flarops_read_placing() {
+            if FLAROPS_MARKS=$(kubectl get configmap flarops-placing -n default -o json 2>/tmp/placing.err); then return 0; fi
+            if grep -q NotFound /tmp/placing.err; then FLAROPS_MARKS='{}'; return 0; fi
+            cat /tmp/placing.err
+            return 1
+          }
+
+          flarops_prune_placing() {
+            FLAROPS_DROP=$(FLAROPS_MARKS="$FLAROPS_MARKS" PR_ENV_NAME="$PR_ENV_NAME" python3 -c "import json,os,time; d=json.loads(os.environ['FLAROPS_MARKS']).get('data') or {}; t=lambda v: v.rsplit('@',1)[-1]; drop={k: None for k,v in d.items() if v.rsplit('@',1)[0] == os.environ['PR_ENV_NAME'] or not t(v).isdigit() or time.time()-int(t(v)) >= 3600}; print(json.dumps({'data': drop}) if drop else '')")
+            if [ -n "$FLAROPS_DROP" ]; then
+              kubectl patch configmap flarops-placing -n default --type merge -p "$FLAROPS_DROP" > /dev/null || true
+            fi
+          }
+
+          flarops_placing_on() {
+            FLAROPS_MARKS="$FLAROPS_MARKS" PR_ENV_NAME="$PR_ENV_NAME" NODE="$1" python3 -c "import json,os,time; d=json.loads(os.environ['FLAROPS_MARKS']).get('data') or {}; p=os.environ['NODE']+'__'; t=lambda v: v.rsplit('@',1)[-1]; print(' '.join(v.rsplit('@',1)[0] for k,v in d.items() if k.startswith(p) and v.rsplit('@',1)[0] != os.environ['PR_ENV_NAME'] and t(v).isdigit() and time.time()-int(t(v)) < 3600))"
+          }
+
           cd deploy/terraform
           terraform init
           terraform workspace select -or-create main
@@ -973,11 +1094,22 @@ jobs:
             echo "::error::Could not read instance_name from Terraform. Refusing to guess node names - a wrong guess drains a node that is carrying work."
             exit 1
           fi
+          if ! flarops_read_placing; then
+            echo "::warning::Could not read the placement marks - leaving every worker alone."
+            exit 0
+          fi
+          flarops_prune_placing
 
           FREED=""
           for SLOT in $(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; print(' '.join(str(s) for s in sorted((int(x) for x in json.load(sys.stdin)), reverse=True)))"); do
             NODE_NAME="${INSTANCE_NAME}-worker-${SLOT}"
             echo "Checking $NODE_NAME ..."
+
+            HOLDERS=$(flarops_placing_on "$NODE_NAME")
+            if [ -n "$HOLDERS" ]; then
+              echo "  being placed on by $HOLDERS - keeping it."
+              continue
+            fi
 
             if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" -o json 2>/tmp/kubectl.err); then
               echo "  could not query pods on $NODE_NAME ($(cat /tmp/kubectl.err)) - leaving it alone."
@@ -1090,14 +1222,14 @@ Paste each value **without the surrounding quotes**. For `SSH_PRIVATE_KEY`, copy
 ```bash
 git add -A
 git commit -m "Deploy with Flarops"
-git push origin main
+git push origin 'main'
 ```
 
 A push to `main` runs the "Flarops CI/CD Pipeline" workflow (repository -> Actions). The first run takes about 10-15 minutes. It creates, in your AWS account and billed to it: a VPC, one EC2 instance (`t3a.medium`, 40 GB disk) with an Elastic IP in `us-west-2`, and installs k3s, then builds and deploys the application.
 
 ## 4. DNS
 
-Cloudflare was not configured, so create the DNS records yourself once the first deploy has run. The server's IP is in the summary of the "Flarops CI/CD Pipeline" run (repository -> Actions), and in `terraform -chdir=deploy/terraform output public_ip`. Create A records pointing at it for:
+Cloudflare was not configured, so create the DNS records yourself once the first deploy has run. The server's IP is in the summary of the "Flarops CI/CD Pipeline" run (repository -> Actions), and in `terraform -chdir=deploy/terraform output public_ip` (after `terraform -chdir=deploy/terraform workspace select main`: CI keeps its state in the `main` workspace). Create A records pointing at it for:
 
 - `example.test`
 - `dashboard.example.test`
@@ -1107,12 +1239,12 @@ HTTPS comes from a proxy in front of the server (Cloudflare's proxy, for example
 
 ## 5. Open it
 
-- Application: https://example.test
-- Dashboard: https://dashboard.example.test - user `admin`, with the password init showed once. Lost it? `npx flarops dashboard-password` issues a new one.
+- Application: http://example.test
+- Dashboard: http://dashboard.example.test - user `admin`, with the password init showed once. Lost it? `npx flarops dashboard-password` issues a new one.
 
 ## Pull requests
 
-Every pull request gets its own environment at `https://pr-<number>.example.test`, with a copy of the production database. Closing the pull request removes it, and any worker machine it no longer needs.
+Every pull request gets its own environment at `http://pr-<number>.example.test`, with a copy of the production database. Closing the pull request removes it, and any worker machine it no longer needs.
 
 ## Changing the deployment later
 
@@ -1356,7 +1488,41 @@ DASHBOARD_PASSWORD_HASH='pbkdf2-sha256$i=600000$<PBKDF2>'
   ],
   "apiReplicas": 1,
   "frontendReplicas": 1,
-  "dbReplicas": 1
+  "dbReplicas": 1,
+  "fileHashes": {
+    "deploy/helm/values.yaml": "92b77c64954dd05376c2daf3576c863f3b4cb4c37f478c1ac0aa9bfc439a5be6",
+    "deploy/helm/templates/01-ingress.yaml": "944e56a7e2cdca95289372ca13563538780e351fb786b0d89f247856337eaaac",
+    "deploy/helm/templates/_helpers.tpl": "b7c70cc41f1d1474646d0c43057c5b7cd3781d21dccd615e932c7eb6cd0a30e5",
+    "deploy/helm/templates/secret.yaml": "bb57b84a2e99016a18731929dbc69eed73be6db2d3d64f84aaefa08479121544",
+    "deploy/helm/templates/registry-secret.yaml": "b7d9748d4a22f9d55f16f46ffb53691a4610549ac9f1c24d947d7ec11aa8f5c9",
+    "deploy/helm/templates/dashboard.yaml": "653af412f75ac6ab3925d563e6ef442dab0bb6158a03e9fc2ce39e9032904b2b",
+    "deploy/helm/templates/api.yaml": "0435620ee79a586b03a9f247c77fe4ad92dd6ea4d816c0f454b46f87744942cf",
+    "deploy/helm/templates/support-prometheus.yaml": "077ed1736bde444033b0f9a5ba6deb7a16246daa0c2c13c7efb39eaabddf7f0b",
+    "deploy/helm/templates/support-cache.yaml": "fe92d07ed4dba72b00ee4a81f08700d9b395208907d362b0ea8b4a8a8c303367",
+    "deploy/helm/templates/support-minio.yaml": "89d22ec2109671f41fe8ba51cb390e4a79147264e607139d9e251dd49d7c3836",
+    "deploy/helm/templates/database.yaml": "d50ef780609f82aa8a50bd92f7ec515e0eef309a8b100b5575f8ec4c932b7f08",
+    ".github/workflows/deploy.yml": "fde719067105715418b30b34484fcb3f36324f0bca8487b181aa81df4ec59875",
+    ".github/workflows/pr-capsule.yml": "6da3c7043376a9d8efcf621e81f89b551f5c9d204826cc43c20e82ea1fd248b3",
+    "werf.yaml": "64858a35e25849950a1acff1169f6e9c1c62104a6de30adda636056a31413f39"
+  },
+  "dashboardFiles": [
+    "Dockerfile",
+    "auth.go",
+    "capacity.go",
+    "collector.go",
+    "db.go",
+    "fetcher.go",
+    "go.mod",
+    "go.sum",
+    "k8s.go",
+    "login.html",
+    "logout.html",
+    "main.go",
+    "nodeagent.go",
+    "state.go",
+    "static/index.html",
+    "static/loader.gif"
+  ]
 }
 
 # ===== deploy/helm/Chart.yaml
@@ -1788,8 +1954,10 @@ spec:
           value: {{ .Values.aws.volumeSize | default "" | quote }}
         - name: FLAROPS_PROJECT
           value: {{ .Values.projectName | quote }}
+        - name: FLAROPS_HOST_PARENT
+          value: "example.test"
         - name: FLAROPS_PR_ESTIMATE_MIB
-          value: "512"
+          value: "896"
         ports:
         - containerPort: 8080
         resources:
@@ -2649,8 +2817,8 @@ resource "aws_instance" "server" {
 
   lifecycle {
     # Changes to the AMI or to user_data reach only new instances; replace this
-    # one deliberately (terraform apply -replace=...) to apply them here. The
-    # cluster's data lives on its root volume.
+    # one deliberately to apply them here (terraform workspace select main, then
+    # terraform apply -replace=...). The cluster's data lives on its root volume.
     ignore_changes = [ami, user_data]
   }
 }
@@ -2746,8 +2914,8 @@ resource "aws_instance" "worker" {
 
   lifecycle {
     # Changes to the AMI or to user_data reach only new instances; replace this
-    # one deliberately (terraform apply -replace=...) to apply them here. The
-    # cluster's data lives on its root volume.
+    # one deliberately to apply them here (terraform workspace select main, then
+    # terraform apply -replace=...). The cluster's data lives on its root volume.
     ignore_changes = [ami, user_data]
   }
 }
@@ -2788,6 +2956,11 @@ variable "instance_name" {
   description = "Name tag for the EC2 instance"
   type        = string
   default     = "zg-composequirks-instance"
+
+  validation {
+    condition     = length(var.instance_name) <= 52
+    error_message = "instance_name must be at most 52 characters: worker hostnames add -worker-<slot> and must fit in 63."
+  }
 }
 
 # Worker nodes, by slot number. The PR-capsule workflow adds and removes them;
@@ -2805,7 +2978,8 @@ variable "instance_type" {
 }
 
 # Read by the server and every worker. A change applies to NEW nodes only -
-# replace an existing one (terraform apply -replace=...) to upgrade it.
+# replace an existing one (terraform workspace select main, then
+# terraform apply -replace=...) to upgrade it.
 variable "k3s_version" {
   description = "k3s version installed on every node (see https://github.com/k3s-io/k3s/releases)"
   type        = string
@@ -3012,6 +3186,16 @@ minio:
 # a letter or digit, and is at most 63 characters (49 with a db: block). Not
 # allowed: secret, dashboard, registry-secret, flarops-..., and words YAML
 # reads as something else (null, true, false, yes, no, on, off, y, n).
+#
+# --- repositorySettings ------------------------------------------------------
+#
+# registry:   the registry host the images are pushed to (no path).
+# project:    the namespace inside it, or null.
+# repository: the repository name.
+# user:       optional - the login CI pushes as (REGISTRY_USER in the
+#             workflows); init's answer when left out. The password is the
+#             REGISTRY_PASSWORD GitHub secret: when registry, project or user
+#             changes, update that secret so it belongs to this login.
 #
 # --- The special blocks ------------------------------------------------------
 #

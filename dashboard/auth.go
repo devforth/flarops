@@ -576,6 +576,8 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLoginPost(w http.ResponseWriter, r *http.Request) {
+	// First: every path below, the rate-limited ones included, parses the form.
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
 	ip := clientIP(r)
 
 	// Rate limit before the expensive verification.
@@ -588,7 +590,6 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		log.Printf("auth: global failure rate is elevated (%s remaining in window)", wait.Truncate(time.Second))
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return

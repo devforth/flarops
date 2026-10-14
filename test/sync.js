@@ -479,12 +479,23 @@ pinger:
     const collector = path.join(dir, 'deploy/dashboard/collector.go');
     const current = read(dir, 'deploy/dashboard/collector.go');
     fs.writeFileSync(collector, current.replace('schedulableForCapsules', 'oldSchedulable'));
+    // obsolete.go stands for a file an earlier version shipped: the state lists it.
+    const stateFile = path.join(dir, 'deploy/.flarops-state.json');
+    const stateJson = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    check('the state lists the dashboard files shipped', Array.isArray(stateJson.dashboardFiles) && stateJson.dashboardFiles.includes('collector.go'), JSON.stringify(stateJson.dashboardFiles));
+    stateJson.dashboardFiles = [...(stateJson.dashboardFiles || []), 'obsolete.go', '../../flarops.yaml'];
+    fs.writeFileSync(stateFile, JSON.stringify(stateJson, null, 2) + '\n');
     fs.writeFileSync(path.join(dir, 'deploy/dashboard/obsolete.go'), 'package main\n');
+    fs.writeFileSync(path.join(dir, 'deploy/dashboard/NOTES.md'), 'our notes\n');
     fs.writeFileSync(path.join(dir, 'deploy/dashboard/flarops_metrics.db'), 'local');
     r = runSync(dir);
     check('sync brings an outdated dashboard source up to date', r.status === 0 && read(dir, 'deploy/dashboard/collector.go') === current, r.err || r.out);
     check('and removes a source this version no longer ships', !exists(dir, 'deploy/dashboard/obsolete.go') && /obsolete\.go \(removed/.test(r.out), r.out);
+    check('but leaves a file it never shipped', exists(dir, 'deploy/dashboard/NOTES.md') && !/NOTES\.md/.test(r.out), r.out);
+    check('and nothing outside the dashboard, whatever the state lists', exists(dir, 'flarops.yaml'));
     check('but leaves a local run\'s database', exists(dir, 'deploy/dashboard/flarops_metrics.db'));
+    check('the state no longer lists the removed file', !JSON.parse(fs.readFileSync(stateFile, 'utf8')).dashboardFiles.includes('obsolete.go'));
+    fs.unlinkSync(path.join(dir, 'deploy/dashboard/NOTES.md'));
     check('the binary loader image stays byte for byte', fs.readFileSync(path.join(dir, 'deploy/dashboard/static/loader.gif')).equals(fs.readFileSync(path.join(__dirname, '..', 'dashboard/static/loader.gif'))));
     fs.unlinkSync(path.join(dir, 'deploy/dashboard/flarops_metrics.db'));
     r = runSync(dir);
@@ -543,7 +554,7 @@ pinger:
     const envBefore = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
     c = cli('dashboard-password');
     const envAfter = fs.readFileSync(envFile, 'utf8');
-    check('dashboard-password shows a new password once, with the address', c.status === 0 && /password: \S+/.test(c.stdout) && /address:\s+\S*https:\/\/dashboard\./.test(c.stdout), c.stdout + c.stderr);
+    check('dashboard-password shows a new password once, with the address', c.status === 0 && /password: \S+/.test(c.stdout) && /address:\s+\S*http:\/\/dashboard\./.test(c.stdout) && /HTTPS needs a proxy/.test(c.stdout), c.stdout + c.stderr);
     check('and replaces the hash in deploy/.env', /^DASHBOARD_PASSWORD_HASH='pbkdf2-sha256\$i=600000\$/m.test(envAfter) && envAfter !== envBefore && (envAfter.match(/^DASHBOARD_PASSWORD_HASH=/gm) || []).length === 1, envAfter.slice(0, 300));
   }
 
@@ -737,6 +748,188 @@ topic-setup:
   check('an empty flarops.yaml is refused', r.status === 1 && /no services/i.test(r.err || ''), r.err);
   check('the deployment survives it', read(dir, 'deploy/helm/values.yaml') === valuesBefore);
   fs.writeFileSync(path.join(dir, 'flarops.yaml'), good);
+
+  // 7b. Review findings: what flarops.yaml says is what the deployment gets, and the report says so.
+  {
+    const file = path.join(dir, 'flarops.yaml');
+    const cli = (...args) => spawnSync('node', [CLI, ...args], { cwd: dir, encoding: 'utf8' });
+    const apiYaml = () => read(dir, 'deploy/helm/templates/api.yaml');
+    const dbBlock = /^database:\n(?:  .*\n|    .*\n|      .*\n)*/m;
+    const apiPassword = '  secretEnvs:\n    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n  exposedRoutes:';
+    check('the api declares the database password', good.includes(apiPassword));
+
+    // The database password reaches the api only while api.secretEnvs lists it.
+    fs.writeFileSync(file, good.replace(dbBlock, '').replace(apiPassword, '  exposedRoutes:'));
+    r = runSync(dir);
+    check('removing the database and the api\'s password syncs', r.status === 0, r.err || r.out);
+    check('the api no longer reads a password nothing provides', !/POSTGRES_PASSWORD/.test(apiYaml()), apiYaml().match(/env:[\s\S]{0,400}/));
+    check('CI no longer passes the database password', !/SECRET_DB_PASSWORD:/.test(read(dir, '.github/workflows/deploy.yml')));
+    check('the report says what went', /- database/.test(r.out) && /api\.secretEnvs\.POSTGRES_PASSWORD: removed/.test(r.out) && /you can delete these GitHub secrets: POSTGRES_PASSWORD/.test(r.out), r.out);
+    if (helmRenders) {
+      const err = helmRenders(dir);
+      check('the chart renders without a database', !err, err);
+    }
+    fs.writeFileSync(file, good);
+    r = runSync(dir);
+    check('a database added back is reported as added, not field by field', r.status === 0 && /\+ database/.test(r.out) && !/database\.(user|port|name|volumes|image|type)/.test(r.out), r.out);
+    check('and the api has its password again', /- name: \{\{ "POSTGRES_PASSWORD" \}\}/.test(apiYaml()) && /SECRET_DB_PASSWORD:/.test(read(dir, '.github/workflows/deploy.yml')));
+    r = runSync(dir);
+    check('which settles', /nothing to do/.test(r.out), r.out);
+
+    // A new key for the database does not appear in the api, which still reads the old one.
+    fs.writeFileSync(file, good.replace(dbBlock, (b) => b.replace('    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n', '    POSTGRES_PASSWORD: DB_PW\n')));
+    r = runSync(dir);
+    check('renaming the database\'s key is not an api change', r.status === 0 && !/api\.secretEnvs/.test(r.out) && /database\.secretEnvs/.test(r.out), r.out);
+    check('the api does not get the new key', !/DB_PW/.test(apiYaml()) && /^api:\n(?:  .*\n|    .*\n)*?  secretKeys:\n    - POSTGRES_PASSWORD$/m.test(read(dir, 'deploy/helm/values.yaml')), apiYaml().match(/env:[\s\S]{0,400}/));
+    check('the new key is asked for', /DB_PW\s+read by database's/.test(r.out) || /create these GitHub repository secrets[\s\S]*DB_PW/.test(r.out), r.out);
+    fs.writeFileSync(file, good);
+    runSync(dir);
+
+    // The frontend keeps a secret named like the database password.
+    fs.writeFileSync(file, good.replace(/^(frontend:\n(?:  .*\n|    .*\n)*?)(  ports:\n)/m, '$1  secretEnvs:\n    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n$2'));
+    r = runSync(dir);
+    check('a frontend secret named like the database password reaches it', r.status === 0 && /frontend\.secretEnvs\.POSTGRES_PASSWORD: added/.test(r.out)
+      && /POSTGRES_PASSWORD/.test(read(dir, 'deploy/helm/templates/frontend.yaml') + read(dir, 'deploy/helm/values.yaml').match(/^frontend:\n(?:  .*\n)*/m)[0]), r.out);
+    fs.writeFileSync(file, good);
+    runSync(dir);
+
+    // Numbers in env keep their text.
+    fs.writeFileSync(file, good.replace('    DB_HOST: database\n', '    DB_HOST: database\n    GUILD_ID: 812345678901234567\n    APP_VERSION: 1.10\n'));
+    r = runSync(dir);
+    const values = read(dir, 'deploy/helm/values.yaml');
+    check('a long or trailing-zero number reaches the container as written', r.status === 0 && /GUILD_ID: "812345678901234567"/.test(values) && /APP_VERSION: "1\.10"/.test(values), values.match(/^api:\n(?:  .*\n|    .*\n)*/m));
+    fs.writeFileSync(file, good);
+    runSync(dir);
+
+    // A field left out is its default.
+    fs.writeFileSync(file, good.replace(dbBlock, (b) => b.replace('  user: appuser\n', '')).replace(/^(frontend:\n)  dockerfile: Dockerfile\n  context: frontend\n/m, '$1'));
+    r = runSync(dir);
+    check('removing database.user falls back to the engine\'s user', r.status === 0 && /database\.user: appuser -> postgres/.test(r.out) && /^  user: "postgres"$/m.test(read(dir, 'deploy/helm/values.yaml')), r.out);
+    check('removing frontend.context falls back to the repository root', /frontend\.context: frontend -> \./.test(r.out), r.out);
+    fs.writeFileSync(file, good);
+    r = runSync(dir);
+    check('and putting them back is reported too', /database\.user: postgres -> appuser/.test(r.out), r.out);
+
+    // An engine change is not a version bump, and the data path follows the engine.
+    fs.writeFileSync(file, good.replace(dbBlock, (b) => b.replace('  type: postgres\n', '  type: mysql\n').replace('  image: "postgres:15"\n', '  image: "mysql:8"\n')));
+    r = runSync(dir);
+    check('a database engine change says the data does not carry over', r.status === 0 && /database\.type changed \(postgres -> mysql\): this is a different database engine/.test(r.err) && !/major version/.test(r.err), r.err || r.out);
+    check('and that the data volume is still at postgres\' path', /"data" volume is still mounted at \/var\/lib\/postgresql\/data, where postgres keeps its data - mysql keeps it at \/var\/lib\/mysql/.test(r.err), r.err);
+    fs.writeFileSync(file, good);
+    runSync(dir);
+
+    // Removing a service's URL on the shared database is not a dump of the state.
+    fs.writeFileSync(file, good + '\nreporter:\n  dockerfile: Dockerfile\n  context: reporter\n  ports:\n    - 8080\n  databaseUrls:\n    - DATABASE_URL\n');
+    runSync(dir);
+    fs.writeFileSync(file, good + '\nreporter:\n  dockerfile: Dockerfile\n  context: reporter\n  ports:\n    - 8080\n');
+    r = runSync(dir);
+    check('removing databaseUrls is reported by name, not as JSON', r.status === 0 && /reporter\.databaseUrls: - DATABASE_URL/.test(r.out) && !/\{"/.test(r.out), r.out);
+    fs.writeFileSync(file, good);
+    runSync(dir);
+
+    // Refusals for what helm template would fail on, with the line of the item.
+    const lineNo = (text, needle) => text.split('\n').lastIndexOf(needle) + 1;
+    const refused = [
+      ['a frontend without ports', good.replace(/^(frontend:\n(?:  .*\n)*?)  ports:\n    - 80\n/m, '$1  ports: []\n'), /"frontend\.ports" needs at least one port/, null],
+      ['a health check with nothing to probe', good + '\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  ports: []\n  healthRoute: /health\n', /"worker\.healthRoute" needs a port to probe/, '  healthRoute: /health'],
+      ['a bad port in a list', good.replace('    - 4000\n', '    - 4000\n    - 0\n'), /"api\.ports\[1\]" must be a port number/, '    - 0'],
+      ['a volume written compose-style', good + '\nworker:\n  image: "busybox:1"\n  volumes:\n    - ./uploads:/app/uploads\n', /"worker\.volumes\[0\]" must be a block with name and path/, '    - ./uploads:/app/uploads'],
+      ['a volume without a path, in a list', good + '\nworker:\n  image: "busybox:1"\n  volumes:\n    - name: a\n      path: /a\n    - name: b\n', /"worker\.volumes\[1\]" needs both a name and a path/, '    - name: b'],
+    ];
+    for (const [label, text, message, at] of refused) {
+      fs.writeFileSync(file, text);
+      r = runSync(dir);
+      const line = at ? lineNo(text, at) : null;
+      check(`refuses ${label}`, r.status === 1 && message.test(r.err) && /line \d+/.test(r.err) && (!line || r.err.includes(`line ${line}:`)), `${r.err}${line ? ` (wanted line ${line})` : ''}`);
+    }
+    fs.writeFileSync(file, good + '\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  ports:\n  - 8080\n');
+    r = runSync(dir);
+    check('a sequence at its key\'s indent is read', r.status === 0 && /- name: worker\n[\s\S]*?    ports:\n      - 8080/.test(read(dir, 'deploy/helm/values.yaml')), r.err || r.out);
+    fs.writeFileSync(file, good);
+    runSync(dir);
+
+    // The registry login.
+    const harbor = good.replace(/^  registry: .*$/m, '  registry: harbor.example.com').replace(/^  project: .*$/m, '  project: team');
+    fs.writeFileSync(file, harbor.replace(/^(  repository: .*)$/m, '$1\n  user: robot$team+ci'));
+    r = runSync(dir);
+    check('repositorySettings.user sets the login CI pushes as', r.status === 0 && /^  REGISTRY_USER: robot\$team\+ci$/m.test(read(dir, '.github/workflows/deploy.yml')) && /^  REGISTRY_USER: robot\$team\+ci$/m.test(read(dir, '.github/workflows/pr-capsule.yml')), r.err || r.out);
+    check('a registry change says the credentials must follow', /REGISTRY_PASSWORD/.test(r.err) && /gh secret set REGISTRY_PASSWORD/.test(r.err), r.err);
+    fs.writeFileSync(file, harbor.replace(/^(  repository: .*)$/m, '$1\n  user: "x ${{ github.token }}"'));
+    r = runSync(dir);
+    check('a login that would break the workflow is refused', r.status === 1 && /repositorySettings\.user/.test(r.err), r.err || r.out);
+    const pushedAs = (read(dir, '.github/workflows/deploy.yml').match(/^  REGISTRY_USER: (.*)$/m) || [])[1];
+    fs.writeFileSync(file, good);
+    r = runSync(dir);
+    const backTo = (read(dir, '.github/workflows/deploy.yml').match(/^  REGISTRY_USER: (.*)$/m) || [])[1];
+    check('leaving user out goes back to the login init asked for', r.status === 0 && backTo && backTo !== 'robot$team+ci' && pushedAs === 'robot$team+ci', `${backTo} / ${pushedAs}`);
+    check('the reference describes repositorySettings.user', /^# user: {7}optional - the login CI pushes as/m.test(good));
+
+    // --check says everything a real run would.
+    fs.writeFileSync(file, good.replace(apiPassword, '  secretEnvs:\n    POSTGRES_PASSWORD: POSTGRES_PASSWORD\n    NEW_TOKEN: NEW_TOKEN\n  exposedRoutes:').replace('    DB_HOST: database\n', '    DB_HOST: database\n    CALLBACK: "http://localhost:4000/cb"\n'));
+    let c = cli('sync', '--check');
+    check('sync --check lists the secrets to create', c.status === 1 && /create these GitHub repository secrets[\s\S]*NEW_TOKEN/.test(c.stdout), c.stdout + c.stderr);
+    check('and the localhost warning', /api\.env\.CALLBACK still points at localhost/.test(c.stderr), c.stderr);
+    fs.writeFileSync(file, good);
+
+    // A file Flarops updated is not "hand edited": the state remembers what sync wrote.
+    {
+      const stateFile = path.join(dir, 'deploy/.flarops-state.json');
+      const stateJson = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      check('the state records a hash of each file sync wrote', stateJson.fileHashes && /^[0-9a-f]{64}$/.test(stateJson.fileHashes['deploy/helm/templates/api.yaml'] || ''), Object.keys(stateJson.fileHashes || {}).join(', '));
+      const older = apiYaml().replace('kind: Deployment', 'kind: Deployment\n# rendered by an older Flarops');
+      fs.writeFileSync(path.join(dir, 'deploy/helm/templates/api.yaml'), older);
+      stateJson.fileHashes['deploy/helm/templates/api.yaml'] = require('crypto').createHash('sha256').update(older).digest('hex');
+      fs.writeFileSync(stateFile, JSON.stringify(stateJson, null, 2) + '\n');
+      r = runSync(dir);
+      check('a template an older version rendered is updated without "hand edits"', r.status === 0 && /deploy\/helm\/templates\/api\.yaml/.test(r.out) && !/had hand edits/.test(r.out), r.out);
+    }
+
+    // Nothing is written through a symlink.
+    {
+      const outside = path.join(path.dirname(dir), `outside-${process.pid}.txt`);
+      fs.writeFileSync(outside, 'precious\n');
+      const values = path.join(dir, 'deploy/helm/values.yaml');
+      const valuesText = read(dir, 'deploy/helm/values.yaml');
+      fs.unlinkSync(values);
+      fs.symlinkSync(outside, values);
+      editService(dir, 'api', 'replicas', '5');
+      r = runSync(dir);
+      check('sync refuses to write through a symlinked file', r.status === 1 && /deploy\/helm\/values\.yaml is a symlink/.test(r.err) && fs.readFileSync(outside, 'utf8') === 'precious\n', r.err || r.out);
+      check('and writes nothing else', !/replicas: 5/.test(read(dir, '.github/workflows/deploy.yml') + read(dir, 'deploy/helm/templates/api.yaml')));
+      fs.unlinkSync(values);
+      fs.writeFileSync(values, valuesText);
+
+      const templates = path.join(dir, 'deploy/helm/templates');
+      const moved = path.join(path.dirname(dir), `templates-${process.pid}`);
+      fs.renameSync(templates, moved);
+      fs.symlinkSync(moved, templates);
+      fs.writeFileSync(file, good + '\nworker:\n  dockerfile: Dockerfile\n  context: worker\n  ports:\n    - 8080\n');
+      r = runSync(dir);
+      check('sync refuses to write through a symlinked directory', r.status === 1 && /deploy\/helm\/templates \(on the way to deploy\/helm\/templates\/\S+\) is a symlink/.test(r.err) && !fs.existsSync(path.join(moved, 'worker.yaml')), r.err || r.out);
+      fs.unlinkSync(templates);
+      fs.renameSync(moved, templates);
+
+      const envFile = path.join(dir, 'deploy/.env');
+      const envText = fs.readFileSync(envFile, 'utf8');
+      fs.unlinkSync(envFile);
+      fs.symlinkSync(outside, envFile);
+      c = cli('dashboard-password');
+      check('dashboard-password refuses a symlinked deploy/.env', c.status === 1 && /deploy\/\.env is a symlink/.test(c.stderr) && fs.readFileSync(outside, 'utf8') === 'precious\n', c.stdout + c.stderr);
+      fs.unlinkSync(envFile);
+      fs.writeFileSync(envFile, envText, { mode: 0o644 });
+      c = cli('dashboard-password');
+      check('dashboard-password leaves deploy/.env readable by its owner only', c.status === 0 && (fs.statSync(envFile).mode & 0o777) === 0o600, (fs.statSync(envFile).mode & 0o777).toString(8));
+      fs.unlinkSync(envFile);
+      c = cli('dashboard-password');
+      check('and creates it that way', c.status === 0 && (fs.statSync(envFile).mode & 0o777) === 0o600 && /^DASHBOARD_PASSWORD_HASH=/m.test(fs.readFileSync(envFile, 'utf8')), (fs.statSync(envFile).mode & 0o777).toString(8));
+      fs.writeFileSync(envFile, envText);
+      fs.unlinkSync(outside);
+
+      fs.writeFileSync(file, good);
+      r = runSync(dir);
+      check('back to the original after the symlink checks', r.status === 0, r.err || r.out);
+    }
+  }
 
   // 8. Without the recorded state there is nothing to merge into.
   const statePath = path.join(dir, 'deploy', '.flarops-state.json');

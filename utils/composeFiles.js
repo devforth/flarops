@@ -11,11 +11,20 @@ const VARIANT = /^(docker-)?compose[.-][A-Za-z0-9_.-]*\.ya?ml$/i;
 
 // Whether the operator approved a variant compose file; null until asked.
 let variantApproved = null;
+// The one the operator chose among several, as an absolute path.
+let chosenVariant = null;
 
-// null resets it: the test harness runs many generations in one process.
-function approveVariantComposeFile(approved) {
+// null resets it: the test harness runs many generations in one process. A string approves that file
+// alone (a path relative to the repository root, or absolute).
+function approveVariantComposeFile(approved, baseDir) {
+  chosenVariant = typeof approved === 'string' ? path.resolve(baseDir || process.cwd(), approved) : null;
   variantApproved = approved === null ? null : !!approved;
 }
+
+// A production variant is the likelier base for a deployment than a development one.
+const PRODUCTION_VARIANT = /(^|[.-])prod(uction)?([.-]|$)/i;
+const productionFirst = (names) => [...names.filter(n => PRODUCTION_VARIANT.test(path.basename(n).replace(/\.ya?ml$/i, ''))),
+  ...names.filter(n => !PRODUCTION_VARIANT.test(path.basename(n).replace(/\.ya?ml$/i, '')))];
 
 const SUBDIRS = ['deploy', 'docker', '.docker', 'compose', 'infra', 'ops'];
 
@@ -46,8 +55,12 @@ function listComposeFiles(baseDir) {
   }
 
   if (variantApproved === false) return [];
+  if (chosenVariant) {
+    const chosen = found.filter(f => path.resolve(baseDir, f) === chosenVariant);
+    if (chosen.length > 0) return chosen;
+  }
 
-  return found;
+  return productionFirst(found);
 }
 
 function composeBaseDir(baseDir, composeFile) {

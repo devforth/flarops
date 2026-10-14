@@ -3,6 +3,11 @@ const { registrySettings, imageRepository, isDockerHub } = require('../utils/reg
 const werfCleanupStep = require('./werfCleanup.js');
 const { TERRAFORM_VERSION, WERF_VERSION } = require('../utils/toolVersions.js');
 const { prEstimateMiB } = require('../utils/prEstimate.js');
+const { prHost } = require('../utils/dashboardAccess.js');
+
+// The capacity oracle answers "unknown" while it has no fresh fleet data (a dashboard pod that just
+// started): asked again every 15 seconds, about two minutes in all.
+const ORACLE_ATTEMPTS = 8;
 
 module.exports = function prCapsuleYmlTemplate(config) {
   const registry = registrySettings(config);
@@ -99,15 +104,7 @@ module.exports = function prCapsuleYmlTemplate(config) {
 ` : '';
 
 
-  const domainParts = config.domain.split('.');
-  let prDomainLogic;
-  if (domainParts.length > 2) {
-    const subdomain = domainParts[0];
-    const baseDomain = domainParts.slice(1).join('.');
-    prDomainLogic = `${subdomain}-pr-\${{ github.event.pull_request.number }}.${baseDomain}`;
-  } else {
-    prDomainLogic = `pr-\${{ github.event.pull_request.number }}.${config.domain}`;
-  }
+  const prDomainLogic = prHost(config.domain, '${{ github.event.pull_request.number }}');
 
   // FALLBACK capsule size, used only when production cannot be measured yet.
   const requiredMi = prEstimateMiB(config);
@@ -147,7 +144,7 @@ ${registryEnv ? '  ' + registryEnv + '\n' : ''}
 jobs:
   deploy-capsule:
     name: Deploy PR Capsule
-    if: github.event.action != 'closed'
+    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -168,6 +165,7 @@ jobs:
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: ${TERRAFORM_VERSION}
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -206,12 +204,18 @@ ${loginStep}
           werf build --repo ${repoString}
 
       - name: Decide where this capsule goes
-${terraformProviderEnv}        run: |
+${terraformProviderEnv}          BASE_REF: \${{ github.base_ref }}
+        run: |
           set -euo pipefail
 
 ${ciSsh.helpers()}
 
 ${ciSsh.slotLock()}
+
+${ciSsh.placementMarks()}
+
+          EC2_IP=$(terraform -chdir=deploy/terraform output -raw public_ip)
+          trap 'flarops_slots_unlock "$EC2_IP"' EXIT
 
           TARGET_NODE=$(kubectl get pvc -n "\${{ env.PR_NAMESPACE }}" \\
             -o jsonpath='{range .items[*]}{.metadata.annotations.volume\\.kubernetes\\.io/selected-node}{"\\n"}{end}' 2>/dev/null | grep -m1 . || true)
@@ -221,9 +225,26 @@ ${ciSsh.slotLock()}
           fi
 
           if [ -n "$TARGET_NODE" ]; then
-            echo "Capsule already runs on $TARGET_NODE - keeping it there."
-            echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
-            exit 0
+            flarops_slots_lock "$EC2_IP"
+            case "$(flarops_node_state "$TARGET_NODE")" in
+              present)
+                flarops_mark_placing "$TARGET_NODE"
+                flarops_slots_unlock "$EC2_IP"
+                echo "Capsule already runs on $TARGET_NODE - keeping it there."
+                echo "TARGET_NODE=$TARGET_NODE" >> "$GITHUB_ENV"
+                exit 0
+                ;;
+              missing)
+                flarops_slots_unlock "$EC2_IP"
+                echo "::warning::This capsule ran on $TARGET_NODE, which no longer exists, and its volumes went with it. Recreating the environment (and its database copy) on another node."
+                kubectl delete namespace "\${{ env.PR_NAMESPACE }}" --ignore-not-found --wait=true --timeout=300s
+                TARGET_NODE=""
+                ;;
+              *)
+                echo "::error::Could not check whether $TARGET_NODE still exists - the Kubernetes API did not answer."
+                exit 1
+                ;;
+            esac
           fi
 
           REQUIRED_MI=$(kubectl top pods -n "\${{ env.MAIN_NAMESPACE }}" --no-headers 2>/dev/null \\
@@ -241,13 +262,15 @@ ${ciSsh.slotLock()}
           }
 
           OUT=""
-          for attempt in 1 2 3; do
+          for attempt in $(seq 1 ${ORACLE_ATTEMPTS}); do
             if OUT=$(ask_capacity 2>/tmp/capacity.err); then
-              break
+              if [ "$(printf '%s' "$OUT" | head -1)" != "unknown" ]; then break; fi
+              echo "The dashboard cannot answer yet (attempt $attempt/${ORACLE_ATTEMPTS}): $(printf '%s' "$OUT" | sed -n 's/^reason=//p')"
+            else
+              echo "Capacity oracle not answering (attempt $attempt/${ORACLE_ATTEMPTS}): $(cat /tmp/capacity.err)"
+              OUT=""
             fi
-            echo "Capacity oracle not answering (attempt $attempt): $(cat /tmp/capacity.err)"
-            OUT=""
-            sleep 10
+            if [ "$attempt" -lt ${ORACLE_ATTEMPTS} ]; then sleep 15; fi
           done
 
           if [ -z "$OUT" ]; then
@@ -260,7 +283,7 @@ ${ciSsh.slotLock()}
           TARGET_NODE=$(printf '%s' "$OUT" | sed -n 's/^node=//p')
 
           if [ "$VERDICT" = "unknown" ]; then
-            echo "::error::The dashboard has no fresh fleet data, so it cannot say whether this capsule fits. Refusing to deploy blind."
+            echo "::error::The dashboard still had no fresh fleet data after ${ORACLE_ATTEMPTS} attempts, so it cannot say whether this capsule fits. Refusing to deploy blind."
             exit 1
           fi
 
@@ -301,16 +324,43 @@ ${ciSsh.slotLock()}
             fi
           fi
 
+          if [ "$VERDICT" = "yes" ]; then
+            if [ -z "$TARGET_NODE" ]; then
+              echo "::error::The capacity oracle said yes but named no node."
+              exit 1
+            fi
+            flarops_slots_lock "$EC2_IP"
+            case "$(flarops_node_state "$TARGET_NODE")" in
+              present)
+                flarops_mark_placing "$TARGET_NODE"
+                ;;
+              missing)
+                echo "::warning::$TARGET_NODE was removed while this capsule was being placed - adding a worker instead."
+                VERDICT=no
+                ;;
+              *)
+                echo "::error::Could not check whether $TARGET_NODE still exists - the Kubernetes API did not answer."
+                exit 1
+                ;;
+            esac
+            flarops_slots_unlock "$EC2_IP"
+          fi
+
           if [ "$VERDICT" = "no" ]; then
             echo "::warning::No node has room for this capsule. Adding a worker..."
 
-            cd deploy/terraform
-            terraform init
+            echo "Adding it with deploy/terraform from $BASE_REF, the base branch - never this pull request's."
+            BASE_TREE="$RUNNER_TEMP/flarops-base"
+            git worktree add --detach "$BASE_TREE" "origin/$BASE_REF" > /dev/null
+            if [ ! -d "$BASE_TREE/deploy/terraform" ]; then
+              echo "::error::$BASE_REF has no deploy/terraform, so there is no reviewed Terraform to add a worker with."
+              exit 1
+            fi
+            cd "$BASE_TREE/deploy/terraform"
+            terraform init -input=false
             terraform workspace select -or-create main
 
-            EC2_IP=$(terraform output -raw public_ip)
             flarops_slots_lock "$EC2_IP"
-            trap 'flarops_slots_unlock "$EC2_IP"' EXIT
             ALL_OUTPUTS=$(terraform output -json)
             CURRENT_SLOTS=$(printf '%s' "$ALL_OUTPUTS" | python3 -c "import json,sys; v=json.load(sys.stdin).get('worker_slots',{}).get('value',[]); print(json.dumps(v if isinstance(v,list) else []))")
             NEW_SLOTS=$(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; s=[int(x) for x in json.load(sys.stdin)]; f=next(n for n in range(1,1000) if n not in s); print(json.dumps(sorted(s+[f])))")
@@ -322,11 +372,12 @@ ${ciSsh.slotLock()}
             fi
             NEW_NODE="\${INSTANCE_NAME}-worker-\${NEW_SLOT}"
             flarops_ssh "$EC2_IP" "sudo k3s kubectl delete node \${NEW_NODE} --ignore-not-found" > /dev/null
+            flarops_mark_placing "$NEW_NODE"
             echo "Worker slots $CURRENT_SLOTS -> $NEW_SLOTS"
             terraform apply -var="worker_slots=$NEW_SLOTS" -auto-approve -lock-timeout=5m
             flarops_slots_unlock "$EC2_IP"
-            trap - EXIT
             cd - > /dev/null
+            git worktree remove --force "$BASE_TREE"
 
             echo "Waiting for $NEW_NODE to join..."
             flarops_wait_for_k3s "$EC2_IP"
@@ -385,10 +436,16 @@ ${secretEnvBlock}${dbPasswordEnvLine}          SECRET_REGISTRY_PASSWORD: \${{ se
             --set domain=\${{ env.PR_DOMAIN }} \\
             --set "dataNodeSelector.kubernetes\\.io/hostname=$TARGET_NODE" \\
             --values deploy/helm/flarops-ci-values.json
+
+      - name: Release the placement mark
+        if: env.TARGET_NODE != ''
+        run: |
+          kubectl patch configmap flarops-placing -n default --type merge \\
+            -p "{\\"data\\":{\\"\${TARGET_NODE}__\${PR_ENV_NAME}\\":null}}" > /dev/null 2>&1 || true
 ${dbCloningLogic}${onDockerHub ? '' : werfCleanupStep(repoString) + '\n'}
   cleanup-capsule:
     name: Teardown PR Capsule
-    if: github.event.action == 'closed'
+    if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -409,6 +466,7 @@ ${dbCloningLogic}${onDockerHub ? '' : werfCleanupStep(repoString) + '\n'}
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: ${TERRAFORM_VERSION}
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: deploy/terraform
@@ -458,6 +516,8 @@ ${ciSsh.helpers()}
 
 ${ciSsh.slotLock()}
 
+${ciSsh.placementMarks()}
+
           cd deploy/terraform
           terraform init
           terraform workspace select -or-create main
@@ -484,11 +544,22 @@ ${ciSsh.slotLock()}
             echo "::error::Could not read instance_name from Terraform. Refusing to guess node names - a wrong guess drains a node that is carrying work."
             exit 1
           fi
+          if ! flarops_read_placing; then
+            echo "::warning::Could not read the placement marks - leaving every worker alone."
+            exit 0
+          fi
+          flarops_prune_placing
 
           FREED=""
           for SLOT in $(printf '%s' "$CURRENT_SLOTS" | python3 -c "import json,sys; print(' '.join(str(s) for s in sorted((int(x) for x in json.load(sys.stdin)), reverse=True)))"); do
             NODE_NAME="\${INSTANCE_NAME}-worker-\${SLOT}"
             echo "Checking $NODE_NAME ..."
+
+            HOLDERS=$(flarops_placing_on "$NODE_NAME")
+            if [ -n "$HOLDERS" ]; then
+              echo "  being placed on by $HOLDERS - keeping it."
+              continue
+            fi
 
             if ! RAW=$(kubectl get pods --all-namespaces --field-selector "spec.nodeName=$NODE_NAME" -o json 2>/tmp/kubectl.err); then
               echo "  could not query pods on $NODE_NAME ($(cat /tmp/kubectl.err)) - leaving it alone."

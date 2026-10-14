@@ -56,10 +56,11 @@ const ALLOWED_GENERATED_COMMENTS = new Set([
   '# Worker nodes, by slot number. The PR-capsule workflow adds and removes them;',
   '# there is no need to edit this by hand.',
   '# Read by the server and every worker. A change applies to NEW nodes only -',
-  '# replace an existing one (terraform apply -replace=...) to upgrade it.',
+  '# replace an existing one (terraform workspace select main, then',
+  '# terraform apply -replace=...) to upgrade it.',
   '# Changes to the AMI or to user_data reach only new instances; replace this',
-  '# one deliberately (terraform apply -replace=...) to apply them here. The',
-  "# cluster's data lives on its root volume.",
+  '# one deliberately to apply them here (terraform workspace select main, then',
+  "# terraform apply -replace=...). The cluster's data lives on its root volume.",
 ]);
 function generatedComments(dir) {
   const git = (args) => execFileSync('git', args, { cwd: dir }).toString().split('\n').filter(Boolean);
@@ -553,6 +554,19 @@ async function urlBreakingPasswordSurvives() {
     check('nothing reached the symlink\'s target', !fs.existsSync(path.join(result.dir, 'public', 'env.txt')));
     fs.rmSync(result.parent, { recursive: true, force: true });
     fs.rmSync(parent, { recursive: true, force: true });
+
+    // The same link made while init waits on a question: checked again before the first write.
+    const late = await generate(path.join(FIXTURES, 'a-full'), {
+      'AWS region': () => {
+        fs.mkdirSync(path.join(process.cwd(), 'public'), { recursive: true });
+        fs.mkdirSync(path.join(process.cwd(), 'deploy'), { recursive: true });
+        fs.symlinkSync('../public/env.txt', path.join(process.cwd(), 'deploy', '.env'));
+        return 'us-west-2';
+      },
+    });
+    check('a symlink made during the questions stops init before it writes', !late.ok && /deploy\/\.env is a symlink/.test(late.log), late.log.slice(-400));
+    check('and nothing reached its target', !fs.existsSync(path.join(late.dir, 'public', 'env.txt')) && !fs.existsSync(path.join(late.dir, 'flarops.yaml')));
+    fs.rmSync(late.parent, { recursive: true, force: true });
   }
 
   console.log('\n  a repository with no commits yet');
@@ -571,12 +585,76 @@ async function urlBreakingPasswordSurvives() {
     const out = plain.log.replace(/\x1b\[[0-9;]*m/g, '');
     const logFile = path.join(plain.dir, 'deploy', 'flarops-init.log');
     check('without --verbose, what init found stays off the screen', plain.ok && !/INFO:|Created \.gitignore|Discovered/.test(out), out.slice(0, 600));
+    {
+      const st = JSON.parse(fs.readFileSync(path.join(plain.dir, 'deploy', '.flarops-state.json'), 'utf8'));
+      const keys = Object.keys(st.fileHashes || {});
+      check('init records a hash of each file sync compares',
+        ['deploy/helm/values.yaml', 'werf.yaml', '.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml', 'deploy/helm/templates/api.yaml'].every(k => keys.includes(k))
+        && keys.every(k => /^[0-9a-f]{64}$/.test(st.fileHashes[k]))
+        && st.fileHashes['werf.yaml'] === require('crypto').createHash('sha256').update(fs.readFileSync(path.join(plain.dir, 'werf.yaml'), 'utf8')).digest('hex'),
+        keys.join(', '));
+    }
     check('and is written to deploy/flarops-init.log, which git ignores',
       fs.existsSync(logFile) && /INFO:/.test(fs.readFileSync(logFile, 'utf8')) && /deploy\/flarops-init\.log/.test(fs.readFileSync(path.join(plain.dir, '.gitignore'), 'utf8')),
       fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').slice(0, 300) : 'no log file');
     check('the screen ends with the next steps and where the details are', /Next steps/.test(out) && /deploy\/flarops-init\.log\s*$/.test(out), out.slice(-300));
     check('no line is longer than 100 characters', out.split('\n').every(l => l.length <= 100), out.split('\n').filter(l => l.length > 100).join('\n').slice(0, 400));
     fs.rmSync(plain.parent, { recursive: true, force: true });
+
+    // Every WARNING printed is counted in the banner, wherever it came from; the banner fits a narrow terminal.
+    const realColumns = process.stdout.columns;
+    process.stdout.columns = 72;
+    let warned;
+    try {
+      warned = await generate(path.join(FIXTURES, 'zj-reservedsecrets'), {}, { verbose: false });
+    } finally {
+      process.stdout.columns = realColumns;
+    }
+    const wout = warned.log.replace(/\x1b\[[0-9;]*m/g, '');
+    const printed = (wout.match(/WARNING/g) || []).length;
+    const counted = Number((wout.match(/Check the (\d+) warnings? above/) || [])[1] || 0);
+    check('the banner counts every WARNING printed', warned.ok && printed > 0 && counted === printed, `printed ${printed}, banner says ${counted}`);
+    check('and offers the step to resolve them', /Resolve the warnings above/.test(wout), wout.slice(-600));
+    check('the banner fits a 72-column terminal', wout.split('\n').filter(l => l.startsWith('#')).every(l => l.length <= 70),
+      wout.split('\n').filter(l => l.startsWith('#')).join('\n'));
+    const envMode = fs.statSync(path.join(warned.dir, 'deploy', '.env')).mode & 0o777;
+    check('deploy/.env is readable by its owner only', envMode === 0o600, envMode.toString(8));
+    fs.rmSync(warned.parent, { recursive: true, force: true });
+
+    // Running init again after deleting flarops.yaml keeps the database password it generated, and says
+    // on screen which answers the existing Terraform did not take.
+    const src = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-test-'));
+    const proj = path.join(src, 'rerun');
+    fs.mkdirSync(path.join(proj, 'backend'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'docker-compose.yml'), 'services:\n  db:\n    image: postgres:16\n  api:\n    build: ./backend\n    ports: ["4000:4000"]\n    environment:\n      DATABASE_URL: postgres://app@db:5432/app\n');
+    fs.writeFileSync(path.join(proj, 'backend', 'Dockerfile'), 'FROM node:20\nCMD ["node", "index.js"]\n');
+    fs.writeFileSync(path.join(proj, 'backend', 'package.json'), '{"name":"api","dependencies":{"express":"4","pg":"8"}}');
+    fs.writeFileSync(path.join(proj, 'backend', 'index.js'), "const { Pool } = require('pg');\nnew Pool({ connectionString: process.env.DATABASE_URL });\nrequire('express')().listen(4000);\n");
+    const first = await generate(proj, {}, { verbose: false });
+    const firstEnv = fs.readFileSync(path.join(first.dir, 'deploy', '.env'), 'utf8');
+    const firstPassword = (firstEnv.match(/^POSTGRES_PASSWORD="?([^"\n]*)/m) || [])[1];
+    fs.rmSync(path.join(first.dir, 'flarops.yaml'));
+    const again = await generate(first.dir, { 'AWS region': 'eu-central-1' }, { verbose: false });
+    const againOut = again.log.replace(/\x1b\[[0-9;]*m/g, '').replace(/\s+/g, ' ');
+    const deployYml = again.ok ? fs.readFileSync(path.join(again.dir, '.github/workflows/deploy.yml'), 'utf8') : '';
+    check('a re-run keeps the generated database password wired', again.ok && !!firstPassword && /SECRET_DB_PASSWORD/.test(deployYml) && /POSTGRES_PASSWORD/.test(fs.readFileSync(path.join(again.dir, 'flarops.yaml'), 'utf8')),
+      (again.error && again.error.stack) || deployYml.split('\n').filter(l => /SECRET/.test(l)).join('\n'));
+    check('and lists it among the secrets to create', /^\s+POSTGRES_PASSWORD\s*$/m.test(again.log.replace(/\x1b\[[0-9;]*m/g, '')), againOut.slice(-700));
+    check('a re-run says on screen that the existing Terraform kept its own region', /WARNING: deploy\/terraform\/ already existed and was kept as it was, so these answers were NOT applied to it: the region \(answered eu-central-1; it keeps us-west-2\)/.test(againOut), againOut.slice(0, 900));
+    fs.rmSync(first.parent, { recursive: true, force: true });
+    fs.rmSync(again.parent, { recursive: true, force: true });
+    fs.rmSync(src, { recursive: true, force: true });
+
+    // CLAUDE.md as a link to AGENTS.md, the usual setup, is written through rather than refused.
+    const viaLink = await generate(path.join(FIXTURES, 'a-full'), {}, { verbose: false, prepare: (dir) => {
+      fs.writeFileSync(path.join(dir, 'AGENTS.md'), '# Project notes\n');
+      fs.symlinkSync('AGENTS.md', path.join(dir, 'CLAUDE.md'));
+    } });
+    const agentsText = viaLink.ok ? fs.readFileSync(path.join(viaLink.dir, 'AGENTS.md'), 'utf8') : '';
+    check('a CLAUDE.md linked to AGENTS.md does not stop init', viaLink.ok, viaLink.error && viaLink.error.message);
+    check('AGENTS.md gets the Flarops section once, and stays the link target',
+      (agentsText.match(/flarops/gi) || []).length > 0 && !/^@AGENTS\.md/m.test(agentsText) && fs.lstatSync(path.join(viaLink.dir, 'CLAUDE.md')).isSymbolicLink(), agentsText.slice(0, 300));
+    fs.rmSync(viaLink.parent, { recursive: true, force: true });
   }
 
   console.log('\n  question order');
@@ -602,8 +680,109 @@ async function urlBreakingPasswordSurvives() {
     check('the compose question comes first, before the operator questions', compose === 0 && registry > compose, q.join(' | '));
     check('the code changes are asked together, after the operator questions', code > region && lower > region && Math.abs(lower - code) === 1, q.join(' | '));
     check('and nothing is asked after them', Math.max(code, lower) === q.length - 1, q.join(' | '));
+    check('the state bucket is created only after every question', r.bucketCreatedAfter === q.length, `created after ${r.bucketCreatedAfter} of ${q.length} questions`);
     fs.rmSync(r.parent, { recursive: true, force: true });
+
+    // Saying yes to both: every form of the lowercase reads is rewritten, and the frontend keeps its
+    // own SITE_URL variable apart from the backend's address.
+    fs.writeFileSync(path.join(proj, 'backend', 'index.js'), "const { Client } = require('pg');\nconst { db_host, db_user: user } = process.env;\nnew Client({ host: db_host, user, database: process.env['db_name'], password: process.env.db_password });\nrequire('express')().listen(4000);\n");
+    fs.writeFileSync(path.join(proj, 'frontend', 'src', 'site.js'), "export const site = import.meta.env.VITE_SITE_URL;\n");
+    const yes = await generate(proj, { 'Base the deployment on it': 'y', 'Apply it?': 'y', 'refactor them': 'y' });
+    const code1 = yes.ok ? fs.readFileSync(path.join(yes.dir, 'backend', 'index.js'), 'utf8') : '';
+    check('the uppercase rewrite covers destructuring and bracket reads', /\{ DB_HOST: db_host, DB_USER: user \} = process\.env/.test(code1) && /process\.env\['DB_NAME'\]/.test(code1) && /process\.env\.DB_PASSWORD/.test(code1), code1);
+    const yesYaml = yes.ok ? fs.readFileSync(path.join(yes.dir, 'flarops.yaml'), 'utf8') : '';
+    check('and flarops.yaml names the variables the code now reads', /DB_HOST: database/.test(yesYaml) && !/db_host/.test(yesYaml), yesYaml.slice(0, 600));
+    check('the rewritten files are listed on screen', /The backend now reads DB_HOST.* in backend\/index\.js/.test(yes.log.replace(/\x1b\[[0-9;]*m/g, '').replace(/\s+/g, ' ')), yes.log.slice(-800));
+    const front = yes.ok ? fs.readFileSync(path.join(yes.dir, 'frontend', 'src', 'api.js'), 'utf8') : '';
+    check('the frontend reads the backend from VITE_API_URL, not the site URL variable', /VITE_API_URL/.test(front) && !/VITE_SITE_URL/.test(front) && !/VITE_SITE_URL: ""/.test(yesYaml), front);
+    fs.rmSync(yes.parent, { recursive: true, force: true });
+
+    // A key read in a form the rewrite does not cover is not offered.
+    fs.writeFileSync(path.join(proj, 'backend', 'config.py'), "import os\nhost = os.environ.get('db_host')\nbad = os.environ.copy()['db_host']\n");
+    fs.writeFileSync(path.join(proj, 'backend', 'settings.json'), '{"note": "process.env.db_host"}\n');
+    const partial = await generate(proj, { 'Base the deployment on it': 'y', 'Apply it?': 'n', 'refactor them': 'y' });
+    const lowerQ = partial.questions.find(x => /lowercase environment variables/.test(x)) || '';
+    check('a variable that cannot be rewritten everywhere is not offered', partial.ok && lowerQ && !/db_host/.test(lowerQ), lowerQ || partial.questions.join(' | '));
+    fs.rmSync(partial.parent, { recursive: true, force: true });
     fs.rmSync(src, { recursive: true, force: true });
+
+    // Several compose variants: the operator picks one, a production one listed first.
+    const vsrc = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-test-'));
+    const vproj = path.join(vsrc, 'variants');
+    fs.cpSync(path.join(FIXTURES, 'u-variantcompose'), vproj, { recursive: true });
+    fs.copyFileSync(path.join(vproj, 'docker-compose-dev.yaml'), path.join(vproj, 'docker-compose.prod.yml'));
+    fs.writeFileSync(path.join(vproj, 'docker-compose-dev.yaml'), 'services:\n  devonly:\n    image: mailhog/mailhog:v1.0.1\n');
+    const v = await generate(vproj, { 'which one': '' });
+    const vq = v.questions.find(x => /which one/.test(x)) || '';
+    const vout = v.log.replace(/\x1b\[[0-9;]*m/g, '');
+    check('several compose variants are listed, the production one first', /1\. docker-compose\.prod\.yml/.test(vout) && /2\. docker-compose-dev\.yaml/.test(vout) && /\[1\]/.test(vq), vout.slice(0, 500));
+    check('and Enter takes it', v.ok && fs.readdirSync(path.join(v.dir, 'deploy/helm/templates')).includes('support-cache.yaml'), v.ok ? fs.readdirSync(path.join(v.dir, 'deploy/helm/templates')).join(' ') : v.error && v.error.message);
+    fs.rmSync(v.parent, { recursive: true, force: true });
+    const v2 = await generate(vproj, { 'which one': '2' });
+    check('another one can be chosen by number', v2.ok && !fs.readdirSync(path.join(v2.dir, 'deploy/helm/templates')).includes('support-cache.yaml'),
+      v2.ok ? fs.readdirSync(path.join(v2.dir, 'deploy/helm/templates')).join(' ') : v2.error && v2.error.message);
+    fs.rmSync(v2.parent, { recursive: true, force: true });
+    fs.rmSync(vsrc, { recursive: true, force: true });
+  }
+
+  console.log('\n  templates');
+  {
+    const access = require('../utils/dashboardAccess.js');
+    const { safeBranch } = require('../utils/branch.js');
+    const { prEstimateMiB } = require('../utils/prEstimate.js');
+    const writeTerraform = require('../templates/terraform.js');
+    const base = { projectName: 'demo', registryUser: 'u', awsRegion: 'us-west-2' };
+    const hosts = (d) => [access.dashboardHost(d), access.prHost(d, 7)].join(' ');
+    check('hosts never go above the zone of a multi-label suffix',
+      hosts('shop.co.uk') === 'dashboard.shop.co.uk pr-7.shop.co.uk' && hosts('app.shop.co.uk') === 'dashboard.shop.co.uk app-pr-7.shop.co.uk',
+      `${hosts('shop.co.uk')} | ${hosts('app.shop.co.uk')}`);
+    check('and stay next to a subdomain, under an apex',
+      hosts('app.example.com') === 'dashboard.example.com app-pr-7.example.com' && hosts('example.com') === 'dashboard.example.com pr-7.example.com',
+      `${hosts('app.example.com')} | ${hosts('example.com')}`);
+    const prWf = require('../templates/pr-capsule.yml.js')({ ...base, domain: 'shop.com.au' });
+    check('the PR workflow and the dashboard chart use the same hosts',
+      /PR_DOMAIN: pr-\$\{\{ github\.event\.pull_request\.number \}\}\.shop\.com\.au\n/.test(prWf) &&
+      /host: dashboard\.shop\.com\.au\n/.test(require('../templates/dashboard.yaml.js')({ ...base, domain: 'shop.com.au' })));
+    const tfDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-test-tf-'));
+    writeTerraform({ ...base, projectName: 'p'.repeat(60), domain: 'app.shop.co.uk', publicKey: 'k', remoteStateBucket: 'b', terraformDir: tfDir,
+      cloudflareApiToken: 't', cloudflareZoneId: 'z', writeFileIfNotExists: (f, c) => fs.writeFileSync(f, c) });
+    const mainTf = fs.readFileSync(path.join(tfDir, 'main.tf'), 'utf8');
+    const instanceName = (fs.readFileSync(path.join(tfDir, 'variables.tf'), 'utf8').match(/variable "instance_name" \{[\s\S]*?default\s*=\s*"([^"]*)"/) || [])[1] || '';
+    check('Terraform keeps the same list of multi-label suffixes', access.MULTI_LABEL_SUFFIXES.every(s => mainTf.includes(`"${s}"`)));
+    check('a worker hostname fits in 63 characters, slot 999 included', instanceName.length > 0 && `${instanceName}-worker-999`.length <= 63, instanceName);
+    fs.rmSync(tfDir, { recursive: true, force: true });
+
+    check('a branch that is not a plain name is refused',
+      safeBranch('release/1.0') === 'release/1.0' && ['x$(touch${IFS}/tmp/p)', '{a}', '-x', 'a..b', '', 'a b', "a'b"].every(b => safeBranch(b) === null));
+    const deployWf = require('../templates/deploy.yml.js')({ ...base, domain: 'example.com', deployBranch: 'x$(id)' });
+    const md = require('../templates/FLAROPS.md.js')({ ...base, domain: 'example.com', deployBranch: 'feature/x' });
+    check('deploy.yml and FLAROPS.md quote the branch, and fall back to main',
+      /branches: \['main'\]/.test(deployWf) && !/\$\(id\)/.test(deployWf) && /git push origin 'feature\/x'/.test(md), md.match(/git push.*/));
+    check('without Cloudflare the addresses are http://, with a word on HTTPS',
+      /Application: http:\/\//.test(deployWf) && /HTTPS needs a proxy/.test(deployWf) && /Dashboard: http:\/\/dashboard\.example\.com/.test(md) &&
+      /Application: https:\/\//.test(require('../templates/deploy.yml.js')({ ...base, domain: 'example.com', hasCloudflare: true })));
+    {
+      const said = [];
+      const realLog = console.log;
+      console.log = (...a) => said.push(a.join(' '));
+      try { access.printDashboardLogin({ password: 'p', domain: 'example.com', tls: false }); } finally { console.log = realLog; }
+      check('the login box shows http:// when there is no TLS', said.some(l => /http:\/\/dashboard\.example\.com/.test(l)) && access.appScheme({}) === 'http', said.join(' | '));
+    }
+
+    const setups = (prWf.match(/hashicorp\/setup-terraform@/g) || []).length + (deployWf.match(/hashicorp\/setup-terraform@/g) || []).length;
+    const unwrapped = (prWf.match(/terraform_wrapper: false/g) || []).length + (deployWf.match(/terraform_wrapper: false/g) || []).length;
+    check('every setup-terraform step turns its wrapper off', setups === 3 && unwrapped === setups, `${unwrapped}/${setups}`);
+    check('both PR jobs refuse pull requests from forks', (prWf.match(/github\.event\.pull_request\.head\.repo\.full_name == github\.repository/g) || []).length === 2);
+    check('a worker is added with the base branch\'s Terraform', /git worktree add --detach "\$BASE_TREE" "origin\/\$BASE_REF"/.test(prWf) &&
+      /cd "\$BASE_TREE\/deploy\/terraform"[\s\S]*terraform apply -var="worker_slots=\$NEW_SLOTS"/.test(prWf) && /BASE_REF: \$\{\{ github\.base_ref \}\}/.test(prWf));
+    check('an "unknown" from the capacity oracle is asked again', /!= "unknown" \]; then break; fi/.test(prWf));
+    check('placement marks the node and reclaim skips marked nodes only',
+      /flarops_mark_placing "\$NEW_NODE"\n\s*echo "Worker slots/.test(prWf) && /flarops_mark_placing "\$TARGET_NODE"/.test(prWf) &&
+      /Release the placement mark/.test(prWf) && /HOLDERS=\$\(flarops_placing_on "\$NODE_NAME"\)/.test(prWf) && !/joined less than/.test(prWf));
+    check('a capsule whose node is gone is placed again', /missing\)\n\s*flarops_slots_unlock "\$EC2_IP"\n[\s\S]*?kubectl delete namespace/.test(prWf));
+
+    check('the PR estimate counts own databases and support services',
+      prEstimateMiB({ hasBackend: true, additionalServices: [{ db: { shared: false } }, { db: { shared: true } }], supportServices: [{}] }) === 256 + 128 * 3 + 256);
   }
 
   console.log('\n  flarops.yaml reader');
@@ -639,7 +818,7 @@ async function urlBreakingPasswordSurvives() {
     }
     check('an empty or invalid domain is asked again', domainAsked === 3, `asked ${domainAsked} times`);
     check('the accepted domain is lowercased, a pasted URL trimmed to its host', answers && answers.domain === 'app.example.com', answers && answers.domain);
-    check('the addresses that follow from it are shown', said.some(l => /dashboard: +https:\/\/dashboard\.example\.com/.test(l)) && said.some(l => /app-pr-<N>\.example\.com/.test(l)), said.join(' | '));
+    check('the addresses that follow from it are shown', said.some(l => /dashboard: +dashboard\.example\.com/.test(l)) && said.some(l => /app-pr-<N>\.example\.com/.test(l)), said.join(' | '));
     check('the refusal says why', said.some(l => /domain is required/.test(l)) && said.some(l => /is not a domain name/.test(l)), said.join(' | '));
   }
 

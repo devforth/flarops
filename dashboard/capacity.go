@@ -85,9 +85,11 @@ func ReservedMiB(h HostState) int {
 
 // A capsule promised a node but not yet visible: held so two pipelines cannot be sent to one slot.
 type reservation struct {
-	node    string
-	mib     int
-	expires time.Time
+	node string
+	mib  int
+	// What was promised; mib is what the environment has not taken up yet.
+	promised int
+	expires  time.Time
 }
 
 // Long enough for a capsule to become measurable.
@@ -96,12 +98,44 @@ const reservationTTL = 5 * time.Minute
 var (
 	reservationsMu sync.Mutex
 	reservations   = map[string]*reservation{}
+	// Held from reading the free memory to reserving it, so two concurrent requests cannot both be
+	// told "yes" for the same space.
+	placementMu sync.Mutex
 )
 
 func reserve(key, node string, mib int) {
 	reservationsMu.Lock()
 	defer reservationsMu.Unlock()
-	reservations[key] = &reservation{node: node, mib: mib, expires: time.Now().Add(reservationTTL)}
+	reservations[key] = &reservation{node: node, mib: mib, promised: mib, expires: time.Now().Add(reservationTTL)}
+}
+
+// CI reserves for its PR_ENV_NAME ("pr-<n>"), the environment's namespace is "<project>-pr-<n>".
+func reservationIsFor(key, namespace string) bool {
+	return key != "" && (namespace == key || strings.HasSuffix(namespace, "-"+key))
+}
+
+// Once the environment a promise was made for runs on its node, its measured memory is counted there
+// and the promise shrinks by as much: released when the environment uses all of it, so the same
+// memory is not counted twice for the rest of the TTL. Unmeasured pods (no metrics yet) settle nothing.
+func settleReservations(hosts map[string]*HostState) {
+	reservationsMu.Lock()
+	defer reservationsMu.Unlock()
+	for key, r := range reservations {
+		h, ok := hosts[r.node]
+		if !ok {
+			continue
+		}
+		for _, c := range h.Capsules {
+			if !reservationIsFor(key, c.ID) || c.Ram <= 0 {
+				continue
+			}
+			r.mib = r.promised - c.Ram
+			if r.mib <= 0 {
+				delete(reservations, key)
+			}
+			break
+		}
+	}
 }
 
 // exceptKey: the caller's own promise does not count against it on a retry.
@@ -159,6 +193,21 @@ func planPlacement(d *DashboardData, requestMiB int, callerKey string) placement
 	}
 	best.Fits = best.Node != "" && best.FreeMiB >= required
 	return best
+}
+
+// A "yes" reserves the node until the capsule appears, decided and recorded as one step.
+func placeAndReserve(d *DashboardData, requestMiB int, callerKey string) placement {
+	placementMu.Lock()
+	defer placementMu.Unlock()
+	p := planPlacement(d, requestMiB, callerKey)
+	if p.Fits {
+		key := callerKey
+		if key == "" {
+			key = "anon:" + p.Node
+		}
+		reserve(key, p.Node, p.RequiredMiB)
+	}
+	return p
 }
 
 // The size CI plans a new PR environment at (templates/pr-capsule.yml.js): what production uses right
@@ -226,16 +275,10 @@ func handleCapacity(w http.ResponseWriter, r *http.Request) {
 	}
 
 	callerKey := r.URL.Query().Get("for")
-	p := planPlacement(d, requested, callerKey)
+	p := placeAndReserve(d, requested, callerKey)
 	verdict := "no"
 	if p.Fits {
 		verdict = "yes"
-		// A "yes" reserves the node until the capsule appears.
-		key := callerKey
-		if key == "" {
-			key = "anon:" + p.Node
-		}
-		reserve(key, p.Node, p.RequiredMiB)
 	}
 	reserved := 0
 	for _, h := range d.Hosts {

@@ -26,15 +26,18 @@ const ANSWERS = {
 
 // Every question asked in the last generation, in order.
 let asked = [];
+let bucketCreatedAfter = null;
 
 function installStubs(extraAnswers) {
   asked = [];
+  bucketCreatedAfter = null;
   readline.createInterface = () => ({
     question(q, cb) {
       asked.push(String(q).replace(/\x1b\[[0-9;]*m/g, ''));
       let answer = '';
       for (const [needle, value] of Object.entries({ ...ANSWERS, ...(extraAnswers || {}) })) {
-        if (q.includes(needle)) { answer = value; break; }
+        // A function answers and may act, as if the user did something while the question was open.
+        if (q.includes(needle)) { answer = typeof value === 'function' ? value(q) : value; break; }
       }
       setImmediate(() => cb(answer));
     },
@@ -51,7 +54,10 @@ function installStubs(extraAnswers) {
     handleS3Bucket: async (_cmd, name) => ({
       bucket: String(name).toLowerCase().replace(/[^a-z0-9-]/g, '-'),
       warning: null,
+      create: true,
     }),
+    // How many questions had been asked when the bucket was created: a check wants all of them.
+    createStateBucket: async (_cmd, name) => { bucketCreatedAfter = asked.length; return name; },
   };
 
   const realExecFile = child_process.execFileSync;
@@ -67,6 +73,8 @@ async function generate(fixtureDir, extraAnswers, options = {}) {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'flarops-test-'));
   const work = path.join(parent, path.basename(fixtureDir));
   fs.cpSync(fixtureDir, work, { recursive: true });
+  // options.prepare(dir): changes to the copy itself (a relative symlink would not survive the copy).
+  if (options.prepare) options.prepare(work);
   child_process.execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: work });
   // .env and .env.local stay out of git, as in a real project: init treats committed values as public.
   fs.appendFileSync(path.join(work, '.git', 'info', 'exclude'), '.env\n.env.local\n');
@@ -111,7 +119,7 @@ async function generate(fixtureDir, extraAnswers, options = {}) {
     restoreErr();
   }
 
-  return { dir: work, parent, log: lines.join(''), ok, error, questions: asked.slice() };
+  return { dir: work, parent, log: lines.join(''), ok, error, questions: asked.slice(), bucketCreatedAfter };
 }
 
 module.exports = { generate };

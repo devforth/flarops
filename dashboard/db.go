@@ -38,9 +38,17 @@ func pruneOldSamples() {
 
 var db *sql.DB
 
-func initDB(dataSourceName string) error {
+// A writer waits for a long read instead of failing with SQLITE_BUSY, and WAL lets reads run
+// alongside the write.
+const sqlitePragmas = "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+
+func initDB(path string) error {
 	var err error
-	db, err = sql.Open("sqlite", dataSourceName)
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	db, err = sql.Open("sqlite", path+sep+sqlitePragmas)
 	if err != nil {
 		return err
 	}
@@ -62,13 +70,18 @@ func initDB(dataSourceName string) error {
 		CREATE INDEX IF NOT EXISTS idx_host_samples_timestamp ON host_samples(timestamp);
 		CREATE INDEX IF NOT EXISTS idx_capsule_samples_timestamp ON capsule_samples(timestamp);
 		CREATE INDEX IF NOT EXISTS idx_capsule_samples_capsule_id ON capsule_samples(capsule_id);
+		CREATE INDEX IF NOT EXISTS idx_capsule_samples_capsule_ts ON capsule_samples(capsule_id, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_capsule_samples_ts_host ON capsule_samples(timestamp, host_id);
+		CREATE INDEX IF NOT EXISTS idx_host_samples_ts_host ON host_samples(timestamp, host_id);
 	`)
 	if err != nil {
 		return err
 	}
 	// What a sample's EC2 part was, so a minute counted at the fallback price can be corrected once
-	// the real price loads. Added to a database created before them.
-	for _, col := range []string{"ec2_rate REAL DEFAULT 0", "priced INTEGER DEFAULT 1", "instance_type TEXT DEFAULT ''", "region TEXT DEFAULT ''"} {
+	// the real price loads; and the seconds since the previous sample, which the sample bills (a row
+	// from before the column counts as the minute it was meant to be). Added to a database created
+	// before them.
+	for _, col := range []string{"ec2_rate REAL DEFAULT 0", "priced INTEGER DEFAULT 1", "instance_type TEXT DEFAULT ''", "region TEXT DEFAULT ''", "elapsed_sec REAL DEFAULT 60"} {
 		name := strings.Fields(col)[0]
 		var n int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('host_samples') WHERE name = ?`, name).Scan(&n); err != nil {
@@ -89,13 +102,17 @@ func sqlTime(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05.000")
 }
 
-func recordHostSample(timestamp time.Time, h HostState) error {
+// What a sample bills: its rate over the time since the previous one.
+const sampleCost = "rate_per_hour * elapsed_sec / 3600.0"
+
+// elapsed: the time since the previous sample, which this one stands for.
+func recordHostSample(timestamp time.Time, elapsed time.Duration, h HostState) error {
 	priced := 0
 	if h.PriceKnown {
 		priced = 1
 	}
-	_, err := db.Exec(`INSERT INTO host_samples (timestamp, host_id, rate_per_hour, ec2_rate, priced, instance_type, region)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, sqlTime(timestamp), h.ID, h.Rate, h.EC2Rate, priced, h.Type, h.Region)
+	_, err := db.Exec(`INSERT INTO host_samples (timestamp, host_id, rate_per_hour, ec2_rate, priced, instance_type, region, elapsed_sec)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, sqlTime(timestamp), h.ID, h.Rate, h.EC2Rate, priced, h.Type, h.Region, elapsed.Seconds())
 	return err
 }
 
@@ -137,17 +154,27 @@ func recordCapsuleSample(timestamp time.Time, capsuleID string, hostID string, r
 	return err
 }
 
+// The same part of the previous month as now is of this one: as far past its 1st as now is past
+// this month's, but never past its own end (31 March compares with all of February, not 3 March).
+func prevMonthWindow(now time.Time) (start, end, startOfMonth time.Time) {
+	startOfMonth = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	start = startOfMonth.AddDate(0, -1, 0)
+	end = start.Add(now.Sub(startOfMonth))
+	if end.After(startOfMonth) {
+		end = startOfMonth
+	}
+	return start, end, startOfMonth
+}
+
 func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error) {
 	// Days and months in UTC, the zone the stored timestamps are in.
 	now := time.Now().UTC()
-	startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	startOfPrevMonth := startOfMonth.AddDate(0, -1, 0)
-	prevMonthSamePeriodEnd := now.AddDate(0, -1, 0)
+	startOfPrevMonth, prevMonthSamePeriodEnd, startOfMonth := prevMonthWindow(now)
 
 	var mtd float64
 	err := db.QueryRow(`
-		SELECT COALESCE(SUM(rate_per_hour / 60.0), 0) 
-		FROM host_samples 
+		SELECT COALESCE(SUM(`+sampleCost+`), 0)
+		FROM host_samples
 		WHERE timestamp >= ?
 	`, sqlTime(startOfMonth)).Scan(&mtd)
 	if err != nil {
@@ -156,9 +183,9 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 
 	var prevSame float64
 	err = db.QueryRow(`
-		SELECT COALESCE(SUM(rate_per_hour / 60.0), 0) 
-		FROM host_samples 
-		WHERE timestamp >= ? AND timestamp <= ?
+		SELECT COALESCE(SUM(`+sampleCost+`), 0)
+		FROM host_samples
+		WHERE timestamp >= ? AND timestamp < ?
 	`, sqlTime(startOfPrevMonth), sqlTime(prevMonthSamePeriodEnd)).Scan(&prevSame)
 	if err != nil {
 		log.Println("Error calculating prevSame:", err)
@@ -180,9 +207,9 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 	}
 
 	rows, err := db.Query(`
-		SELECT CAST(strftime('%d', timestamp) AS INTEGER) AS day, SUM(rate_per_hour / 60.0) 
-		FROM host_samples 
-		WHERE timestamp >= ? 
+		SELECT CAST(strftime('%d', timestamp) AS INTEGER) AS day, SUM(`+sampleCost+`)
+		FROM host_samples
+		WHERE timestamp >= ?
 		GROUP BY day
 	`, sqlTime(startOfMonth))
 	if err == nil {
@@ -205,8 +232,8 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 	}
 
 	rowsPrev, err := db.Query(`
-		SELECT CAST(strftime('%d', timestamp) AS INTEGER) AS day, SUM(rate_per_hour / 60.0) 
-		FROM host_samples 
+		SELECT CAST(strftime('%d', timestamp) AS INTEGER) AS day, SUM(`+sampleCost+`)
+		FROM host_samples
 		WHERE timestamp >= ? AND timestamp < ?
 		GROUP BY day
 	`, sqlTime(startOfPrevMonth), sqlTime(startOfMonth))
@@ -251,23 +278,25 @@ func getSpendStats(totalHourlyRate float64, currentHosts int) (SpendState, error
 	}, nil
 }
 
-// Each environment's share of its node's rate, per one-minute sample, since `since[id]`: the node's
-// rate split across the environments on it at that minute.
+// Each environment's share of its node's cost, per sample, since `since[id]`: what the node billed for
+// that sample split across the environments on it at the time.
 func getCapsulesCostLife(since map[string]time.Time) map[string]float64 {
 	res := make(map[string]float64)
 	for id, from := range since {
 		var cost float64
+		// The count is per sample (timestamp, host), looked up by index, not grouped over the whole table.
 		err := db.QueryRow(`
-			SELECT COALESCE(SUM(h.rate_per_hour / 60.0 / n.cnt), 0)
+			SELECT COALESCE(SUM(h.rate_per_hour * h.elapsed_sec / 3600.0 /
+				(SELECT COUNT(*) FROM capsule_samples n WHERE n.timestamp = c.timestamp AND n.host_id = c.host_id)), 0)
 			FROM capsule_samples c
 			JOIN host_samples h ON h.host_id = c.host_id AND h.timestamp = c.timestamp
-			JOIN (SELECT timestamp, host_id, COUNT(*) AS cnt FROM capsule_samples GROUP BY timestamp, host_id) n
-			  ON n.timestamp = c.timestamp AND n.host_id = c.host_id
 			WHERE c.capsule_id = ? AND c.timestamp >= ?
 		`, id, sqlTime(from)).Scan(&cost)
-		if err == nil {
-			res[id] = cost
+		if err != nil {
+			log.Printf("Error calculating the cost of %s: %v", id, err)
+			continue
 		}
+		res[id] = cost
 	}
 	return res
 }

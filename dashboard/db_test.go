@@ -17,7 +17,7 @@ func TestSpendIsGroupedByDay(t *testing.T) {
 		if ts.Day() != now.Day() {
 			break
 		}
-		recordHostSample(ts, HostState{ID: "server", Rate: 0.6, PriceKnown: true}) // $0.01 a minute
+		recordHostSample(ts, time.Minute, HostState{ID: "server", Rate: 0.6, PriceKnown: true}) // $0.01 a minute
 		recordCapsuleSample(ts, "shop-production", "server", 100)
 		recordCapsuleSample(ts, "shop-pr-5", "server", 100)
 	}
@@ -45,7 +45,7 @@ func TestFallbackPriceIsCorrected(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := HostState{ID: "server", Type: "t3a.medium", Region: "us-west-2", EC2Rate: fallbackEC2HourlyRate, Rate: fallbackEC2HourlyRate + 0.01}
-	recordHostSample(time.Now(), h)
+	recordHostSample(time.Now(), time.Minute, h)
 
 	awsPricesMutex.Lock()
 	saved := awsPrices

@@ -4,11 +4,11 @@ const path = require('path');
 const readText = (file) => fs.readFileSync(file, 'utf8').replace(/\r\n?/g, '\n');
 const readline = require('readline');
 const { execFileSync } = require('child_process');
-const { getDefaultAWSCredentials, ensureAwsCli, handleS3Bucket, checkAwsAccess } = require('../../utils/awsHelper.js');
+const { getDefaultAWSCredentials, ensureAwsCli, handleS3Bucket, createStateBucket, checkAwsAccess } = require('../../utils/awsHelper.js');
 const { SENSITIVE_REGEX, DB_PASSWORD_REGEX, IGNORED_DIRS, LOOPBACK_HOST_REGEX } = require('../../utils/constants.js');
 const { parseSupportService, toK8sName, extractEnv, extractBuildArgs, extractCommand, extractEnvFiles, extractVolumes, materializeBindMounts } = require('../../utils/composeSupport.js');
 const { generateFlaropsYaml } = require('../../utils/flaropsYaml.js');
-const { RESERVED_SERVICE_NAMES, MAX_SERVICE_NAME_WITH_DB } = require('../../utils/flaropsValidate.js');
+const { RESERVED_SERVICE_NAMES, MAX_SERVICE_NAME_WITH_DB, RESERVED_SECRET } = require('../../utils/flaropsValidate.js');
 const writeTerraform = require('../../templates/terraform.js');
 const collectOperatorAnswers = require('./prompts.js');
 const { defaultUserFor, passwordKeyFor, defaultImageFor, urlSchemeOf, sameEngineScheme, databaseVolumes } = require('../../utils/dbDefaults.js');
@@ -17,6 +17,7 @@ const { listComposeFiles, isVariantComposeFile, approveVariantComposeFile, compo
 const { normalizeRoutes } = require('../../utils/routes.js');
 const { EnvFile } = require('../../utils/envFile.js');
 const { newDashboardPassword, printDashboardLogin, dashboardHost } = require('../../utils/dashboardAccess.js');
+const { safeBranch } = require('../../utils/branch.js');
 const { SecretWiring, unmountedSecretKeys } = require('../../utils/secretWiring.js');
 const isYes = collectOperatorAnswers.isYes;
 const hclEscapeString = writeTerraform.hclEscapeString;
@@ -70,6 +71,11 @@ let DETAILS = [];
 function detail(message) {
   DETAILS.push(String(message).replace(/\x1b\[[0-9;]*m/g, ''));
   if (VERBOSE) console.log(message);
+}
+// What the operator has to look at or act on: on screen always, and in the log with the rest.
+function notice(message) {
+  DETAILS.push(String(message).replace(/\x1b\[[0-9;]*m/g, ''));
+  console.log(`\x1b[36m${message}\x1b[0m`);
 }
 
 function ensureDir(dirPath, logMessage) {
@@ -322,16 +328,18 @@ function applyEnvDecision(decision, targets) {
   const { isBackend, isFrontend, apiEnv, frontendEnv, sensitiveContext, matchedAdditionalServices } = targets;
 
   if (decision.disposition === 'secret') {
+    // The GitHub secret's name: the key's own, unless the infrastructure uses it.
+    const secretName = decision.secretName || key;
     // Dedup by key alone: the same secret is often declared in several places.
-    const keyLine = new RegExp(`(^|\\n)${escapeRegex(key)}=([^\\n]*)`);
+    const keyLine = new RegExp(`(^|\\n)${escapeRegex(secretName)}=([^\\n]*)`);
     const present = sensitiveContext.content.match(keyLine);
     if (!present) {
       // A value spanning lines (a PEM key) stays one entry only inside quotes.
       const written = /[\r\n]/.test(String(value)) && !/^["'].*["']$/s.test(String(value)) ? `"${String(value).replace(/"/g, '\\"')}"` : value;
-      sensitiveContext.content += `${key}=${written}\n`;
+      sensitiveContext.content += `${secretName}=${written}\n`;
     } else if (present[2] === '' && value !== '') {
       // A blank (withheld) value is replaced by a real one found later.
-      sensitiveContext.content = sensitiveContext.content.replace(keyLine, (m, lead) => `${lead}${key}=${value}`);
+      sensitiveContext.content = sensitiveContext.content.replace(keyLine, (m, lead) => `${lead}${secretName}=${value}`);
     }
     return;
   }
@@ -360,6 +368,11 @@ async function runInit({ verbose = false } = {}) {
   try {
     deployBranch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], { cwd: currentDir, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() || 'main';
   } catch (e) { /* detached HEAD: keep main */ }
+  // The name lands in deploy.yml and in a shell line of FLAROPS.md: only a plain ref name is used.
+  if (!safeBranch(deployBranch)) {
+    console.warn(`\x1b[33mWARNING: the branch name ${JSON.stringify(deployBranch)} has characters Flarops does not put into a workflow or a shell command - deploying from "main" instead. Rename the branch, or set it under on.push.branches in .github/workflows/deploy.yml and list that file under syncLock.\x1b[0m`);
+    deployBranch = 'main';
+  }
 
   // init is one-shot: a second run would reissue keys and overwrite the user's edits.
   const flaropsYamlFile = path.join(currentDir, 'flarops.yaml');
@@ -384,19 +397,46 @@ async function runInit({ verbose = false } = {}) {
     'deploy/helm/Chart.yaml', 'deploy/helm/templates', 'deploy/dashboard',
     '.github/workflows/deploy.yml', '.github/workflows/pr-capsule.yml',
   ];
-  const symlinked = new Set();
-  for (const rel of WRITTEN_PATHS) {
-    const parts = rel.split('/');
-    for (let i = 1; i <= parts.length; i++) {
-      const sub = parts.slice(0, i).join('/');
-      try { if (fs.lstatSync(path.join(currentDir, sub)).isSymbolicLink()) symlinked.add(sub); } catch (e) { /* absent */ }
+  // AGENTS.md and CLAUDE.md hold no secrets, and one is often a link to the other: a link that stays
+  // inside the repository is written through.
+  const linkStaysInside = (file) => {
+    try {
+      const root = fs.realpathSync(currentDir);
+      let real;
+      try {
+        real = fs.realpathSync(file);
+      } catch (e) {
+        // A link to a file not created yet: where it would be.
+        const target = path.resolve(path.dirname(file), fs.readlinkSync(file));
+        real = path.join(fs.realpathSync(path.dirname(target)), path.basename(target));
+      }
+      // Another Markdown file: never deploy/.env, the deploy key, or git's own files.
+      return isPathInside(root, real) && /\.md$/i.test(real) && !isPathInside(path.join(root, '.git'), real);
+    } catch (e) {
+      return false;
     }
-  }
-  if (symlinked.size > 0) {
-    console.error(`\x1b[31mERROR: ${[...symlinked].join(', ')} ${symlinked.size === 1 ? 'is a symlink' : 'are symlinks'}. Flarops writes the deploy key and the secrets to these paths, and would follow the link wherever it points.\x1b[0m`);
-    console.error('  Replace each with a real file or directory (or remove it), then run init again.');
-    process.exit(1);
-  }
+  };
+  // Run before the questions, and again right before the first write: answering them takes minutes.
+  const refuseSymlinkedOutputs = () => {
+    const symlinked = new Set();
+    for (const rel of WRITTEN_PATHS) {
+      const parts = rel.split('/');
+      for (let i = 1; i <= parts.length; i++) {
+        const sub = parts.slice(0, i).join('/');
+        try {
+          if (!fs.lstatSync(path.join(currentDir, sub)).isSymbolicLink()) continue;
+          if ((sub === 'AGENTS.md' || sub === 'CLAUDE.md') && linkStaysInside(path.join(currentDir, sub))) continue;
+          symlinked.add(sub);
+        } catch (e) { /* absent */ }
+      }
+    }
+    if (symlinked.size > 0) {
+      console.error(`\x1b[31mERROR: ${[...symlinked].join(', ')} ${symlinked.size === 1 ? 'is a symlink' : 'are symlinks'}. Flarops writes the deploy key and the secrets to these paths, and would follow the link wherever it points.\x1b[0m`);
+      console.error('  Replace each with a real file or directory (or remove it), then run init again.');
+      process.exit(1);
+    }
+  };
+  refuseSymlinkedOutputs();
 
   const gitignoreFile = path.join(currentDir, '.gitignore');
   const linesToIgnore = [
@@ -462,9 +502,25 @@ async function runInit({ verbose = false } = {}) {
     return '';
   };
 
+  // The workflows read the infrastructure's credentials from GitHub secrets of these names (and GitHub
+  // reserves GITHUB_*): an application variable spelled the same is passed from APP_<NAME> instead, so
+  // the AWS keys, the deploy key or the registry password never reach a pod.
+  const isReservedSecretName = (key) => RESERVED_SECRET.test(String(key)) || /^(AWS|REGISTRY)_/i.test(String(key));
+  // Container env name -> the GitHub secret it is read from.
+  const renamedSecrets = new Map();
+  const secretNameFor = (key) => {
+    if (!isReservedSecretName(key)) return key;
+    const renamed = `APP_${String(key).toUpperCase().replace(/[^A-Z0-9_]/g, '_')}`;
+    renamedSecrets.set(key, renamed);
+    return renamed;
+  };
+
   const takeEnvVariable = (key, val, sourceFile, targets) => {
     const decision = classifyEnvVariable(key, val, targets.foundDbUrls);
-    if (decision && decision.disposition === 'secret') decision.value = composeSecretValue(usableSecretValue(key, decision.value, sourceFile), sourceFile);
+    if (decision && decision.disposition === 'secret') {
+      decision.secretName = secretNameFor(key);
+      decision.value = composeSecretValue(usableSecretValue(decision.secretName, decision.value, sourceFile), sourceFile);
+    }
     if (decision) applyEnvDecision(decision, targets);
     return decision;
   };
@@ -487,12 +543,28 @@ async function runInit({ verbose = false } = {}) {
   // A non-conventionally named compose file is often a local stack; ask before using it.
   {
     const candidates = listComposeFiles(currentDir);
-    if (candidates.length > 0 && isVariantComposeFile(candidates[0])) {
+    if (candidates.length === 1 && isVariantComposeFile(candidates[0])) {
       const answer = await askQuestion(`\x1b[36m? \x1b[0mThis project has no docker-compose.yml, but it does have "${candidates[0]}". Base the deployment on it? [Y/n] `);
       const approved = isYes(answer);
       approveVariantComposeFile(approved);
       if (!approved) {
         console.log(`\x1b[33mSkipping ${candidates[0]}. Services will be discovered from the repository layout alone - anything only that file declares will be missing, and can be added to flarops.yaml afterwards.\x1b[0m`);
+      }
+    } else if (candidates.length > 1 && isVariantComposeFile(candidates[0])) {
+      // Several variants (dev, prod, local): the operator picks one; a production one is listed first.
+      console.log('This project has no docker-compose.yml, but it has these compose files:');
+      candidates.forEach((name, i) => console.log(`  ${i + 1}. ${name}`));
+      let chosen;
+      while (chosen === undefined) {
+        const answer = (await askQuestion(`\x1b[36m? \x1b[0mBase the deployment on which one? Its number, or "n" for none [1] `)).trim().toLowerCase();
+        if (answer === '') chosen = candidates[0];
+        else if (answer === 'n' || answer === 'no' || answer === 'none') chosen = null;
+        else if (/^\d+$/.test(answer) && Number(answer) >= 1 && Number(answer) <= candidates.length) chosen = candidates[Number(answer) - 1];
+        else console.log(`Enter a number from 1 to ${candidates.length}, or "n".`);
+      }
+      approveVariantComposeFile(chosen === null ? false : chosen, currentDir);
+      if (chosen === null) {
+        console.log(`\x1b[33mSkipping the compose files. Services will be discovered from the repository layout alone - anything only they declare will be missing, and can be added to flarops.yaml afterwards.\x1b[0m`);
       }
     }
   }
@@ -504,70 +576,105 @@ async function runInit({ verbose = false } = {}) {
   const {
     projectName, dockerRegistry, dockerProject, dockerRepository, registryUser, registryPassword,
     domain, cloudflareApiToken, cloudflareZoneId,
-    awsCredentials, awsRegion, remoteStateBucket,
+    awsCredentials, awsCmd, awsRegion, createRemoteStateBucket,
   } = answers;
+  let remoteStateBucket = answers.remoteStateBucket;
   let s3BucketWarning = answers.s3BucketWarning;
-
-  // Written only now, so stopping at a question (Ctrl-C) leaves the repository as it was.
-  if (!fs.existsSync(gitignoreFile)) {
-    fs.writeFileSync(gitignoreFile, '#autogenerated by flarops\n' + linesToIgnore.join('\n') + '\n');
-    detail("Created .gitignore and added ignore rules");
-  } else {
-    const gitignoreContent = fs.readFileSync(gitignoreFile, 'utf8');
-    const existingLines = new Set(gitignoreContent.split('\n').map(line => line.trim()));
-    const linesToAdd = linesToIgnore.filter(line => !existingLines.has(line));
-
-    if (linesToAdd.length > 0) {
-      let appendStr = '#autogenerated by flarops\n' + linesToAdd.join('\n') + '\n';
-      if (gitignoreContent.length > 0 && !gitignoreContent.endsWith('\n')) {
-        appendStr = '\n' + appendStr;
-      }
-      fs.appendFileSync(gitignoreFile, appendStr);
-      detail(`Appended ${linesToAdd.length} rules to .gitignore`);
-    } else {
-      detail("All ignore rules are already in .gitignore");
-    }
-  }
-
-  ensureDir(keysDir, "Created .keys/ directory");
-  if (fs.existsSync(privateKeyPath)) {
-    // A mismatched pair would authorize a key nobody holds.
-    let pairIsConsistent = false;
-    try {
-      const derivedPublic = execFileSync('ssh-keygen', ['-y', '-f', privateKeyPath], { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
-      const storedPublic = fs.existsSync(publicKeyPath) ? fs.readFileSync(publicKeyPath, 'utf8').trim() : '';
-      pairIsConsistent = storedPublic.startsWith(derivedPublic.split(' ').slice(0, 2).join(' '));
-    } catch (e) {
-      pairIsConsistent = false;
-    }
-
-    if (!pairIsConsistent) {
-      console.warn("\x1b[33mWARNING: .keys/deploy_rsa and .keys/deploy_rsa.pub are not a matching pair (or the private key is unreadable). Generating a fresh key.\x1b[0m");
-      try { fs.unlinkSync(privateKeyPath); } catch (e) { }
-      try { fs.unlinkSync(publicKeyPath); } catch (e) { }
-    }
-  }
-
-  if (!fs.existsSync(privateKeyPath)) {
-    detail("Generating SSH keys in .keys/ ...");
-    execFileSync('ssh-keygen', ['-t', 'rsa', '-b', '4096', '-f', privateKeyPath, '-q', '-N', '']);
-  }
-
-  try { fs.chmodSync(keysDir, 0o700); } catch (e) { }
-  try { fs.chmodSync(privateKeyPath, 0o600); } catch (e) { }
-
-  const publicKey = fs.readFileSync(publicKeyPath, 'utf8').trim();
-  const privateKey = fs.readFileSync(privateKeyPath, 'utf8').trim();
 
   const deployDir = path.join(currentDir, 'deploy');
   const terraformDir = path.join(deployDir, 'terraform');
+  let publicKey = '';
+  let privateKey = '';
 
-  ensureDir(deployDir, "Created deploy/ directory");
-  ensureDir(terraformDir, "Created deploy/terraform/ directory");
-  writeTerraform({
-    projectName, domain, publicKey, awsRegion, remoteStateBucket, terraformDir,
-    cloudflareApiToken, cloudflareZoneId, writeFileIfNotExists,
-  });
+  // Called once every question is answered, so stopping at one (Ctrl-C) leaves the repository - and
+  // the AWS account - as they were.
+  async function writeRepositorySetup() {
+    refuseSymlinkedOutputs();
+    const nonEmpty = (file) => { try { const text = fs.readFileSync(file, 'utf8'); return text.trim() ? text : null; } catch (e) { return null; } };
+    const keptMainTf = nonEmpty(path.join(terraformDir, 'main.tf'));
+    const keptVariablesTf = nonEmpty(path.join(terraformDir, 'variables.tf'));
+    const keptBucket = keptMainTf && (keptMainTf.match(/backend\s+"s3"\s*\{[^}]*?\bbucket\s*=\s*"([^"]*)"/) || [])[1];
+
+    // An existing deploy/terraform keeps its own bucket: a new one would hold nothing.
+    if (createRemoteStateBucket && !(keptBucket && keptBucket !== remoteStateBucket)) {
+      remoteStateBucket = await createStateBucket(awsCmd, remoteStateBucket, awsCredentials, askQuestion, awsRegion);
+    }
+
+    if (!fs.existsSync(gitignoreFile)) {
+      fs.writeFileSync(gitignoreFile, '#autogenerated by flarops\n' + linesToIgnore.join('\n') + '\n');
+      detail("Created .gitignore and added ignore rules");
+    } else {
+      const gitignoreContent = fs.readFileSync(gitignoreFile, 'utf8');
+      const existingLines = new Set(gitignoreContent.split('\n').map(line => line.trim()));
+      const linesToAdd = linesToIgnore.filter(line => !existingLines.has(line));
+
+      if (linesToAdd.length > 0) {
+        let appendStr = '#autogenerated by flarops\n' + linesToAdd.join('\n') + '\n';
+        if (gitignoreContent.length > 0 && !gitignoreContent.endsWith('\n')) {
+          appendStr = '\n' + appendStr;
+        }
+        fs.appendFileSync(gitignoreFile, appendStr);
+        detail(`Appended ${linesToAdd.length} rules to .gitignore`);
+      } else {
+        detail("All ignore rules are already in .gitignore");
+      }
+    }
+
+    ensureDir(keysDir, "Created .keys/ directory");
+    if (fs.existsSync(privateKeyPath)) {
+      // A mismatched pair would authorize a key nobody holds.
+      let pairIsConsistent = false;
+      try {
+        const derivedPublic = execFileSync('ssh-keygen', ['-y', '-f', privateKeyPath], { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+        const storedPublic = fs.existsSync(publicKeyPath) ? fs.readFileSync(publicKeyPath, 'utf8').trim() : '';
+        pairIsConsistent = storedPublic.startsWith(derivedPublic.split(' ').slice(0, 2).join(' '));
+      } catch (e) {
+        pairIsConsistent = false;
+      }
+
+      if (!pairIsConsistent) {
+        console.warn("\x1b[33mWARNING: .keys/deploy_rsa and .keys/deploy_rsa.pub are not a matching pair (or the private key is unreadable). Generating a fresh key.\x1b[0m");
+        try { fs.unlinkSync(privateKeyPath); } catch (e) { }
+        try { fs.unlinkSync(publicKeyPath); } catch (e) { }
+      }
+    }
+
+    if (!fs.existsSync(privateKeyPath)) {
+      detail("Generating SSH keys in .keys/ ...");
+      execFileSync('ssh-keygen', ['-t', 'rsa', '-b', '4096', '-f', privateKeyPath, '-q', '-N', '']);
+    }
+
+    try { fs.chmodSync(keysDir, 0o700); } catch (e) { }
+    try { fs.chmodSync(privateKeyPath, 0o600); } catch (e) { }
+
+    publicKey = fs.readFileSync(publicKeyPath, 'utf8').trim();
+    privateKey = fs.readFileSync(privateKeyPath, 'utf8').trim();
+
+    ensureDir(deployDir, "Created deploy/ directory");
+    ensureDir(terraformDir, "Created deploy/terraform/ directory");
+    writeTerraform({
+      projectName, domain, publicKey, awsRegion, remoteStateBucket, terraformDir,
+      cloudflareApiToken, cloudflareZoneId, writeFileIfNotExists,
+    });
+
+    // Terraform is the operator's after the first init: one already here is kept, and the answers that
+    // would have gone into it are named.
+    if (keptMainTf || keptVariablesTf) {
+      const tf = `${keptMainTf || ''}\n${keptVariablesTf || ''}`;
+      const keptRegion = (tf.match(/variable\s+"aws_region"\s*\{[^}]*?\bdefault\s*=\s*"([^"]*)"/) || tf.match(/backend\s+"s3"\s*\{[^}]*?\bregion\s*=\s*"([^"]*)"/) || [])[1];
+      const keptCloudflare = /cloudflare_zone_id|provider\s+"cloudflare"/.test(tf);
+      const wantCloudflare = !!(cloudflareApiToken && cloudflareZoneId);
+      const notApplied = [];
+      if (keptRegion && keptRegion !== awsRegion) notApplied.push(`the region (answered ${awsRegion}; it keeps ${keptRegion})`);
+      if (keptBucket && keptBucket !== remoteStateBucket) notApplied.push(`the state bucket (answered ${remoteStateBucket}; it keeps ${keptBucket})`);
+      if (keptCloudflare !== wantCloudflare) notApplied.push(`Cloudflare (answered ${wantCloudflare ? 'yes' : 'no'}; it ${keptCloudflare ? 'keeps' : 'has no'} Cloudflare DNS)`);
+      if (notApplied.length > 0) {
+        console.warn(`\x1b[33mWARNING: deploy/terraform/ already existed and was kept as it was, so these answers were NOT applied to it: ${notApplied.join('; ')}. Change deploy/terraform/ yourself if they should be (or delete it before running init).\x1b[0m`);
+      } else {
+        notice('deploy/terraform/ already existed and was kept as it was; its region, state bucket and Cloudflare setting match the answers.');
+      }
+    }
+  }
 
   const ignoredDirs = new Set([...IGNORED_DIRS, '.git']);
 
@@ -709,34 +816,66 @@ async function runInit({ verbose = false } = {}) {
     return dirty.length > 0 ? /^y(es)?$/i.test(answer.trim()) : isYes(answer);
   };
 
-  let refactoredEnvKey = null;
-  let refactoredRoutes = [];
+  // The code changes are only asked about here; everything is written once the last one is answered.
+  let applyFrontendRefactor = false;
   if (frontendInfo.frontendPath && backendInfo.ports && backendInfo.ports.length > 0) {
     const preview = await refactorFrontendEnv(frontendInfo.frontendPath, backendInfo.ports, false);
     const nginxPreview = await refactorNginxConf(frontendInfo.frontendPath, backendInfo.ports, false);
     const codeFiles = [...((preview && preview.files) || []), ...nginxPreview];
     // Nothing hardcoded: nothing to rewrite, and nothing to ask.
-    let apply = false;
     if (codeFiles.length > 0) {
-      apply = await confirmCodeChange(
+      applyFrontendRefactor = await confirmCodeChange(
         `The frontend calls the backend at a hardcoded address on port ${backendInfo.ports.join("/")}, which a browser cannot reach once deployed. Flarops can read it from ${preview ? preview.envVarKey : 'an environment variable'} instead${nginxPreview.length ? ', and point nginx proxy_pass at the api service' : ''}.`,
         codeFiles,
         preview && preview.supportFiles.length ? [`and ${preview.supportFiles.map(rel).join(', ')} (the local value, kept out of git and the image)`] : []);
     }
-    if (apply) {
-      const refactorResult = await refactorFrontendEnv(frontendInfo.frontendPath, backendInfo.ports);
-      const nginxChanged = await refactorNginxConf(frontendInfo.frontendPath, backendInfo.ports);
-      if (nginxChanged.length > 0) {
-        console.log(`\x1b[32mPointed proxy_pass at the api service in ${nginxChanged.map(rel).join(', ')}.\x1b[0m`);
+  }
+
+  let applyDbUrlRefactor = false;
+  if (backendInfo.backendPath && dbInfo.hasDb) {
+    const dbPreview = await refactorBackendDbUrl(backendInfo.backendPath, false);
+    if (dbPreview && dbPreview.hasHardcoded) {
+      applyDbUrlRefactor = await confirmCodeChange(
+        'The backend connects to the database at a hardcoded URL. Flarops can make it read DATABASE_URL (DB_URL for MongoDB) first and keep the URL as the fallback.',
+        dbPreview.files);
+    }
+  }
+
+  // Applied further on, where it always was. Only a variable every read of which can be rewritten is
+  // offered: one left half-renamed would read nothing in production.
+  let approvedUppercase = [];
+  if (dbInfo.hasDb && backendInfo.hasBackend) {
+    const keys = await analyzeBackendForDbKeys(backendInfo.backendPath);
+    const candidates = ['hostKey', 'userKey', 'nameKey', 'passwordKey', 'portKey']
+      .map(k => keys[k]).filter((v, i, all) => v && v !== v.toUpperCase() && all.indexOf(v) === i);
+    const { rewrittenKeys: lowercase, blockedKeys } = await refactorLowercaseEnvVars(backendInfo.backendPath, candidates, false);
+    if (blockedKeys.length > 0) {
+      detail(`\x1b[36mINFO: ${blockedKeys.join(', ')} ${blockedKeys.length === 1 ? 'is' : 'are'} read in a form Flarops cannot rewrite, so ${blockedKeys.length === 1 ? 'it keeps its' : 'they keep their'} lowercase name.\x1b[0m`);
+    }
+    if (lowercase.length > 0) {
+      const confirmAnswer = await askQuestion(`\x1b[36m? \x1b[0mFound lowercase environment variables in backend code (${lowercase.join(', ')}). Standard convention is UPPERCASE. Do you want to automatically refactor them? [Y/n] `);
+      if (isYes(confirmAnswer)) approvedUppercase = lowercase;
+    }
+  }
+
+  // Every question is answered: the work starts.
+  await writeRepositorySetup();
+
+  let refactoredEnvKey = null;
+  let refactoredRoutes = [];
+  if (applyFrontendRefactor) {
+    const refactorResult = await refactorFrontendEnv(frontendInfo.frontendPath, backendInfo.ports);
+    const nginxChanged = await refactorNginxConf(frontendInfo.frontendPath, backendInfo.ports);
+    if (nginxChanged.length > 0) {
+      console.log(`\x1b[32mPointed proxy_pass at the api service in ${nginxChanged.map(rel).join(', ')}.\x1b[0m`);
+    }
+    if (refactorResult) {
+      refactoredEnvKey = refactorResult.envVarKey;
+      if (refactorResult.discoveredRoutes) {
+        refactoredRoutes = refactorResult.discoveredRoutes;
       }
-      if (refactorResult) {
-        refactoredEnvKey = refactorResult.envVarKey;
-        if (refactorResult.discoveredRoutes) {
-          refactoredRoutes = refactorResult.discoveredRoutes;
-        }
-        if (refactorResult.filesChanged > 0) {
-          console.log(`\x1b[32mThe frontend now reads the backend address from ${refactoredEnvKey} in ${refactorResult.files.map(rel).join(', ')}.\x1b[0m`);
-        }
+      if (refactorResult.filesChanged > 0) {
+        console.log(`\x1b[32mThe frontend now reads the backend address from ${refactoredEnvKey} in ${refactorResult.files.map(rel).join(', ')}.\x1b[0m`);
       }
     }
   }
@@ -744,37 +883,15 @@ async function runInit({ verbose = false } = {}) {
   let foundDbUrls = {};
 
   if (backendInfo.backendPath && dbInfo.hasDb) {
-    let dbRefactorResult = await refactorBackendDbUrl(backendInfo.backendPath, false);
-
-    if (dbRefactorResult && dbRefactorResult.hasHardcoded) {
-      const doDbRefactor = await confirmCodeChange(
-        'The backend connects to the database at a hardcoded URL. Flarops can make it read DATABASE_URL (DB_URL for MongoDB) first and keep the URL as the fallback.',
-        dbRefactorResult.files);
-      if (doDbRefactor) {
-        dbRefactorResult = await refactorBackendDbUrl(backendInfo.backendPath, true);
-        if (dbRefactorResult && dbRefactorResult.filesChanged > 0) {
-          console.log(`\x1b[32mThe backend now reads ${dbRefactorResult.discoveredVars.join(', ')} in ${dbRefactorResult.files.map(rel).join(', ')}.\x1b[0m`);
-        }
-      }
+    let dbRefactorResult = await refactorBackendDbUrl(backendInfo.backendPath, applyDbUrlRefactor);
+    if (applyDbUrlRefactor && dbRefactorResult && dbRefactorResult.filesChanged > 0) {
+      console.log(`\x1b[32mThe backend now reads ${dbRefactorResult.discoveredVars.join(', ')} in ${dbRefactorResult.files.map(rel).join(', ')}.\x1b[0m`);
     }
 
     if (dbRefactorResult && dbRefactorResult.discoveredVars.length > 0) {
       for (const dbVar of dbRefactorResult.discoveredVars) {
         foundDbUrls[dbVar] = { key: dbVar, query: '' };
       }
-    }
-  }
-
-  // Asked here with the other code changes; applied further on, where it always was, since what
-  // comes between reads the backend's .env files as they are.
-  let approvedUppercase = [];
-  if (dbInfo.hasDb && backendInfo.hasBackend) {
-    const keys = await analyzeBackendForDbKeys(backendInfo.backendPath);
-    const lowercase = ['hostKey', 'userKey', 'nameKey', 'passwordKey', 'portKey']
-      .map(k => keys[k]).filter((v, i, all) => v && v !== v.toUpperCase() && all.indexOf(v) === i);
-    if (lowercase.length > 0) {
-      const confirmAnswer = await askQuestion(`\x1b[36m? \x1b[0mFound lowercase environment variables in backend code (${lowercase.join(', ')}). Standard convention is UPPERCASE. Do you want to automatically refactor them? [Y/n] `);
-      if (isYes(confirmAnswer)) approvedUppercase = lowercase;
     }
   }
 
@@ -812,7 +929,15 @@ async function runInit({ verbose = false } = {}) {
   const apiExtraSecretEnvMappings = wiring.api.mappings;
   const frontendExtraSecretEnvMappings = wiring.frontend.mappings;
 
-  const registerSharedCredential = (varName, secretKeyName) => wiring.registerCredential(varName, secretKeyName);
+  const registerSharedCredential = (varName, secretKeyName) => wiring.registerCredential(varName, secretNameFor(secretKeyName));
+
+  // A secret compose declares for a service, wired even if the source never spells it out.
+  const forceSecret = (key, isBackend, isFrontend, services) => {
+    const secretKey = secretNameFor(key);
+    if (isBackend) wiring.wire(wiring.api, key, secretKey);
+    if (isFrontend) wiring.wire(wiring.frontend, key, secretKey);
+    for (const s of services) wiring.wire(s, key, secretKey);
+  };
 
   // Every credential owner is registered before any consumer is scanned: compose order is arbitrary.
   let composeServicesForCredentials = {};
@@ -1135,14 +1260,7 @@ async function runInit({ verbose = false } = {}) {
               });
               sensitiveEnvContent = sensitiveContext.content;
 
-              // A sensitive key compose declares for this service is wired even if the source never spells it out.
-              if (isSensitiveKey(key)) {
-                if (isBackend) apiForcedSecretKeys.add(key);
-                if (isFrontend) frontendForcedSecretKeys.add(key);
-                for (const s of handledServices) {
-                  s.forcedSecretKeys.add(key);
-                }
-              }
+              if (isSensitiveKey(key)) forceSecret(key, isBackend, isFrontend, handledServices);
             }
           }
         }
@@ -1189,11 +1307,7 @@ async function runInit({ verbose = false } = {}) {
             sensitiveContext, matchedAdditionalServices: handledServices,
           });
           sensitiveEnvContent = sensitiveContext.content;
-          if (isSensitiveKey(key)) {
-            if (isBackend) apiForcedSecretKeys.add(key);
-            if (isFrontend) frontendForcedSecretKeys.add(key);
-            for (const s of handledServices) s.forcedSecretKeys.add(key);
-          }
+          if (isSensitiveKey(key)) forceSecret(key, isBackend, isFrontend, handledServices);
         }
       }
     }
@@ -1341,19 +1455,17 @@ async function runInit({ verbose = false } = {}) {
       }
     });
 
-    // Only what was approved above.
+    // Only what was approved above, and of that only what was rewritten: flarops.yaml must name the
+    // variable the code reads.
     const toUppercase = keysToUppercase.filter(k => approvedUppercase.includes(k));
     if (toUppercase.length > 0) {
-      {
-        const { modifiedCount } = await refactorLowercaseEnvVars(backendInfo.backendPath, toUppercase, true);
-        if (modifiedCount > 0) {
-          detail(`\x1b[36mINFO: Refactored lowercase environment variables to uppercase in ${modifiedCount} backend files.\x1b[0m`);
-        }
-
-        ['hostKey', 'userKey', 'nameKey', 'passwordKey', 'portKey'].forEach(k => {
-          if (inferredKeys[k] && toUppercase.includes(inferredKeys[k])) inferredKeys[k] = inferredKeys[k].toUpperCase();
-        });
+      const { files, rewrittenKeys } = await refactorLowercaseEnvVars(backendInfo.backendPath, toUppercase, true);
+      if (files.length > 0) {
+        console.log(`\x1b[32mThe backend now reads ${rewrittenKeys.map(k => k.toUpperCase()).join(', ')} in ${files.map(rel).join(', ')}.\x1b[0m`);
       }
+      ['hostKey', 'userKey', 'nameKey', 'passwordKey', 'portKey'].forEach(k => {
+        if (inferredKeys[k] && rewrittenKeys.includes(inferredKeys[k])) inferredKeys[k] = inferredKeys[k].toUpperCase();
+      });
     }
     if (inferredKeys.hostKey && !apiEnv[inferredKeys.hostKey]) {
       apiEnv[inferredKeys.hostKey] = 'database';
@@ -1393,9 +1505,18 @@ async function runInit({ verbose = false } = {}) {
     return crypto.randomBytes(16).toString('hex');
   };
 
+  // A deploy/.env from an earlier init already holds a generated password, which the database was
+  // created with: it is kept, not generated again.
+  const keptInDeployEnv = (key) => {
+    try {
+      const m = fs.readFileSync(path.join(currentDir, 'deploy', '.env'), 'utf8').match(new RegExp('^' + escapeRegex(key) + '=(.*)$', 'm'));
+      return m ? parseDotenvValue(m[1]) : '';
+    } catch (e) { return ''; }
+  };
+
   if (analyzedKey) {
     finalDbPasswordKey = analyzedKey;
-    finalDbPassword = require('crypto').randomBytes(16).toString('hex');
+    finalDbPassword = keptInDeployEnv(finalDbPasswordKey) || require('crypto').randomBytes(16).toString('hex');
     detail(`\x1b[36mINFO: Analyzed backend code and found expected database password key: ${finalDbPasswordKey}\x1b[0m`);
 
     const envMatch = foundDbPasswords.find(p => p.key === finalDbPasswordKey);
@@ -1410,7 +1531,7 @@ async function runInit({ verbose = false } = {}) {
     finalDbPasswordKey = foundDbPasswords[0].key;
     finalDbPassword = passwordValueOf(foundDbPasswords[0]);
     if (foundDbPasswords.length > 1) {
-      console.log(`\x1b[33mWARNING: Found multiple database passwords in .env files. Using ${finalDbPasswordKey} from ${foundDbPasswords[0].file}\x1b[0m`);
+      console.warn(`\x1b[33mWARNING: Found multiple database passwords in .env files. Using ${finalDbPasswordKey} from ${foundDbPasswords[0].file}\x1b[0m`);
     }
   } else if (dbInfo.hasDb) {
     if (dbInfo.dbType === 'postgres' || dbInfo.dbType === 'postgresql') finalDbPasswordKey = 'POSTGRES_PASSWORD';
@@ -1419,10 +1540,10 @@ async function runInit({ verbose = false } = {}) {
     else if (dbInfo.dbType === 'mongodb') finalDbPasswordKey = 'MONGO_INITDB_ROOT_PASSWORD';
     else finalDbPasswordKey = 'DATABASE_PASSWORD';
 
-    // A deploy/.env from an earlier init already holds one; it is kept, and nothing is generated.
-    let kept = false;
-    try { kept = new RegExp('^' + escapeRegex(finalDbPasswordKey) + '=', 'm').test(fs.readFileSync(path.join(currentDir, 'deploy', '.env'), 'utf8')); } catch (e) { /* no deploy/.env yet */ }
-    if (!kept) {
+    finalDbPassword = keptInDeployEnv(finalDbPasswordKey);
+    if (finalDbPassword) {
+      detail(`\x1b[36mINFO: No database password found in .env files. Kept the one an earlier init generated for ${finalDbPasswordKey} in deploy/.env\x1b[0m`);
+    } else {
       finalDbPassword = require('crypto').randomBytes(16).toString('hex');
       detail(`\x1b[36mINFO: No database password found in .env files. Generated a secure random fallback password for ${finalDbPasswordKey}\x1b[0m`);
     }
@@ -1838,8 +1959,8 @@ SSH_PRIVATE_KEY="${privateKey}"
     allEnvKeys.push(match[1]);
   }
 
-  const excludedKeys = new Set(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'SSH_PRIVATE_KEY', 'REGISTRY_USER', 'REGISTRY_PASSWORD', 'CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ZONE_ID']);
-  const envKeysToPass = allEnvKeys.filter(k => !excludedKeys.has(k));
+  // The infrastructure's own secrets are read by the workflows directly, never passed to a pod.
+  const envKeysToPass = allEnvKeys.filter(k => !isReservedSecretName(k));
   // Only when a database password was actually found or generated.
   const hasDbPassword = !!finalDbPassword;
   if (hasDbPassword && finalDbPasswordKey && !envKeysToPass.includes(finalDbPasswordKey)) envKeysToPass.push(finalDbPasswordKey);
@@ -1861,7 +1982,7 @@ SSH_PRIVATE_KEY="${privateKey}"
   let lateSectionWritten = false;
   const lateSecretKeys = [];
   const registerSecretKeyForCI = (key) => {
-    if (!key) return;
+    if (!key || isReservedSecretName(key)) return;
     if (!envKeysToPass.includes(key)) envKeysToPass.push(key);
     if (!envIO.has(key)) {
       const known = sharedCredentialSecrets.get(key);
@@ -1892,6 +2013,17 @@ SSH_PRIVATE_KEY="${privateKey}"
     }
     // The DB password reaches a service only if its own source reads it.
     s.dbPasswordKey = (dbInfo.hasDb && finalDbPasswordKey && s.usedEnvVars && s.usedEnvVars.includes(finalDbPasswordKey)) ? finalDbPasswordKey : null;
+  }
+
+  // A renamed secret reaches whoever reads it under its own name, from the APP_ secret.
+  for (const [envName, secretKey] of renamedSecrets) {
+    const readers = [
+      ...(backendInfo.usedEnvVars && backendInfo.usedEnvVars.includes(envName) ? [wiring.api] : []),
+      ...(frontendInfo.usedEnvVars && frontendInfo.usedEnvVars.includes(envName) ? [wiring.frontend] : []),
+      ...additionalServices.filter(s => s.usedEnvVars && s.usedEnvVars.includes(envName)),
+    ];
+    for (const target of readers) wiring.wire(target, envName, secretKey);
+    if (readers.length > 0) registerSecretKeyForCI(secretKey);
   }
 
   // An additional service with a different database gets a database of its own.
@@ -1953,7 +2085,7 @@ SSH_PRIVATE_KEY="${privateKey}"
       if (deadKeyIdx !== -1 && 'SPRING_DATASOURCE_PASSWORD' !== passwordKey) {
         envKeysToPass.splice(deadKeyIdx, 1);
         envIO.removeKey('SPRING_DATASOURCE_PASSWORD');
-        detail(`\x1b[36mINFO: "SPRING_DATASOURCE_PASSWORD" was found in the project but Spring's relaxed environment-variable binding means the container never reads a secret under that exact name - it uses ${passwordKey} instead (wired automatically). Removed it from the required GitHub secrets and deploy/.env.\x1b[0m`);
+        notice(`"SPRING_DATASOURCE_PASSWORD" was found in the project but Spring's relaxed environment-variable binding means the container never reads a secret under that exact name - it uses ${passwordKey} instead (wired automatically). Removed it from the required GitHub secrets and deploy/.env.`);
       }
     } else {
       const dbUrlRefactorResult = await refactorBackendDbUrl(s.path, true);
@@ -2074,7 +2206,7 @@ SSH_PRIVATE_KEY="${privateKey}"
     if (s.buildArgs) s.buildArgs = resolveBuildArgs(s.buildArgs, s.name);
   }
   if (rewrittenBuildArgs.length > 0) {
-    detail(`\x1b[36mINFO: These docker-compose build args pointed at a loopback address, which is compiled into the image and is never reachable from a pod - they were rewritten to the project's own domain: ${rewrittenBuildArgs.join(', ')}. If a different address is correct, change them under buildArgs in flarops.yaml and run "npx flarops sync".\x1b[0m`);
+    notice(`These docker-compose build args pointed at a loopback address, which is compiled into the image and is never reachable from a pod - they were rewritten to the project's own domain: ${rewrittenBuildArgs.join(', ')}. If a different address is correct, change them under buildArgs in flarops.yaml and run "npx flarops sync".`);
   }
   if (droppedBuildArgs.length > 0) {
     console.warn(`\x1b[33mWARNING: These docker-compose build args reference a value this repository never defines, so they were left to the Dockerfile's own ARG defaults: ${droppedBuildArgs.join(', ')}. If a default is a development value, set the real one under buildArgs in flarops.yaml and run "npx flarops sync".\x1b[0m`);
@@ -2198,14 +2330,17 @@ SSH_PRIVATE_KEY="${privateKey}"
           if (isSensitiveKey(key)) {
             delete parsed.env[key];
             // A GitHub secret name is letters, digits and "_"; xpack.security.http.ssl.key is not one.
-            const secretKey = /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) ? key : key.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+            const secretKey = secretNameFor(/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) ? key : key.toUpperCase().replace(/[^A-Z0-9_]/g, '_'));
             if (secretKey === key) {
               if (!parsed.secretKeys.includes(key)) parsed.secretKeys.push(key);
             } else if (!parsed.extraSecretEnvMappings.some(m => m.envName === key)) {
               parsed.extraSecretEnvMappings.push({ envName: key, secretKey });
             }
             if (!envIO.has(secretKey)) {
-              envIO.append(`${secretKey}=${composeSecretValue(usableSecretValue(secretKey, sanitizeEnvValue(rawVal, key, { parsed: true }), composeFilePath), composeFilePath)}\n`);
+              // A renamed key that only forwards the outer variable of its old name would point at
+              // the infrastructure's credential: it is left for the operator to fill.
+              const forwardsReserved = secretKey !== key && renamedSecrets.get(key) === secretKey && extractBareVarRef(rawVal) === key;
+              envIO.append(`${secretKey}=${forwardsReserved ? '' : composeSecretValue(usableSecretValue(secretKey, sanitizeEnvValue(rawVal, key, { parsed: true }), composeFilePath), composeFilePath)}\n`);
             }
             if (!envKeysToPass.includes(secretKey)) envKeysToPass.push(secretKey);
           } else {
@@ -2326,15 +2461,13 @@ SSH_PRIVATE_KEY="${privateKey}"
   }
 
   if (supportServices.length > 0) {
-    detail(`\x1b[36mINFO: Generated ${supportServices.length} supporting service(s) declared in docker-compose that the application references but this repository does not build: ${supportServices.map(s => s.name).join(', ')}. Review their images and settings under their names in flarops.yaml, then run "npx flarops sync".\x1b[0m`);
+    notice(`Generated ${supportServices.length} supporting service(s) declared in docker-compose that the application references but this repository does not build: ${supportServices.map(s => s.name).join(', ')}. Review their images and settings under their names in flarops.yaml, then run "npx flarops sync".`);
   }
   if (skippedNodeAgents.length > 0) {
     console.warn(`\x1b[33mWARNING: Skipped ${skippedNodeAgents.join(', ')} - these mount the host's docker socket or /proc and /sys, which makes them node-level agents rather than application services. Install them as a DaemonSet (usually via the vendor's own Helm chart) if you want them in the cluster.\x1b[0m`);
   }
-  // GitHub reserves the GITHUB_ prefix: such a secret cannot be created.
-  const githubReservedKeys = [...envKeysToPass, ...(hasDbPassword ? [finalDbPasswordKey] : [])].filter(k => k && /^GITHUB_/i.test(k));
-  if (githubReservedKeys.length > 0) {
-    console.warn(`\x1b[33mWARNING: The following secret name(s) start with "GITHUB_", a prefix GitHub reserves for its own secrets - you will NOT be able to create a matching repository secret for: ${githubReservedKeys.join(', ')}. Rename this environment variable in your project.\x1b[0m`);
+  if (renamedSecrets.size > 0) {
+    console.warn(`\x1b[33mWARNING: Your application reads ${[...renamedSecrets.keys()].join(', ')}, which ${renamedSecrets.size === 1 ? 'is a name' : 'are names'} the deploy workflows use for the infrastructure's own credentials (or GitHub reserves). So that those never reach a pod, ${renamedSecrets.size === 1 ? 'it is' : 'they are'} passed from GitHub secrets named ${[...renamedSecrets.values()].join(', ')} instead - create ${renamedSecrets.size === 1 ? 'that secret' : 'those secrets'} with the application's own value${renamedSecrets.size === 1 ? '' : 's'} (deploy/.env lists ${renamedSecrets.size === 1 ? 'it' : 'them'}).\x1b[0m`);
   }
 
   if (dbInitFiles) {
@@ -2602,6 +2735,19 @@ appVersion: "1.0.0"
 
   otherFilesToGenerate.forEach(f => fs.writeFileSync(f.file, f.content));
 
+  // What each generated file held when written, as sync records it: the first sync can then tell a
+  // hand edit from a change in Flarops' templates.
+  {
+    const { contentHash, writeState } = require('../../utils/state.js');
+    const rel = (file) => path.relative(currentDir, file).split(path.sep).join('/');
+    config.fileHashes = Object.fromEntries([
+      { file: path.join(helmDir, 'values.yaml'), content: valuesYaml },
+      ...templatesToGenerate,
+      ...otherFilesToGenerate.filter(f => /(deploy|pr-capsule)\.yml$|[\\/]werf\.yaml$/.test(f.file)),
+    ].map(f => [rel(f.file), contentHash(f.content)]));
+    writeState(currentDir, config);
+  }
+
   // What a coding agent reads on its own: the Flarops section of AGENTS.md, imported by CLAUDE.md.
   {
     const { AGENTS_BLOCK, CLAUDE_BLOCK, withBlock } = require('../../utils/agentsDoc.js');
@@ -2610,8 +2756,11 @@ appVersion: "1.0.0"
     const agents = withBlock(readIfAny(agentsFile), AGENTS_BLOCK);
     if (agents !== null) fs.writeFileSync(agentsFile, agents);
     const claudeFile = path.join(currentDir, 'CLAUDE.md');
-    const claude = readIfAny(claudeFile);
-    if (!claude || !/^@AGENTS\.md\s*$/m.test(claude)) {
+    const realOf = (file) => { try { return fs.realpathSync(file); } catch (e) { return null; } };
+    // CLAUDE.md linked to AGENTS.md (or the other way round) is one file, which already has its section.
+    const sameFile = realOf(claudeFile) !== null && realOf(claudeFile) === realOf(agentsFile);
+    const claude = sameFile ? null : readIfAny(claudeFile);
+    if (!sameFile && (!claude || !/^@AGENTS\.md\s*$/m.test(claude))) {
       const updated = withBlock(claude, CLAUDE_BLOCK);
       if (updated !== null) fs.writeFileSync(claudeFile, updated);
     }
@@ -2631,8 +2780,8 @@ appVersion: "1.0.0"
 
   // Everything to check comes first, then the result and the password, and the steps to take last,
   // so the steps are what is left on screen.
-  let warningCount = 0;
-  const warn = (text) => { warningCount++; console.warn(`\x1b[33mWARNING: ${text}\x1b[0m`); console.log(''); };
+  // Every WARNING init printed counts, wherever it was printed (see init() below).
+  const warn = (text) => { console.warn(`\x1b[33mWARNING: ${text}\x1b[0m`); console.log(''); };
   const note = (text) => { console.log(`\x1b[36mNOTE: ${text}\x1b[0m`); console.log(''); };
 
   // Report orphaned templates; removing them is sync's job.
@@ -2684,8 +2833,7 @@ appVersion: "1.0.0"
   }
 
   if (s3BucketWarning) {
-    warningCount++;
-    console.log(s3BucketWarning);
+    console.warn(s3BucketWarning);
     console.log('');
   }
 
@@ -2702,14 +2850,14 @@ appVersion: "1.0.0"
     warn(`these variables still point at this machine, which inside a pod is the container itself - Flarops could not tell what they should become: ${unresolvedLoopback.join(', ')}.\nSet them in flarops.yaml and run "npx flarops sync". Use a service's name for traffic inside the cluster ("database", "api"), and your project's domain for anything a browser reaches.`);
   }
 
-  console.log('#############################################################################################');
-  console.log('# Flarops has been initialized.                                                             #');
-  if (warningCount > 0) {
-    console.log(`# ${`Check the ${warningCount} warning${warningCount === 1 ? '' : 's'} above before the first deploy.`.padEnd(90)}#`);
-  }
-  console.log('#############################################################################################');
+  const warningCount = warningsPrinted;
+  printBanner(['Flarops has been initialized.',
+    ...(warningCount > 0 ? [`Check the ${warningCount} warning${warningCount === 1 ? '' : 's'} above before the first deploy.`] : [])]);
 
-  if (dashboardPassword) printDashboardLogin({ password: dashboardPassword, domain });
+  // Without Cloudflare nothing terminates TLS: the addresses are http://.
+  const tls = !!(cloudflareApiToken && cloudflareZoneId);
+  const scheme = tls ? 'https' : 'http';
+  if (dashboardPassword) printDashboardLogin({ password: dashboardPassword, domain, tls });
 
   const cyan = (t) => `\x1b[36m${t}\x1b[0m`;
   let step = 0;
@@ -2739,7 +2887,7 @@ appVersion: "1.0.0"
     console.log(`${++step}. Point DNS at the server: A records for ${domain}, ${dashboardHost(domain)} and the PR`);
     console.log('   environments, to the IP the deploy run prints in its summary (see FLAROPS.md).');
   }
-  if (domain) console.log(`${++step}. Open https://${domain} and the dashboard at https://${dashboardHost(domain)} (user admin).`);
+  if (domain) console.log(`${++step}. Open ${scheme}://${domain} and the dashboard at ${scheme}://${dashboardHost(domain)} (user admin)${tls ? '' : ' -\n   plain HTTP: for HTTPS, put a proxy such as Cloudflare in front of the server'}.`);
   console.log('');
   fs.writeFileSync(path.join(currentDir, 'deploy', 'flarops-init.log'), `# What flarops init found and decided (git-ignored).\n\n${DETAILS.join('\n')}\n`);
   if (!VERBOSE) console.log('What init found and decided, in detail: deploy/flarops-init.log');
@@ -2749,9 +2897,29 @@ appVersion: "1.0.0"
 const plainOutput = () => !process.stdout.isTTY || !!process.env.NO_COLOR;
 const ANSI = /\x1b\[[0-9;]*m/g;
 
+// How wide init's output may be: the terminal, at most 100 columns.
+const wrapWidth = () => Math.min(100, (process.stdout.columns || 100) - 2);
+
+// The closing banner, as wide as the output may be (93 columns at most); on a terminal too narrow
+// for a box, the lines alone.
+function printBanner(lines) {
+  const inner = Math.max(...lines.map(l => l.length));
+  const width = Math.min(93, wrapWidth());
+  if (width < inner + 4) {
+    for (const line of lines) console.log(line);
+    return;
+  }
+  console.log('#'.repeat(width));
+  for (const line of lines) console.log(`# ${line.padEnd(width - 4)} #`);
+  console.log('#'.repeat(width));
+}
+
+// WARNING messages printed during this init, counted for the banner.
+let warningsPrinted = 0;
+
 // A line longer than the terminal (at most 100 columns), wrapped at word boundaries.
 function wrapLines(text) {
-  const width = Math.min(100, (process.stdout.columns || 100) - 2);
+  const width = wrapWidth();
   return String(text).split('\n').map(line => {
     if (line.replace(ANSI, '').length <= width) return line;
     // Continuation lines keep the line's own indent, plus two.
@@ -2775,8 +2943,12 @@ module.exports = async function init(options = {}) {
   const plain = plainOutput();
   const original = { log: console.log, warn: console.warn, error: console.error };
   const clean = (a) => (typeof a === 'string' && plain ? a.replace(ANSI, '') : a);
+  warningsPrinted = 0;
   for (const name of ['log', 'warn', 'error']) {
-    console[name] = (...args) => original[name](...args.map(a => clean(typeof a === 'string' ? wrapLines(a) : a)));
+    console[name] = (...args) => {
+      if (name === 'warn' && args.some(a => typeof a === 'string' && a.includes('WARNING'))) warningsPrinted++;
+      return original[name](...args.map(a => clean(typeof a === 'string' ? wrapLines(a) : a)));
+    };
   }
   try {
     return await runInit(options);

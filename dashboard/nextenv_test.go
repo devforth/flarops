@@ -31,3 +31,19 @@ func TestNextEnvironmentMiB(t *testing.T) {
 		t.Fatalf("with no estimate either: got %d, want the largest, 900", mib)
 	}
 }
+
+// PR addresses follow the generator's rule: never above the zone the domain is in.
+func TestCapsuleDomainStaysInTheZone(t *testing.T) {
+	cases := []struct{ parent, domain, want string }{
+		{"", "app.example.com", "app-pr-7.example.com"},
+		{"", "example.com", "pr-7.example.com"},
+		{"shop.co.uk", "shop.co.uk", "pr-7.shop.co.uk"},
+		{"example.com", "app.example.com", "app-pr-7.example.com"},
+	}
+	for _, c := range cases {
+		t.Setenv("FLAROPS_HOST_PARENT", c.parent)
+		if got := getCapsuleDomain("proj-pr-7", c.domain); got != c.want {
+			t.Errorf("parent %q, domain %q: got %q, want %q", c.parent, c.domain, got, c.want)
+		}
+	}
+}

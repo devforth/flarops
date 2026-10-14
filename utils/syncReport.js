@@ -2,6 +2,7 @@
 // the GitHub Secrets to create or drop, and what a change does not do to data already on disk.
 
 const { claimNameFor } = require('../templates/generic/volumes.js');
+const { ENGINES, defaultDataPathFor } = require('./dbDefaults.js');
 
 const none = (v) => v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0)
   || (typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0);
@@ -124,6 +125,9 @@ function secretReaders(declared) {
 }
 
 const major = (image) => ((String(image || '').split(':')[1] || '').match(/^(\d+)/) || [])[1];
+const engine = (type) => (/^postgres/.test(String(type).toLowerCase()) ? 'postgres' : String(type).toLowerCase());
+// Where an engine's image keeps its data, in any version (Postgres 18 moved it).
+const dataPaths = (type) => [defaultDataPathFor(type, ''), defaultDataPathFor(type, `${type}:18`)];
 
 // What the change does not do to what is already deployed: a database keeps the name, user and password
 // it was created with, an image major version does not upgrade a data directory, and data stays in
@@ -135,12 +139,20 @@ function dataNotes(before, after) {
     if (was.name && now.name && was.name !== now.name) notes.push(`${label}.name changed (${was.name} -> ${now.name}): a database already created keeps "${was.name}" - the server creates a database only on its first start. Create "${now.name}" in it (or move the data) before the app connects.`);
     if (was.user && now.user && was.user !== now.user) notes.push(`${label}.user changed (${was.user} -> ${now.user}): a database already created keeps its first user. Create "${now.user}" in it, or keep the old name.`);
     if (was.passwordKey && now.passwordKey && was.passwordKey !== now.passwordKey) notes.push(`${label}'s password now comes from ${now.passwordKey} (was ${was.passwordKey}): a database already created keeps its first password. Give ${now.passwordKey} the same value, or change the password inside the database too.`);
-    if (major(was.image) && major(now.image) && major(was.image) !== major(now.image)) notes.push(`${label}.image moves to a new major version (${was.image} -> ${now.image}): the existing data directory will not start under it. Dump the data, recreate the database, and restore.`);
-    if (was.type && now.type && was.type !== now.type && was.image === now.image) notes.push(`${label}.type changed to ${now.type} but image is still ${now.image} - set an image for ${now.type} too.`);
+    const engineChanged = was.type && now.type && engine(was.type) !== engine(now.type);
+    if (engineChanged) {
+      notes.push(`${label}.type changed (${was.type} -> ${now.type}): this is a different database engine, and ${now.type} cannot read the data ${was.type} left on the disk. Dump the data with ${was.type}'s tools, deploy, and load it into ${now.type} - or start empty.`);
+      const data = (now.volumes || []).find(v => v.name === 'data');
+      const owner = data && !dataPaths(now.type).includes(data.target) && Object.keys(ENGINES).find(t => dataPaths(t).includes(data.target));
+      if (owner) notes.push(`${label}.volumes: the "data" volume is still mounted at ${data.target}, where ${owner} keeps its data - ${now.type} keeps it at ${defaultDataPathFor(now.type, now.image)}, so its data would not reach the disk. Set that path for "data" under ${label}.volumes (or leave the data volume out to get it).`);
+    } else if (major(was.image) && major(now.image) && major(was.image) !== major(now.image)) {
+      notes.push(`${label}.image moves to a new major version (${was.image} -> ${now.image}): the existing data directory will not start under it. Dump the data, recreate the database, and restore.`);
+    }
+    if (engineChanged && was.image === now.image) notes.push(`${label}.type changed to ${now.type} but image is still ${now.image} - set an image for ${now.type} too.`);
   };
   if (before.hasDb && after.hasDb) {
     dbNotes('database', { name: before.dbName, user: before.dbUser, passwordKey: before.dbPasswordKey, image: before.images && before.images.db, type: before.dbType },
-      { name: after.dbName, user: after.dbUser, passwordKey: after.dbPasswordKey, image: after.images && after.images.db, type: after.dbType });
+      { name: after.dbName, user: after.dbUser, passwordKey: after.dbPasswordKey, image: after.images && after.images.db, type: after.dbType, volumes: after.dbVolumes });
   }
 
   const all = (s) => [...(s.additionalServices || []), ...(s.supportServices || [])];
